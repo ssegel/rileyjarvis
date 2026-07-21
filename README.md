@@ -16,13 +16,17 @@ It is built with Electron, React, Vite, TypeScript, and the OpenAI Realtime API.
 
 ## Requirements
 
-- macOS
+- macOS or Windows 11
 - Node.js 20+
 - npm
 - An OpenAI API key with Realtime and image generation access
 - Optional: an Exa API key for web search
 
+Computer-use mode currently requires macOS. The voice, artifact, notes, records, image, and web-search features can run on Windows 11.
+
 ## Quick Start
+
+### macOS
 
 ```bash
 git clone https://github.com/rileybrown/rileyjarvis.git
@@ -31,6 +35,18 @@ npm install
 cp .env.example .env.local
 npm run dev
 ```
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/rileybrown/rileyjarvis.git
+Set-Location rileyjarvis
+npm install
+Copy-Item .env.example .env.local
+npm run dev
+```
+
+In Command Prompt, use `cd rileyjarvis` and `copy .env.example .env.local` instead.
 
 Edit `.env.local` before starting voice features:
 
