@@ -241,7 +241,12 @@ test("rejects helper diagnostics and malformed stdout", async () => {
 });
 
 test("PowerShell helper probe is non-destructive", { skip: process.platform !== "win32" }, async () => {
-  assert.deepEqual(await runPowerShellInput("probe", {}), { ok: true, operation: "probe" });
+  const result = await runPowerShellInput("probe", {});
+  assert.equal(result.ok, true);
+  assert.equal(result.operation, "probe");
+  assert.equal(result.pointerSize, 8);
+  assert.equal(result.inputSize, 40);
+  assert.equal(result.expectedInputSize, 40);
 });
 
 test("PowerShell helper rejects unapproved input before SendInput", { skip: process.platform !== "win32" }, async () => {
@@ -253,4 +258,38 @@ test("PowerShell helper rejects unapproved input before SendInput", { skip: proc
     runPowerShellInput("click", { x: 1_000_001, y: 0 }),
     /outside the allowed bounds/,
   );
+});
+
+test("marshals multi-character Unicode TypeText without live SendInput", { skip: process.platform !== "win32" }, async () => {
+  const fixture = "Keyboard input confirmed";
+  const result = await runPowerShellInput("marshalTypeText", { text: fixture });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.operation, "marshalTypeText");
+  assert.equal(result.pointerSize, 8);
+  assert.equal(result.inputSize, 40);
+  assert.equal(result.expectedInputSize, 40);
+  assert.equal(result.scanOffset, 10);
+  assert.equal(result.flagsOffset, 12);
+  assert.equal(result.unicodeKeyDown, true);
+  assert.equal(result.text, fixture);
+
+  const expectedCodes = [...fixture].map((character) => character.charCodeAt(0));
+  assert.deepEqual(result.scanCodes.map(Number), expectedCodes);
+  assert.deepEqual(
+    result.elementIndexes.map(Number),
+    expectedCodes.map((_code, index) => index * 2),
+  );
+  assert.deepEqual(
+    result.downFlags.map(Number),
+    expectedCodes.map(() => 0x0004),
+  );
+
+  // The pre-fix repeated-character failure came from wrong INPUT stride/size so
+  // later wScan values no longer matched the fixture code units. This assertion
+  // locks the native 40-byte stride and exact per-character UTF-16 scan codes.
+  assert.notEqual(result.inputSize, 28);
+  assert.notEqual(result.inputSize, 36);
+  assert.equal(new Set(result.scanCodes.map(Number)).size > 1, true);
+  assert.equal(result.scanCodes.map(Number).join(","), expectedCodes.join(","));
 });
