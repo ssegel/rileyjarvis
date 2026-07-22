@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, nativeImage, screen } = require("electron");
+const { app, BrowserWindow, ipcMain, nativeImage, screen, shell } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const crypto = require("node:crypto");
@@ -9,7 +9,7 @@ dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 
 const dataDir = path.join(process.cwd(), "data");
 const dbPath = path.join(dataDir, "ricky-db.json");
-const desktopControl = createDesktopControl({ dataDir });
+const desktopControl = createDesktopControl({ dataDir, screen, shell });
 let currentMode = "display";
 let mainWindow = null;
 let normalWindowBounds = null;

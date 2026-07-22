@@ -9,20 +9,28 @@ test("selects the macOS adapter without invoking desktop commands", () => {
   assert.deepEqual(control.capabilities(), Object.fromEntries(capabilityNames.map((name) => [name, true])));
 });
 
-test("selects the Windows adapter with Phase 2 unsupported capabilities", async () => {
+test("selects the Windows adapter with Phase 3 capabilities", async () => {
   const control = createDesktopControl({ platform: "win32" });
 
   assert.equal(control.platform, "win32");
-  assert.deepEqual(control.capabilities(), Object.fromEntries(capabilityNames.map((name) => [name, false])));
+  assert.deepEqual(control.capabilities(), {
+    openApp: true,
+    typeText: true,
+    pressKey: true,
+    click: true,
+    scroll: true,
+    captureScreen: false,
+    inspectUi: false,
+  });
 
-  for (const capability of capabilityNames) {
+  for (const capability of ["captureScreen", "inspectUi"]) {
     const result = await control[capability]({});
     assert.deepEqual(result, {
       ok: false,
       platform: "win32",
-      phase: 2,
+      phase: 3,
       unsupportedCapability: capability,
-      error: `Desktop control capability "${capability}" is not implemented on Windows in Phase 2.`,
+      error: `Desktop control capability "${capability}" is not implemented on Windows in Phase 3.`,
     });
   }
 });

@@ -18,7 +18,7 @@ function createDesktopControl(options = {}) {
     return createMacosDesktopControl(options);
   }
   if (platform === "win32") {
-    return createWindowsDesktopControl();
+    return createWindowsDesktopControl(options);
   }
   return createUnsupportedDesktopControl(platform);
 }
