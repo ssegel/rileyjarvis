@@ -1,16 +1,15 @@
 const { app, BrowserWindow, ipcMain, nativeImage, screen } = require("electron");
-const { execFile } = require("node:child_process");
-const { promisify } = require("node:util");
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const crypto = require("node:crypto");
 const dotenv = require("dotenv");
+const { createDesktopControl } = require("./platform/index.cjs");
 
 dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 
-const execFileAsync = promisify(execFile);
 const dataDir = path.join(process.cwd(), "data");
 const dbPath = path.join(dataDir, "ricky-db.json");
+const desktopControl = createDesktopControl({ dataDir });
 let currentMode = "display";
 let mainWindow = null;
 let normalWindowBounds = null;
@@ -462,26 +461,6 @@ function requiresConfirmation(args) {
   return args.confirmed !== true && (args.risk === "may_send_or_modify" || args.risk === "private_or_sensitive");
 }
 
-function keyCodeForKey(key) {
-  const keyCodes = {
-    enter: 36,
-    return: 36,
-    tab: 48,
-    escape: 53,
-    delete: 51,
-    space: 49,
-    up: 126,
-    down: 125,
-    left: 123,
-    right: 124,
-  };
-  return keyCodes[String(key || "").toLowerCase()] || null;
-}
-
-function appleScriptString(value) {
-  return JSON.stringify(String(value)).replace(/\\\\/g, "\\");
-}
-
 async function createWindow() {
   await ensureData();
   await clearStartupLoadingThumbnails();
@@ -770,81 +749,34 @@ ipcMain.handle("tools:execute", async (_event, toolCall) => {
     }
 
     if (name === "computer_open_app") {
-      await execFileAsync("open", ["-a", String(args.appName || "")]);
-      return { ok: true, message: `Opened ${args.appName}.` };
+      return await desktopControl.openApp(args);
     }
 
     if (name === "computer_type_text") {
-      await execFileAsync("osascript", ["-e", `tell application "System Events" to keystroke ${appleScriptString(args.text || "")}`]);
-      return { ok: true, message: "Typed text into the active app." };
+      return await desktopControl.typeText(args);
     }
 
     if (name === "computer_press_key") {
-      const keyCode = keyCodeForKey(args.key);
-      if (!keyCode) {
-        return { ok: false, error: `Unsupported key: ${args.key}` };
-      }
-      const repeat = Math.max(1, Math.min(20, Number(args.repeat || 1)));
-      await execFileAsync("osascript", ["-e", `tell application "System Events" to repeat ${repeat} times\nkey code ${keyCode}\nend repeat`]);
-      return { ok: true, message: `Pressed ${args.key}.` };
+      return await desktopControl.pressKey(args);
     }
 
     if (name === "computer_click") {
       if (requiresConfirmation(args)) {
         return { ok: false, requiresConfirmation: true, message: "Confirmation required before clicking a risky target." };
       }
-      await execFileAsync("osascript", ["-e", `tell application "System Events" to click at {${Number(args.x)}, ${Number(args.y)}}`]);
-      return { ok: true, message: `Clicked ${args.x}, ${args.y}.` };
+      return await desktopControl.click(args);
     }
 
     if (name === "computer_scroll") {
-      const direction = String(args.direction || "down");
-      const amount = Math.max(1, Math.min(20, Number(args.amount || 4)));
-      const keyByDirection = { up: 126, down: 125, left: 123, right: 124 };
-      const keyCode = keyByDirection[direction] || 125;
-      await execFileAsync("osascript", ["-e", `tell application "System Events" to repeat ${amount} times\nkey code ${keyCode}\nend repeat`]);
-      return { ok: true, message: `Scrolled ${direction}.` };
+      return await desktopControl.scroll(args);
     }
 
     if (name === "screen_snapshot") {
-      await fs.mkdir(dataDir, { recursive: true });
-      const screenshotPath = path.join(dataDir, `screenshot-${Date.now()}.png`);
-      await execFileAsync("screencapture", ["-x", screenshotPath]);
-      return {
-        ok: true,
-        path: screenshotPath,
-        artifact: {
-          title: "Screen Snapshot",
-          kind: "image",
-          content: screenshotPath,
-        },
-      };
+      return await desktopControl.captureScreen(args);
     }
 
     if (name === "ui_inspect") {
-      const script = `tell application "System Events"
-set frontApp to first application process whose frontmost is true
-set appName to name of frontApp
-set windowName to ""
-try
-  set windowName to name of front window of frontApp
-end try
-set roleSummary to ""
-try
-  set roleSummary to value of attribute "AXRoleDescription" of front window of frontApp
-end try
-return "App: " & appName & linefeed & "Window: " & windowName & linefeed & "Role: " & roleSummary
-end tell`;
-      const { stdout } = await execFileAsync("osascript", ["-e", script]);
-      return {
-        ok: true,
-        summary: stdout.trim(),
-        artifact: {
-          title: "UI Inspect",
-          kind: "text",
-          content: stdout.trim(),
-        },
-      };
+      return await desktopControl.inspectUi(args);
     }
 
     return { ok: false, error: `Unknown tool: ${name}` };
