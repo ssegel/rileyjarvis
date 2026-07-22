@@ -5,12 +5,24 @@ const { promisify } = require("node:util");
 
 const execFileAsync = promisify(execFile);
 const helperPath = path.resolve(__dirname, "windows-input.ps1");
+const uiHelperPath = path.resolve(__dirname, "windows-ui.ps1");
 const maxTextLength = 32_768;
 const maxCoordinate = 1_000_000;
 const maxHelperOutput = 1_048_576;
+const inspectTimeoutMs = 5_000;
+const inspectDepthLimit = 4;
+const inspectNodeLimit = 120;
 
-const supportedCapabilities = new Set(["openApp", "typeText", "pressKey", "click", "scroll", "captureScreen"]);
-const capabilityNames = [...supportedCapabilities, "inspectUi"];
+const supportedCapabilities = new Set([
+  "openApp",
+  "typeText",
+  "pressKey",
+  "click",
+  "scroll",
+  "captureScreen",
+  "inspectUi",
+]);
+const capabilityNames = [...supportedCapabilities];
 
 const keyVirtualKeys = Object.freeze({
   enter: 0x0d,
@@ -37,22 +49,55 @@ const applicationAliases = Object.freeze({
   settings: { type: "uri", value: "ms-settings:" },
 });
 
-function unsupported(capability) {
-  return {
-    ok: false,
-    platform: "win32",
-    phase: 4,
-    unsupportedCapability: capability,
-    error: `Desktop control capability "${capability}" is not implemented on Windows in Phase 4.`,
-  };
-}
-
 function invalidInput(code, error) {
   return { ok: false, platform: "win32", code, error };
 }
 
 function captureError(code, error) {
   return { ok: false, platform: "win32", code, error };
+}
+
+function inspectError(code, error) {
+  return { ok: false, platform: "win32", code, error };
+}
+
+function buildInspectSummary(payload) {
+  const appName = payload?.app?.name || payload?.app?.processName || "unknown";
+  const windowTitle = payload?.window?.title || "";
+  const controlType = payload?.window?.controlType || payload?.focused?.controlType || "Window";
+  return `App: ${appName}\nWindow: ${windowTitle}\nControlType: ${controlType}`;
+}
+
+function sanitizeInspectTree(nodes) {
+  if (!Array.isArray(nodes)) return [];
+  return nodes.map((node) => {
+    const item = {
+      name: typeof node?.name === "string" ? node.name : "",
+      controlType: typeof node?.controlType === "string" ? node.controlType : "Unknown",
+      role: typeof node?.role === "string" ? node.role : typeof node?.controlType === "string" ? node.controlType : "Unknown",
+      enabled: node?.enabled === true,
+      focused: node?.focused === true,
+      offscreen: node?.offscreen === true,
+      redacted: node?.redacted === true,
+      depth: Number.isFinite(Number(node?.depth)) ? Number(node.depth) : 0,
+    };
+    if (typeof node?.automationId === "string" && node.automationId) item.automationId = node.automationId;
+    if (node?.bounds && typeof node.bounds === "object") {
+      item.bounds = {
+        x: Number(node.bounds.x) || 0,
+        y: Number(node.bounds.y) || 0,
+        width: Number(node.bounds.width) || 0,
+        height: Number(node.bounds.height) || 0,
+      };
+    }
+    if (Number.isFinite(Number(node?.childCount))) item.childCount = Number(node.childCount);
+    if (item.redacted) {
+      // Never expose raw password/private values in the sanitized tree.
+    } else if (typeof node?.value === "string" && node.value) {
+      item.value = node.value.length > 80 ? node.value.slice(0, 80) : node.value;
+    }
+    return item;
+  });
 }
 
 function physicalPixelSize(display) {
@@ -81,6 +126,7 @@ function matchScreenSource(sources, display, pixelSize) {
 
 function createWindowsDesktopControl(options = {}) {
   const inputRunner = options.inputRunner || runPowerShellInput;
+  const uiRunner = options.uiRunner || runPowerShellUi;
   const shellApi = options.shell;
   const screenApi = options.screen;
   const desktopCapturerApi = options.desktopCapturer;
@@ -286,7 +332,72 @@ function createWindowsDesktopControl(options = {}) {
       };
     },
 
-    inspectUi: async () => unsupported("inspectUi"),
+    async inspectUi() {
+      let helperResult;
+      try {
+        helperResult = await uiRunner("inspectUi", {}, { timeoutMs: inspectTimeoutMs });
+      } catch (error) {
+        if (error && error.code === "INSPECT_TIMEOUT") {
+          return inspectError("INSPECT_TIMEOUT", error.message || "UI inspection timed out.");
+        }
+        if (error && error.code === "INSPECT_UNAVAILABLE") {
+          return inspectError("INSPECT_UNAVAILABLE", error.message || "Windows UI inspection helper is unavailable.");
+        }
+        return inspectError(
+          "INSPECT_HELPER_FAILED",
+          error instanceof Error ? error.message : "Windows UI inspection helper failed.",
+        );
+      }
+
+      if (!helperResult || typeof helperResult !== "object") {
+        return inspectError("INSPECT_HELPER_FAILED", "Windows UI inspection helper returned no result.");
+      }
+
+      if (helperResult.ok !== true) {
+        const code = typeof helperResult.code === "string" ? helperResult.code : "INSPECT_HELPER_FAILED";
+        return inspectError(code, helperResult.error || "Windows UI inspection failed.");
+      }
+
+      const tree = sanitizeInspectTree(helperResult.tree);
+      const focused = helperResult.focused ? sanitizeInspectTree([helperResult.focused])[0] : null;
+      const summary = buildInspectSummary(helperResult);
+      const meta = {
+        depthLimit: Number(helperResult.meta?.depthLimit) || inspectDepthLimit,
+        nodeLimit: Number(helperResult.meta?.nodeLimit) || inspectNodeLimit,
+        visited: Number(helperResult.meta?.visited) || 0,
+        returned: Number(helperResult.meta?.returned) || tree.length,
+        skipped: Number(helperResult.meta?.skipped) || 0,
+        truncated: helperResult.meta?.truncated === true,
+        limited: helperResult.meta?.limited === true,
+        redactedCount: Number(helperResult.meta?.redactedCount) || 0,
+      };
+
+      return {
+        ok: true,
+        summary,
+        artifact: {
+          title: "UI Inspect",
+          kind: "text",
+          content: summary,
+        },
+        app: {
+          name: helperResult.app?.name || helperResult.app?.processName || "unknown",
+          processName: helperResult.app?.processName || "",
+          pid: Number(helperResult.app?.pid) || 0,
+          path: helperResult.app?.path || null,
+        },
+        window: {
+          title: helperResult.window?.title || "",
+          className: helperResult.window?.className || "",
+          handle: helperResult.window?.handle || null,
+          controlType: helperResult.window?.controlType || "Window",
+          bounds: helperResult.window?.bounds || null,
+        },
+        focused,
+        tree,
+        meta,
+      };
+    },
   };
 }
 
@@ -414,12 +525,112 @@ function runPowerShellInput(operation, payload, options = {}) {
   });
 }
 
+function runPowerShellUi(operation, payload = {}, options = {}) {
+  const spawnImpl = options.spawn || spawn;
+  const systemRoot = path.win32.resolve(options.systemRoot || process.env.SystemRoot || "C:\\Windows");
+  const powershellPath = path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const scriptPath = path.resolve(options.helperPath || uiHelperPath);
+  if (scriptPath !== uiHelperPath) {
+    const error = new Error("Alternate Windows UI inspection helper paths are not allowed.");
+    error.code = "INSPECT_UNAVAILABLE";
+    return Promise.reject(error);
+  }
+
+  const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : inspectTimeoutMs;
+
+  return new Promise((resolve, reject) => {
+    const child = spawnImpl(
+      powershellPath,
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", uiHelperPath],
+      { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try {
+        child.kill();
+      } catch {
+        // Ignore kill races after exit.
+      }
+      reject(error);
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      const error = new Error(`Windows UI inspection timed out after ${timeoutMs}ms.`);
+      error.code = "INSPECT_TIMEOUT";
+      fail(error);
+    }, timeoutMs);
+
+    child.on("error", (error) => {
+      error.code = error.code || "INSPECT_UNAVAILABLE";
+      fail(error);
+    });
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      if (stdout.length > maxHelperOutput) {
+        const error = new Error("Windows UI inspection helper produced excessive output.");
+        error.code = "INSPECT_HELPER_FAILED";
+        fail(error);
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+      if (stderr.length > maxHelperOutput) {
+        const error = new Error("Windows UI inspection helper produced excessive diagnostics.");
+        error.code = "INSPECT_HELPER_FAILED";
+        fail(error);
+      }
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (timedOut) return;
+      if (code !== 0) {
+        const error = new Error(stderr.trim() || `Windows UI inspection helper exited with code ${code}.`);
+        error.code = "INSPECT_HELPER_FAILED";
+        reject(error);
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout);
+        if (!result || typeof result !== "object") {
+          throw new Error("Windows UI inspection helper returned malformed JSON.");
+        }
+        resolve(result);
+      } catch (error) {
+        const wrapped = error instanceof Error ? error : new Error(String(error));
+        wrapped.code = "INSPECT_HELPER_FAILED";
+        reject(wrapped);
+      }
+    });
+
+    child.stdin.on("error", (error) => {
+      error.code = "INSPECT_HELPER_FAILED";
+      fail(error);
+    });
+    child.stdin.end(JSON.stringify({ operation, payload }));
+  });
+}
+
 module.exports = {
   applicationAliases,
   createWindowsDesktopControl,
   helperPath,
+  inspectDepthLimit,
+  inspectNodeLimit,
+  inspectTimeoutMs,
   keyVirtualKeys,
   matchScreenSource,
   physicalPixelSize,
   runPowerShellInput,
+  runPowerShellUi,
+  uiHelperPath,
 };

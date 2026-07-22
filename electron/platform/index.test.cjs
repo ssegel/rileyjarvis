@@ -9,7 +9,7 @@ test("selects the macOS adapter without invoking desktop commands", () => {
   assert.deepEqual(control.capabilities(), Object.fromEntries(capabilityNames.map((name) => [name, true])));
 });
 
-test("selects the Windows adapter with Phase 4 capabilities", async () => {
+test("selects the Windows adapter with Phase 5 capabilities", async () => {
   const control = createDesktopControl({ platform: "win32" });
 
   assert.equal(control.platform, "win32");
@@ -20,16 +20,7 @@ test("selects the Windows adapter with Phase 4 capabilities", async () => {
     click: true,
     scroll: true,
     captureScreen: true,
-    inspectUi: false,
-  });
-
-  const inspect = await control.inspectUi({});
-  assert.deepEqual(inspect, {
-    ok: false,
-    platform: "win32",
-    phase: 4,
-    unsupportedCapability: "inspectUi",
-    error: 'Desktop control capability "inspectUi" is not implemented on Windows in Phase 4.',
+    inspectUi: true,
   });
 });
 

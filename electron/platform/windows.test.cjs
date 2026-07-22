@@ -6,10 +6,14 @@ const {
   applicationAliases,
   createWindowsDesktopControl,
   helperPath,
+  inspectDepthLimit,
+  inspectNodeLimit,
   keyVirtualKeys,
   matchScreenSource,
   physicalPixelSize,
   runPowerShellInput,
+  runPowerShellUi,
+  uiHelperPath,
 } = require("./windows.cjs");
 
 function createThumbnail({ width, height, empty = false, png = Buffer.from([0x89, 0x50, 0x4e, 0x47, ...Buffer.alloc(300, 1)]) }) {
@@ -19,6 +23,76 @@ function createThumbnail({ width, height, empty = false, png = Buffer.from([0x89
     toPNG: () => {
       if (png instanceof Error) throw png;
       return png;
+    },
+  };
+}
+
+function createSuccessInspect(overrides = {}) {
+  return {
+    ok: true,
+    operation: "inspectUi",
+    app: {
+      name: "notepad",
+      processName: "notepad",
+      pid: 4242,
+      path: "C:\\Windows\\System32\\notepad.exe",
+      ...(overrides.app || {}),
+    },
+    window: {
+      title: "Untitled - Notepad",
+      className: "Notepad",
+      handle: "12345",
+      controlType: "Window",
+      bounds: { x: 10, y: 20, width: 800, height: 600 },
+      ...(overrides.window || {}),
+    },
+    focused: {
+      name: "Text Editor",
+      controlType: "Document",
+      role: "Document",
+      enabled: true,
+      focused: true,
+      offscreen: false,
+      redacted: false,
+      depth: 1,
+      childCount: 0,
+      ...(overrides.focused || {}),
+    },
+    tree: overrides.tree || [
+      {
+        name: "Untitled - Notepad",
+        controlType: "Window",
+        role: "Window",
+        enabled: true,
+        focused: false,
+        offscreen: false,
+        redacted: false,
+        depth: 0,
+        childCount: 1,
+        bounds: { x: 10, y: 20, width: 800, height: 600 },
+      },
+      {
+        name: "Text Editor",
+        controlType: "Document",
+        role: "Document",
+        enabled: true,
+        focused: true,
+        offscreen: false,
+        redacted: false,
+        depth: 1,
+        childCount: 0,
+      },
+    ],
+    meta: {
+      depthLimit: inspectDepthLimit,
+      nodeLimit: inspectNodeLimit,
+      visited: 2,
+      returned: 2,
+      skipped: 0,
+      truncated: false,
+      limited: false,
+      redactedCount: 0,
+      ...(overrides.meta || {}),
     },
   };
 }
@@ -35,6 +109,7 @@ function createHarness(options = {}) {
   const openedPaths = [];
   const launchedProcesses = [];
   const inputCalls = [];
+  const uiCalls = [];
   const writtenFiles = [];
   const mkdirCalls = [];
   const fsApi = {
@@ -71,6 +146,12 @@ function createHarness(options = {}) {
     if (options.inputError) throw options.inputError;
     return { ok: true, operation };
   };
+  const uiRunner = async (operation, payload) => {
+    uiCalls.push({ operation, payload });
+    if (options.uiError) throw options.uiError;
+    if (typeof options.uiResult === "function") return options.uiResult(operation, payload);
+    return options.uiResult || createSuccessInspect();
+  };
   const screen = options.screen === null
     ? null
     : options.screen || { dipToScreenPoint: ({ x, y }) => ({ x: x * 2, y: y * 2 }) };
@@ -83,12 +164,13 @@ function createHarness(options = {}) {
     now: options.now || (() => 1700000000000),
     screen,
     shell,
+    uiRunner,
     windowsDirectory: "C:\\Windows",
   });
-  return { control, inputCalls, launchedProcesses, mkdirCalls, openedPaths, writtenFiles };
+  return { control, inputCalls, launchedProcesses, mkdirCalls, openedPaths, uiCalls, writtenFiles };
 }
 
-test("reports Phase 4 Windows capabilities with inspectUi still unsupported", async () => {
+test("reports Phase 5 Windows capabilities including inspectUi and captureScreen", async () => {
   const { control } = createHarness();
   assert.deepEqual(control.capabilities(), {
     openApp: true,
@@ -97,10 +179,8 @@ test("reports Phase 4 Windows capabilities with inspectUi still unsupported", as
     click: true,
     scroll: true,
     captureScreen: true,
-    inspectUi: false,
+    inspectUi: true,
   });
-  assert.equal((await control.inspectUi()).unsupportedCapability, "inspectUi");
-  assert.equal((await control.inspectUi()).phase, 4);
 });
 
 test("opens every exact application alias through mocked launchers", async () => {
@@ -582,4 +662,256 @@ test("Phase 3 input capabilities remain unchanged and never call macOS binaries"
   );
   assert.equal(JSON.stringify(harness.inputCalls).includes("osascript"), false);
   assert.equal(JSON.stringify(harness.inputCalls).includes("screencapture"), false);
+});
+
+test("inspectUi maps foreground app, window, focused element, and safe summary", async () => {
+  const harness = createHarness({
+    uiResult: createSuccessInspect({
+      focused: {
+        name: "Search box",
+        controlType: "Edit",
+        role: "Edit",
+        automationId: "SearchBox",
+        enabled: true,
+        focused: true,
+        offscreen: false,
+        redacted: false,
+        depth: 2,
+        childCount: 0,
+        value: "query",
+      },
+    }),
+  });
+  const result = await harness.control.inspectUi();
+  assert.equal(result.ok, true);
+  assert.equal(result.app.processName, "notepad");
+  assert.equal(result.app.pid, 4242);
+  assert.equal(result.window.title, "Untitled - Notepad");
+  assert.equal(result.focused.name, "Search box");
+  assert.equal(result.focused.value, "query");
+  assert.equal(result.artifact.title, "UI Inspect");
+  assert.equal(result.artifact.kind, "text");
+  assert.equal(result.summary, "App: notepad\nWindow: Untitled - Notepad\nControlType: Window");
+  assert.equal(result.artifact.content, result.summary);
+  assert.equal(result.summary.includes("query"), false);
+  assert.deepEqual(harness.uiCalls.map((call) => call.operation), ["inspectUi"]);
+});
+
+test("inspectUi enforces depth and node bounds with truncation metadata", async () => {
+  const tree = [];
+  for (let depth = 0; depth <= inspectDepthLimit; depth += 1) {
+    tree.push({
+      name: `node-${depth}`,
+      controlType: "Custom",
+      role: "Custom",
+      enabled: true,
+      focused: false,
+      offscreen: false,
+      redacted: false,
+      depth,
+      childCount: depth < inspectDepthLimit ? 1 : 0,
+    });
+  }
+  while (tree.length < inspectNodeLimit) {
+    tree.push({
+      name: `leaf-${tree.length}`,
+      controlType: "Text",
+      role: "Text",
+      enabled: true,
+      focused: false,
+      offscreen: false,
+      redacted: false,
+      depth: 2,
+      childCount: 0,
+      value: "ok",
+    });
+  }
+
+  const result = await createHarness({
+    uiResult: createSuccessInspect({
+      tree,
+      meta: {
+        depthLimit: inspectDepthLimit,
+        nodeLimit: inspectNodeLimit,
+        visited: 400,
+        returned: inspectNodeLimit,
+        skipped: 17,
+        truncated: true,
+        limited: true,
+        redactedCount: 0,
+      },
+    }),
+  }).control.inspectUi();
+
+  assert.equal(result.ok, true);
+  assert.equal(result.tree.length, inspectNodeLimit);
+  assert.equal(result.meta.depthLimit, 4);
+  assert.equal(result.meta.nodeLimit, 120);
+  assert.equal(result.meta.truncated, true);
+  assert.equal(result.meta.limited, true);
+  assert.equal(result.meta.skipped, 17);
+  assert.equal(result.meta.visited, 400);
+  assert.equal(result.meta.returned, 120);
+  assert.equal(Math.max(...result.tree.map((node) => node.depth)), inspectDepthLimit);
+});
+
+test("inspectUi redacts passwords, truncates safe values, and tracks inaccessible skips", async () => {
+  const result = await createHarness({
+    uiResult: createSuccessInspect({
+      tree: [
+        {
+          name: "Password",
+          controlType: "Edit",
+          role: "Edit",
+          automationId: "PasswordBox",
+          enabled: true,
+          focused: false,
+          offscreen: false,
+          redacted: true,
+          depth: 1,
+          childCount: 0,
+          value: "super-secret",
+        },
+        {
+          name: "Username",
+          controlType: "Edit",
+          role: "Edit",
+          enabled: true,
+          focused: false,
+          offscreen: false,
+          redacted: false,
+          depth: 1,
+          childCount: 0,
+          value: "a".repeat(120),
+        },
+        {
+          name: "Notes",
+          controlType: "Document",
+          role: "Document",
+          enabled: true,
+          focused: false,
+          offscreen: false,
+          redacted: false,
+          depth: 1,
+          childCount: 0,
+        },
+      ],
+      meta: {
+        depthLimit: 4,
+        nodeLimit: 120,
+        visited: 8,
+        returned: 3,
+        skipped: 5,
+        truncated: false,
+        limited: true,
+        redactedCount: 1,
+      },
+    }),
+  }).control.inspectUi();
+
+  assert.equal(result.ok, true);
+  assert.equal(result.tree[0].redacted, true);
+  assert.equal("value" in result.tree[0], false);
+  assert.equal(result.tree[1].value.length, 80);
+  assert.equal(result.meta.redactedCount, 1);
+  assert.equal(result.meta.skipped, 5);
+  assert.equal(result.summary.includes("super-secret"), false);
+  assert.equal(result.artifact.content.includes("super-secret"), false);
+});
+
+test("inspectUi maps every structured helper failure and timeout", async () => {
+  for (const code of [
+    "INSPECT_UNAVAILABLE",
+    "INSPECT_NO_FOREGROUND",
+    "INSPECT_ROOT_FAILED",
+    "INSPECT_ACCESS_DENIED",
+    "INSPECT_SECURE_DESKTOP",
+    "INSPECT_HELPER_FAILED",
+  ]) {
+    const result = await createHarness({
+      uiResult: { ok: false, code, error: `${code} message` },
+    }).control.inspectUi();
+    assert.equal(result.ok, false);
+    assert.equal(result.code, code);
+    assert.match(result.error, new RegExp(code));
+  }
+
+  const timeoutError = new Error("timed out");
+  timeoutError.code = "INSPECT_TIMEOUT";
+  assert.equal((await createHarness({ uiError: timeoutError }).control.inspectUi()).code, "INSPECT_TIMEOUT");
+
+  const unavailable = new Error("spawn failed");
+  unavailable.code = "INSPECT_UNAVAILABLE";
+  assert.equal((await createHarness({ uiError: unavailable }).control.inspectUi()).code, "INSPECT_UNAVAILABLE");
+
+  const malformed = new Error("Unexpected token");
+  malformed.code = "INSPECT_HELPER_FAILED";
+  assert.equal((await createHarness({ uiError: malformed }).control.inspectUi()).code, "INSPECT_HELPER_FAILED");
+});
+
+test("UI helper probe is non-destructive and rejects alternate helper paths", async () => {
+  const probe = await runPowerShellUi("probe", {});
+  assert.equal(probe.ok, true);
+  assert.equal(probe.operation, "probe");
+  assert.equal(probe.helper, "windows-ui");
+  assert.equal(probe.maxDepth, 4);
+  assert.equal(probe.maxNodes, 120);
+  assert.equal(uiHelperPath.endsWith("windows-ui.ps1"), true);
+
+  await assert.rejects(
+    () => runPowerShellUi("probe", {}, { helperPath: path.join(__dirname, "not-allowed.ps1") }),
+    (error) => error.code === "INSPECT_UNAVAILABLE",
+  );
+});
+
+test("UI helper maps malformed JSON to INSPECT_HELPER_FAILED", async () => {
+  class FakeChild extends EventEmitter {
+    constructor() {
+      super();
+      this.stdout = new EventEmitter();
+      this.stderr = new EventEmitter();
+      this.stdin = new EventEmitter();
+      this.stdin.end = () => {
+        queueMicrotask(() => {
+          this.stdout.emit("data", Buffer.from("{not-json"));
+          this.emit("close", 0);
+        });
+      };
+    }
+    kill() {}
+  }
+
+  await assert.rejects(
+    () => runPowerShellUi("inspectUi", {}, { spawn: () => new FakeChild(), timeoutMs: 1000 }),
+    (error) => error.code === "INSPECT_HELPER_FAILED",
+  );
+});
+test("Phase 4 capture and Phase 5 inspect never invoke macOS binaries", async () => {
+  const harness = createHarness({
+    uiResult: createSuccessInspect(),
+    desktopCapturer: {
+      async getSources() {
+        return [
+          {
+            id: "screen:1",
+            display_id: "1",
+            thumbnail: createThumbnail({ width: 100, height: 100 }),
+          },
+        ];
+      },
+    },
+    screen: {
+      getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+      getDisplayNearestPoint: () => ({ id: 1, bounds: { x: 0, y: 0, width: 100, height: 100 }, scaleFactor: 1 }),
+      dipToScreenPoint: ({ x, y }) => ({ x, y }),
+    },
+  });
+
+  assert.equal((await harness.control.captureScreen()).ok, true);
+  assert.equal((await harness.control.inspectUi()).ok, true);
+  assert.equal((await harness.control.click({ x: 1, y: 2 })).ok, true);
+  const blob = JSON.stringify({ input: harness.inputCalls, ui: harness.uiCalls });
+  assert.equal(blob.includes("osascript"), false);
+  assert.equal(blob.includes("screencapture"), false);
+  assert.equal(helperPath.includes("windows-input.ps1"), true);
 });

@@ -19,6 +19,7 @@ function createDesktopControl(options = {}) {
   }
   if (platform === "win32") {
     // Forward Electron APIs such as screen, shell, and desktopCapturer unchanged.
+    // Windows UI inspection uses the checked-in PowerShell helper from windows.cjs.
     return createWindowsDesktopControl(options);
   }
   return createUnsupportedDesktopControl(platform);

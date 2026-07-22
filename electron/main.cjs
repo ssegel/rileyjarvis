@@ -351,7 +351,7 @@ const toolSpecs = [
   {
     type: "function",
     name: "ui_inspect",
-    description: "Inspect the frontmost macOS app name, window, and visible UI summary using Accessibility when available. Requires computer mode.",
+    description: "Inspect the frontmost application name, window, and visible UI summary using platform accessibility APIs when available. Requires computer mode.",
     parameters: {
       type: "object",
       properties: {},
