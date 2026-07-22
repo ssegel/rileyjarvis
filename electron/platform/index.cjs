@@ -18,6 +18,7 @@ function createDesktopControl(options = {}) {
     return createMacosDesktopControl(options);
   }
   if (platform === "win32") {
+    // Forward Electron APIs such as screen, shell, and desktopCapturer unchanged.
     return createWindowsDesktopControl(options);
   }
   return createUnsupportedDesktopControl(platform);

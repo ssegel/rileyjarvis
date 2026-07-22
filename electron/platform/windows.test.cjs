@@ -7,8 +7,21 @@ const {
   createWindowsDesktopControl,
   helperPath,
   keyVirtualKeys,
+  matchScreenSource,
+  physicalPixelSize,
   runPowerShellInput,
 } = require("./windows.cjs");
+
+function createThumbnail({ width, height, empty = false, png = Buffer.from([0x89, 0x50, 0x4e, 0x47, ...Buffer.alloc(300, 1)]) }) {
+  return {
+    isEmpty: () => empty || width < 1 || height < 1,
+    getSize: () => ({ width, height }),
+    toPNG: () => {
+      if (png instanceof Error) throw png;
+      return png;
+    },
+  };
+}
 
 function createHarness(options = {}) {
   const files = new Map(
@@ -22,6 +35,8 @@ function createHarness(options = {}) {
   const openedPaths = [];
   const launchedProcesses = [];
   const inputCalls = [];
+  const writtenFiles = [];
+  const mkdirCalls = [];
   const fsApi = {
     async realpath(candidate) {
       const existing = files.get(candidate.toLowerCase());
@@ -31,6 +46,14 @@ function createHarness(options = {}) {
     async stat(candidate) {
       if (!files.has(candidate.toLowerCase()) && !directories.has(candidate.toLowerCase())) throw new Error("ENOENT");
       return { isFile: () => !directories.has(candidate.toLowerCase()) };
+    },
+    async mkdir(candidate, mkdirOptions) {
+      mkdirCalls.push({ candidate, mkdirOptions });
+      if (options.mkdirError) throw options.mkdirError;
+    },
+    async writeFile(candidate, contents) {
+      writtenFiles.push({ candidate, contents });
+      if (options.writeError) throw options.writeError;
     },
   };
   const shell = {
@@ -52,17 +75,20 @@ function createHarness(options = {}) {
     ? null
     : options.screen || { dipToScreenPoint: ({ x, y }) => ({ x: x * 2, y: y * 2 }) };
   const control = createWindowsDesktopControl({
+    dataDir: options.dataDir || "C:\\repo\\data",
+    desktopCapturer: options.desktopCapturer,
     fs: fsApi,
     inputRunner,
     launchProcess,
+    now: options.now || (() => 1700000000000),
     screen,
     shell,
     windowsDirectory: "C:\\Windows",
   });
-  return { control, inputCalls, launchedProcesses, openedPaths };
+  return { control, inputCalls, launchedProcesses, mkdirCalls, openedPaths, writtenFiles };
 }
 
-test("reports only Phase 3 Windows capabilities", async () => {
+test("reports Phase 4 Windows capabilities with inspectUi still unsupported", async () => {
   const { control } = createHarness();
   assert.deepEqual(control.capabilities(), {
     openApp: true,
@@ -70,11 +96,11 @@ test("reports only Phase 3 Windows capabilities", async () => {
     pressKey: true,
     click: true,
     scroll: true,
-    captureScreen: false,
+    captureScreen: true,
     inspectUi: false,
   });
-  assert.equal((await control.captureScreen()).unsupportedCapability, "captureScreen");
   assert.equal((await control.inspectUi()).unsupportedCapability, "inspectUi");
+  assert.equal((await control.inspectUi()).phase, 4);
 });
 
 test("opens every exact application alias through mocked launchers", async () => {
@@ -292,4 +318,268 @@ test("marshals multi-character Unicode TypeText without live SendInput", { skip:
   assert.notEqual(result.inputSize, 36);
   assert.equal(new Set(result.scanCodes.map(Number)).size > 1, true);
   assert.equal(result.scanCodes.map(Number).join(","), expectedCodes.join(","));
+});
+
+test("physicalPixelSize uses scaleFactor for mixed-DPI displays", () => {
+  assert.deepEqual(
+    physicalPixelSize({ bounds: { x: -1920, y: 0, width: 1920, height: 1080 }, scaleFactor: 1.25 }),
+    { width: 2400, height: 1350, scaleFactor: 1.25 },
+  );
+  assert.deepEqual(
+    physicalPixelSize({ bounds: { x: 0, y: 0, width: 800, height: 600 }, scaleFactor: 2 }),
+    { width: 1600, height: 1200, scaleFactor: 2 },
+  );
+});
+
+test("matchScreenSource prefers display_id then pixel size then sole source", () => {
+  const display = { id: 42, bounds: { x: -100, y: 0, width: 800, height: 600 }, scaleFactor: 1 };
+  const pixelSize = { width: 800, height: 600 };
+  const byId = { id: "a", display_id: "42", thumbnail: createThumbnail({ width: 10, height: 10 }) };
+  const bySize = { id: "b", display_id: "99", thumbnail: createThumbnail({ width: 800, height: 600 }) };
+  const other = { id: "c", display_id: "7", thumbnail: createThumbnail({ width: 100, height: 100 }) };
+  assert.equal(matchScreenSource([bySize, byId, other], display, pixelSize), byId);
+  assert.equal(matchScreenSource([bySize, other], display, pixelSize), bySize);
+  assert.equal(matchScreenSource([other], display, pixelSize), other);
+  assert.equal(matchScreenSource([bySize, other], { id: 1, bounds: display.bounds }, { width: 1, height: 1 }), null);
+});
+
+test("captureScreen writes PNG for the display nearest a negative-origin cursor", async () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, ...Buffer.alloc(400, 7)]);
+  const leftDisplay = { id: 2, bounds: { x: -1920, y: 0, width: 1920, height: 1080 }, scaleFactor: 1 };
+  const rightDisplay = { id: 1, bounds: { x: 0, y: 0, width: 800, height: 600 }, scaleFactor: 2 };
+  let requestedThumbnail = null;
+  const desktopCapturer = {
+    async getSources({ types, thumbnailSize }) {
+      requestedThumbnail = { types, thumbnailSize };
+      return [
+        {
+          id: "screen:1",
+          display_id: "1",
+          thumbnail: createThumbnail({ width: 1600, height: 1200, png: Buffer.alloc(300, 9) }),
+        },
+        {
+          id: "screen:2",
+          display_id: "2",
+          thumbnail: createThumbnail({ width: 1920, height: 1080, png }),
+        },
+      ];
+    },
+  };
+  const harness = createHarness({
+    desktopCapturer,
+    screen: {
+      getCursorScreenPoint: () => ({ x: -100, y: 40 }),
+      getDisplayNearestPoint: (point) => {
+        assert.deepEqual(point, { x: -100, y: 40 });
+        return leftDisplay;
+      },
+      dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      getAllDisplays: () => [leftDisplay, rightDisplay],
+    },
+  });
+
+  const result = await harness.control.captureScreen();
+  assert.equal(result.ok, true);
+  assert.equal(result.path, "C:\\repo\\data\\screenshot-1700000000000.png");
+  assert.equal(result.artifact.title, "Screen Snapshot");
+  assert.equal(result.artifact.kind, "image");
+  assert.equal(result.artifact.content, `data:image/png;base64,${png.toString("base64")}`);
+  assert.deepEqual(result.display, {
+    id: 2,
+    bounds: { x: -1920, y: 0, width: 1920, height: 1080 },
+    scaleFactor: 1,
+    pixelSize: { width: 1920, height: 1080 },
+  });
+  assert.deepEqual(requestedThumbnail, {
+    types: ["screen"],
+    thumbnailSize: { width: 1920, height: 1080 },
+  });
+  assert.equal(harness.mkdirCalls.length, 1);
+  assert.equal(harness.writtenFiles.length, 1);
+  assert.deepEqual(harness.writtenFiles[0].contents, png);
+  assert.equal(harness.inputCalls.length, 0);
+});
+
+test("captureScreen requests physical pixels for mixed-DPI nearest display", async () => {
+  const display = { id: 9, bounds: { x: 100, y: 200, width: 1280, height: 720 }, scaleFactor: 1.5 };
+  let requested = null;
+  const harness = createHarness({
+    desktopCapturer: {
+      async getSources({ thumbnailSize }) {
+        requested = thumbnailSize;
+        return [
+          {
+            id: "screen:9",
+            display_id: "9",
+            thumbnail: createThumbnail({ width: 1920, height: 1080 }),
+          },
+        ];
+      },
+    },
+    screen: {
+      getCursorScreenPoint: () => ({ x: 120, y: 220 }),
+      getDisplayNearestPoint: () => display,
+      dipToScreenPoint: ({ x, y }) => ({ x, y }),
+    },
+  });
+  const result = await harness.control.captureScreen();
+  assert.equal(result.ok, true);
+  assert.deepEqual(requested, { width: 1920, height: 1080 });
+  assert.deepEqual(result.display.pixelSize, { width: 1920, height: 1080 });
+  assert.equal(result.display.scaleFactor, 1.5);
+});
+
+test("captureScreen reports structured failures for unavailable and empty captures", async () => {
+  assert.equal((await createHarness({ screen: null }).control.captureScreen()).code, "CAPTURE_UNAVAILABLE");
+  assert.equal(
+    (await createHarness({
+      screen: {
+        getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+        getDisplayNearestPoint: () => null,
+        dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      },
+      desktopCapturer: { async getSources() { return []; } },
+    }).control.captureScreen()).code,
+    "CAPTURE_NO_DISPLAYS",
+  );
+  assert.equal(
+    (await createHarness({
+      screen: {
+        getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+        getDisplayNearestPoint: () => ({ id: 1, bounds: { x: 0, y: 0, width: 100, height: 100 }, scaleFactor: 1 }),
+        dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      },
+      desktopCapturer: { async getSources() { return []; } },
+    }).control.captureScreen()).code,
+    "CAPTURE_NO_SOURCES",
+  );
+  assert.equal(
+    (await createHarness({
+      screen: {
+        getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+        getDisplayNearestPoint: () => ({ id: 1, bounds: { x: 0, y: 0, width: 100, height: 100 }, scaleFactor: 1 }),
+        dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      },
+      desktopCapturer: {
+        async getSources() {
+          return [
+            { id: "a", display_id: "2", thumbnail: createThumbnail({ width: 10, height: 10 }) },
+            { id: "b", display_id: "3", thumbnail: createThumbnail({ width: 11, height: 11 }) },
+          ];
+        },
+      },
+    }).control.captureScreen()).code,
+    "CAPTURE_NO_MATCHING_SOURCE",
+  );
+  assert.equal(
+    (await createHarness({
+      screen: {
+        getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+        getDisplayNearestPoint: () => ({ id: 1, bounds: { x: 0, y: 0, width: 100, height: 100 }, scaleFactor: 1 }),
+        dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      },
+      desktopCapturer: {
+        async getSources() {
+          return [{ id: "a", display_id: "1", thumbnail: null }];
+        },
+      },
+    }).control.captureScreen()).code,
+    "CAPTURE_EMPTY",
+  );
+  assert.equal(
+    (await createHarness({
+      screen: {
+        getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+        getDisplayNearestPoint: () => ({ id: 1, bounds: { x: 0, y: 0, width: 100, height: 100 }, scaleFactor: 1 }),
+        dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      },
+      desktopCapturer: {
+        async getSources() {
+          return [{ id: "a", display_id: "1", thumbnail: createThumbnail({ width: 100, height: 100, empty: true }) }];
+        },
+      },
+    }).control.captureScreen()).code,
+    "CAPTURE_PROTECTED_OR_EMPTY",
+  );
+  assert.equal(
+    (await createHarness({
+      screen: {
+        getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+        getDisplayNearestPoint: () => ({ id: 1, bounds: { x: 0, y: 0, width: 100, height: 100 }, scaleFactor: 1 }),
+        dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      },
+      desktopCapturer: {
+        async getSources() {
+          return [{ id: "a", display_id: "1", thumbnail: createThumbnail({ width: 100, height: 100, png: new Error("png boom") }) }];
+        },
+      },
+    }).control.captureScreen()).code,
+    "CAPTURE_PNG_FAILED",
+  );
+  assert.equal(
+    (await createHarness({
+      mkdirError: new Error("mkdir denied"),
+      screen: {
+        getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+        getDisplayNearestPoint: () => ({ id: 1, bounds: { x: 0, y: 0, width: 100, height: 100 }, scaleFactor: 1 }),
+        dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      },
+      desktopCapturer: {
+        async getSources() {
+          return [{ id: "a", display_id: "1", thumbnail: createThumbnail({ width: 100, height: 100 }) }];
+        },
+      },
+    }).control.captureScreen()).code,
+    "CAPTURE_MKDIR_FAILED",
+  );
+  assert.equal(
+    (await createHarness({
+      writeError: new Error("disk full"),
+      screen: {
+        getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+        getDisplayNearestPoint: () => ({ id: 1, bounds: { x: 0, y: 0, width: 100, height: 100 }, scaleFactor: 1 }),
+        dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      },
+      desktopCapturer: {
+        async getSources() {
+          return [{ id: "a", display_id: "1", thumbnail: createThumbnail({ width: 100, height: 100 }) }];
+        },
+      },
+    }).control.captureScreen()).code,
+    "CAPTURE_WRITE_FAILED",
+  );
+  assert.equal(
+    (await createHarness({
+      screen: {
+        getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+        getDisplayNearestPoint: () => ({ id: 1, bounds: { x: 0, y: 0, width: 100, height: 100 }, scaleFactor: 1 }),
+        dipToScreenPoint: ({ x, y }) => ({ x, y }),
+      },
+      desktopCapturer: {
+        async getSources() {
+          return [{ id: "a", display_id: "1", thumbnail: createThumbnail({ width: 100, height: 100, png: Buffer.from([1, 2, 3]) }) }];
+        },
+      },
+    }).control.captureScreen()).code,
+    "CAPTURE_PROTECTED_OR_EMPTY",
+  );
+});
+
+test("Phase 3 input capabilities remain unchanged and never call macOS binaries", async () => {
+  const harness = createHarness({
+    desktopCapturer: {
+      async getSources() {
+        throw new Error("capture should not run during input tests");
+      },
+    },
+  });
+  assert.equal((await harness.control.typeText({ text: "ok" })).ok, true);
+  assert.equal((await harness.control.pressKey({ key: "enter" })).ok, true);
+  assert.equal((await harness.control.scroll({ direction: "down", amount: 1 })).ok, true);
+  assert.deepEqual(
+    harness.inputCalls.map((call) => call.operation),
+    ["typeText", "pressKey", "scroll"],
+  );
+  assert.equal(JSON.stringify(harness.inputCalls).includes("osascript"), false);
+  assert.equal(JSON.stringify(harness.inputCalls).includes("screencapture"), false);
 });

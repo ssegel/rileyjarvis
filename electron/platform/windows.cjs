@@ -9,8 +9,8 @@ const maxTextLength = 32_768;
 const maxCoordinate = 1_000_000;
 const maxHelperOutput = 1_048_576;
 
-const supportedCapabilities = new Set(["openApp", "typeText", "pressKey", "click", "scroll"]);
-const capabilityNames = [...supportedCapabilities, "captureScreen", "inspectUi"];
+const supportedCapabilities = new Set(["openApp", "typeText", "pressKey", "click", "scroll", "captureScreen"]);
+const capabilityNames = [...supportedCapabilities, "inspectUi"];
 
 const keyVirtualKeys = Object.freeze({
   enter: 0x0d,
@@ -41,9 +41,9 @@ function unsupported(capability) {
   return {
     ok: false,
     platform: "win32",
-    phase: 3,
+    phase: 4,
     unsupportedCapability: capability,
-    error: `Desktop control capability "${capability}" is not implemented on Windows in Phase 3.`,
+    error: `Desktop control capability "${capability}" is not implemented on Windows in Phase 4.`,
   };
 }
 
@@ -51,10 +51,41 @@ function invalidInput(code, error) {
   return { ok: false, platform: "win32", code, error };
 }
 
+function captureError(code, error) {
+  return { ok: false, platform: "win32", code, error };
+}
+
+function physicalPixelSize(display) {
+  const scaleFactor = Number(display?.scaleFactor) > 0 ? Number(display.scaleFactor) : 1;
+  const width = Math.max(1, Math.round(Number(display?.bounds?.width || 0) * scaleFactor));
+  const height = Math.max(1, Math.round(Number(display?.bounds?.height || 0) * scaleFactor));
+  return { width, height, scaleFactor };
+}
+
+function matchScreenSource(sources, display, pixelSize) {
+  const list = Array.isArray(sources) ? sources : [];
+  const displayId = display?.id == null ? null : String(display.id);
+  if (displayId) {
+    const byDisplayId = list.find((source) => String(source?.display_id ?? "") === displayId);
+    if (byDisplayId) return byDisplayId;
+  }
+
+  const bySize = list.find((source) => {
+    const size = source?.thumbnail?.getSize?.();
+    return size && size.width === pixelSize.width && size.height === pixelSize.height;
+  });
+  if (bySize) return bySize;
+
+  return list.length === 1 ? list[0] : null;
+}
+
 function createWindowsDesktopControl(options = {}) {
   const inputRunner = options.inputRunner || runPowerShellInput;
   const shellApi = options.shell;
   const screenApi = options.screen;
+  const desktopCapturerApi = options.desktopCapturer;
+  const dataDir = options.dataDir;
+  const now = options.now || (() => Date.now());
   const fsApi = options.fs || fs;
   const launchProcess = options.launchProcess || defaultLaunchProcess;
   const windowsDirectory = path.win32.resolve(options.windowsDirectory || process.env.SystemRoot || "C:\\Windows");
@@ -137,7 +168,124 @@ function createWindowsDesktopControl(options = {}) {
       return { ok: true, message: `Scrolled ${direction}.` };
     },
 
-    captureScreen: async () => unsupported("captureScreen"),
+    async captureScreen() {
+      if (!dataDir || typeof dataDir !== "string") {
+        return captureError("CAPTURE_WRITE_FAILED", "Screenshot data directory is unavailable.");
+      }
+      if (!screenApi || typeof screenApi.getCursorScreenPoint !== "function" || typeof screenApi.getDisplayNearestPoint !== "function") {
+        return captureError("CAPTURE_UNAVAILABLE", "Windows screen APIs are unavailable.");
+      }
+      if (!desktopCapturerApi || typeof desktopCapturerApi.getSources !== "function") {
+        return captureError("CAPTURE_UNAVAILABLE", "Windows desktop capture API is unavailable.");
+      }
+
+      const cursorPoint = screenApi.getCursorScreenPoint();
+      const display = screenApi.getDisplayNearestPoint(cursorPoint);
+      if (!display || !display.bounds) {
+        return captureError("CAPTURE_NO_DISPLAYS", "No displays are available for screen capture.");
+      }
+
+      const pixelSize = physicalPixelSize(display);
+      let sources;
+      try {
+        sources = await desktopCapturerApi.getSources({
+          types: ["screen"],
+          thumbnailSize: { width: pixelSize.width, height: pixelSize.height },
+        });
+      } catch (error) {
+        return captureError(
+          "CAPTURE_UNAVAILABLE",
+          error instanceof Error ? error.message : "Desktop capturer failed to enumerate screen sources.",
+        );
+      }
+
+      if (!Array.isArray(sources) || sources.length === 0) {
+        return captureError("CAPTURE_NO_SOURCES", "No screen capture sources are available.");
+      }
+
+      const source = matchScreenSource(sources, display, pixelSize);
+      if (!source) {
+        return captureError("CAPTURE_NO_MATCHING_SOURCE", "No desktopCapturer source matched the display nearest the cursor.");
+      }
+
+      const thumbnail = source.thumbnail;
+      if (!thumbnail || typeof thumbnail.isEmpty !== "function" || typeof thumbnail.getSize !== "function") {
+        return captureError("CAPTURE_EMPTY", "Screen capture thumbnail is missing.");
+      }
+      if (thumbnail.isEmpty()) {
+        return captureError(
+          "CAPTURE_PROTECTED_OR_EMPTY",
+          "Screen capture thumbnail is empty. The target may be protected, elevated, or on a secure desktop.",
+        );
+      }
+
+      const size = thumbnail.getSize();
+      if (!size || size.width < 1 || size.height < 1) {
+        return captureError("CAPTURE_EMPTY", "Screen capture thumbnail has zero dimensions.");
+      }
+
+      let png;
+      try {
+        png = thumbnail.toPNG();
+      } catch (error) {
+        return captureError(
+          "CAPTURE_PNG_FAILED",
+          error instanceof Error ? error.message : "PNG conversion failed.",
+        );
+      }
+      if (!Buffer.isBuffer(png) || png.length === 0) {
+        return captureError("CAPTURE_PNG_FAILED", "PNG conversion produced an empty buffer.");
+      }
+
+      // Honest signal for obviously blank captures (common with protected/UAC content).
+      if (png.length < 256) {
+        return captureError(
+          "CAPTURE_PROTECTED_OR_EMPTY",
+          "Screen capture produced a suspiciously small PNG. The target may be protected or unavailable.",
+        );
+      }
+
+      const screenshotPath = path.join(dataDir, `screenshot-${now()}.png`);
+      try {
+        await fsApi.mkdir(dataDir, { recursive: true });
+      } catch (error) {
+        return captureError(
+          "CAPTURE_MKDIR_FAILED",
+          error instanceof Error ? error.message : "Failed to create screenshot directory.",
+        );
+      }
+
+      try {
+        await fsApi.writeFile(screenshotPath, png);
+      } catch (error) {
+        return captureError(
+          "CAPTURE_WRITE_FAILED",
+          error instanceof Error ? error.message : "Failed to write screenshot file.",
+        );
+      }
+
+      return {
+        ok: true,
+        path: screenshotPath,
+        artifact: {
+          title: "Screen Snapshot",
+          kind: "image",
+          content: `data:image/png;base64,${png.toString("base64")}`,
+        },
+        display: {
+          id: display.id,
+          bounds: {
+            x: display.bounds.x,
+            y: display.bounds.y,
+            width: display.bounds.width,
+            height: display.bounds.height,
+          },
+          scaleFactor: pixelSize.scaleFactor,
+          pixelSize: { width: pixelSize.width, height: pixelSize.height },
+        },
+      };
+    },
+
     inspectUi: async () => unsupported("inspectUi"),
   };
 }
@@ -271,5 +419,7 @@ module.exports = {
   createWindowsDesktopControl,
   helperPath,
   keyVirtualKeys,
+  matchScreenSource,
+  physicalPixelSize,
   runPowerShellInput,
 };
