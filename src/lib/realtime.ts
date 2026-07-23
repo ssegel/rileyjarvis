@@ -1,4 +1,11 @@
 import type { RickyArtifact, RickyToolCall, RickyToolResult, RickyToolSpec } from "../vite-env";
+import {
+  assertSingleRealtimePath,
+  countRealtimeResources,
+  createRemoteAudioElement,
+  releaseRemoteAudioElement,
+  type RealtimeResourceCounts,
+} from "./realtimeAudioLifecycle";
 
 export type RickyConnectionState = "idle" | "connecting" | "connected" | "error";
 export type RickyMood = "idle" | "listening" | "thinking" | "speaking" | "working" | "error";
@@ -54,11 +61,13 @@ type ResponseOutputItem = {
 };
 
 const realtimeUrl = "https://api.openai.com/v1/realtime/calls";
+const LOG_PREFIX = "[jarvis-realtime]";
 
 export class RickyRealtimeClient {
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private micStream: MediaStream | null = null;
+  private remoteAudio: HTMLAudioElement | null = null;
   private callbacks: RealtimeCallbacks;
   private currentAssistantText = "";
   private toolSpecs: RickyToolSpec[] = [];
@@ -67,13 +76,30 @@ export class RickyRealtimeClient {
   private outputAnalyser: AnalyserNode | null = null;
   private outputMeterFrame = 0;
   private smoothedMouthShape: MouthShape = silentMouthShape();
+  private responseAudioStarted = false;
+  private boundTrackHandler: ((event: RTCTrackEvent) => void) | null = null;
+  private boundDcOpenHandler: (() => void) | null = null;
+  private boundDcMessageHandler: ((event: MessageEvent) => void) | null = null;
 
   constructor(callbacks: RealtimeCallbacks) {
     this.callbacks = callbacks;
   }
 
+  getResourceCounts(): RealtimeResourceCounts {
+    return countRealtimeResources({
+      pc: this.pc,
+      remoteAudio: this.remoteAudio,
+      outputAnalyser: this.outputAnalyser,
+      micStream: this.micStream,
+      dc: this.dc,
+    });
+  }
+
   async connect(): Promise<void> {
-    if (this.pc) return;
+    this.log("connect start", this.getResourceCounts());
+    // Drop any leftover resources from a failed or partial prior connect on this instance.
+    this.releaseAllResources({ emitIdle: false });
+
     this.callbacks.onConnectionState("connecting");
     this.callbacks.onMood("thinking");
     this.callbacks.onStatus("Minting a Realtime client secret.");
@@ -82,13 +108,24 @@ export class RickyRealtimeClient {
       this.toolSpecs = await window.ricky.getToolSpecs();
       const token = await window.ricky.createRealtimeToken();
       const pc = new RTCPeerConnection();
-      const audio = document.createElement("audio");
-      audio.autoplay = true;
+      const audio = createRemoteAudioElement();
+      this.remoteAudio = audio;
 
-      pc.ontrack = (event) => {
-        audio.srcObject = event.streams[0];
-        this.startOutputMeter(event.streams[0]);
+      this.boundTrackHandler = (event: RTCTrackEvent) => {
+        const stream = event.streams[0] || new MediaStream([event.track]);
+        this.log("remote track received", {
+          trackKind: event.track.kind,
+          streamId: stream.id,
+          hasRemoteAudio: Boolean(this.remoteAudio),
+        });
+        if (!this.remoteAudio) return;
+        this.remoteAudio.srcObject = stream;
+        // Exactly one analyser per successful connection.
+        if (!this.outputAnalyser) {
+          this.startOutputMeter(stream);
+        }
       };
+      pc.addEventListener("track", this.boundTrackHandler);
 
       this.micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -100,14 +137,17 @@ export class RickyRealtimeClient {
       pc.addTrack(this.micStream.getAudioTracks()[0], this.micStream);
 
       const dc = pc.createDataChannel("oai-events");
-      dc.addEventListener("open", () => {
+      this.boundDcOpenHandler = () => {
         this.callbacks.onConnectionState("connected");
         this.callbacks.onMood("idle");
         this.callbacks.onStatus("Ricky is live. Start talking naturally.");
-      });
-      dc.addEventListener("message", (event) => {
-        void this.handleServerEvent(event.data);
-      });
+        this.log("connect success", this.getResourceCounts());
+      };
+      this.boundDcMessageHandler = (event: MessageEvent) => {
+        void this.handleServerEvent(String(event.data));
+      };
+      dc.addEventListener("open", this.boundDcOpenHandler);
+      dc.addEventListener("message", this.boundDcMessageHandler);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -132,6 +172,11 @@ export class RickyRealtimeClient {
 
       this.pc = pc;
       this.dc = dc;
+
+      const counts = this.getResourceCounts();
+      if (!assertSingleRealtimePath(counts)) {
+        this.log("connect warning: resource path not singular", counts);
+      }
     } catch (error) {
       this.callbacks.onConnectionState("error");
       this.callbacks.onMood("error");
@@ -141,17 +186,9 @@ export class RickyRealtimeClient {
   }
 
   disconnect(): void {
-    this.dc?.close();
-    this.pc?.close();
-    this.micStream?.getTracks().forEach((track) => track.stop());
-    this.stopOutputMeter();
-    this.dc = null;
-    this.pc = null;
-    this.micStream = null;
-    this.currentAssistantText = "";
-    this.callbacks.onConnectionState("idle");
-    this.callbacks.onMood("idle");
-    this.callbacks.onMouthShape(silentMouthShape());
+    this.log("disconnect start", this.getResourceCounts());
+    this.releaseAllResources({ emitIdle: true });
+    this.log("disconnect complete", this.getResourceCounts());
   }
 
   sendText(text: string): boolean {
@@ -167,8 +204,60 @@ export class RickyRealtimeClient {
         content: [{ type: "input_text", text }],
       },
     });
+    this.log("response creation", { source: "sendText" });
     this.sendEvent({ type: "response.create" });
     return true;
+  }
+
+  private releaseAllResources(options: { emitIdle: boolean }): void {
+    if (this.dc && this.boundDcOpenHandler) {
+      this.dc.removeEventListener("open", this.boundDcOpenHandler);
+    }
+    if (this.dc && this.boundDcMessageHandler) {
+      this.dc.removeEventListener("message", this.boundDcMessageHandler);
+    }
+    if (this.pc && this.boundTrackHandler) {
+      this.pc.removeEventListener("track", this.boundTrackHandler);
+    }
+
+    this.boundDcOpenHandler = null;
+    this.boundDcMessageHandler = null;
+    this.boundTrackHandler = null;
+
+    try {
+      this.dc?.close();
+    } catch {
+      // Ignore close races.
+    }
+    try {
+      this.pc?.close();
+    } catch {
+      // Ignore close races.
+    }
+
+    this.micStream?.getTracks().forEach((track) => {
+      try {
+        track.stop();
+      } catch {
+        // Ignore stop races.
+      }
+    });
+
+    this.stopOutputMeter();
+    this.remoteAudio = releaseRemoteAudioElement(this.remoteAudio);
+
+    this.dc = null;
+    this.pc = null;
+    this.micStream = null;
+    this.currentAssistantText = "";
+    this.responseAudioStarted = false;
+    this.toolRunning = false;
+
+    if (options.emitIdle) {
+      this.callbacks.onConnectionState("idle");
+      this.callbacks.onMood("idle");
+      this.callbacks.onMouthShape(silentMouthShape());
+    }
   }
 
   private async handleServerEvent(raw: string): Promise<void> {
@@ -182,22 +271,48 @@ export class RickyRealtimeClient {
     }
 
     if (event.type === "input_audio_buffer.speech_started") {
+      this.log("speech started");
       this.callbacks.onMood("listening");
       return;
     }
 
     if (event.type === "input_audio_buffer.speech_stopped") {
+      this.log("speech stopped");
       this.callbacks.onMood("thinking");
       return;
     }
 
+    if (
+      event.type === "response.created" ||
+      event.type === "response.created.completed" ||
+      event.type === "response.create"
+    ) {
+      this.log("response creation", { type: event.type });
+    }
+
     if (event.type === "response.audio.delta" || event.type === "response.output_audio.delta") {
+      if (!this.responseAudioStarted) {
+        this.responseAudioStarted = true;
+        this.log("response audio start");
+      }
       this.callbacks.onMood("speaking");
       return;
     }
 
     if (event.type === "response.output_audio.done" || event.type === "response.audio.done") {
+      this.log("response audio completion", { type: event.type });
+      this.responseAudioStarted = false;
       if (!this.toolRunning) this.callbacks.onMood("idle");
+      return;
+    }
+
+    if (
+      event.type === "response.cancelled" ||
+      event.type === "response.canceled" ||
+      event.type === "output_audio_buffer.cleared"
+    ) {
+      this.log("interruption or cancellation", { type: event.type });
+      this.responseAudioStarted = false;
       return;
     }
 
@@ -221,6 +336,7 @@ export class RickyRealtimeClient {
       const spoken = this.currentAssistantText || output.map(collectOutputText).filter(Boolean).join("\n");
       if (spoken) this.callbacks.onTranscript(newEntry("ricky", spoken));
       this.currentAssistantText = "";
+      this.responseAudioStarted = false;
 
       const functionCalls = output.filter((item) => item.type === "function_call" && item.name && item.call_id);
       if (functionCalls.length > 0) {
@@ -282,7 +398,10 @@ export class RickyRealtimeClient {
       await this.returnToolOutput(callId, result);
     }
 
-    if (shouldCreateResponse) this.sendEvent({ type: "response.create" });
+    if (shouldCreateResponse) {
+      this.log("response creation", { source: "tool_followup" });
+      this.sendEvent({ type: "response.create" });
+    }
     this.toolRunning = false;
   }
 
@@ -356,7 +475,24 @@ export class RickyRealtimeClient {
     this.outputAnalyser = null;
     this.smoothedMouthShape = silentMouthShape();
   }
+
+  private log(message: string, detail?: unknown): void {
+    if (detail !== undefined) {
+      console.debug(LOG_PREFIX, message, detail);
+    } else {
+      console.debug(LOG_PREFIX, message);
+    }
+  }
 }
+
+export {
+  assertSingleRealtimePath,
+  countRealtimeResources,
+  createRemoteAudioElement,
+  releaseRemoteAudioElement,
+};
+export type { RealtimeResourceCounts };
+export { isEmptyRealtimePath } from "./realtimeAudioLifecycle";
 
 function silentMouthShape(): MouthShape {
   return { open: 0, width: 0.18, round: 0, teeth: 0 };

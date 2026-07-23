@@ -27,6 +27,10 @@ export default function App() {
   const isConnected = connectionState === "connected";
 
   async function connect() {
+    // Prevent reconnect from retaining a prior client's audio path or peer connection.
+    clientRef.current?.disconnect();
+    clientRef.current = null;
+
     const client = new RickyRealtimeClient({
       onConnectionState: setConnectionState,
       onMood: setMood,
