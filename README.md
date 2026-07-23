@@ -11,8 +11,8 @@ It is built with Electron, React, Vite, TypeScript, and the OpenAI Realtime API.
 - Artifact panel for markdown, menus, notes, Mermaid diagrams, generated images, records, and progress.
 - YouTube thumbnail board with persistent numbered generations and image edits.
 - Optional Exa-powered web search.
-- Local notes and records stored at runtime under `data/`.
-- Optional computer-use mode for opening apps, clicking, typing, scrolling, screenshots, and UI inspection on macOS.
+- Local notes, records, and personal memory stored at runtime under `data/`.
+- Optional computer-use mode for opening apps, clicking, typing, scrolling, screenshots, and UI inspection on macOS and Windows 11.
 
 ## Requirements
 
@@ -22,7 +22,7 @@ It is built with Electron, React, Vite, TypeScript, and the OpenAI Realtime API.
 - An OpenAI API key with Realtime and image generation access
 - Optional: an Exa API key for web search
 
-Computer-use mode currently requires macOS. The voice, artifact, notes, records, image, and web-search features can run on Windows 11.
+Computer-use mode works on macOS and Windows 11. Voice, artifacts, notes, records, personal memory, image, and web-search features are available on both.
 
 ## Quick Start
 
@@ -85,7 +85,48 @@ npm start
 
 ## Runtime Data
 
-The app creates a local `data/` directory for notes, records, generated images, and thumbnail-board state. That directory is intentionally ignored by Git.
+The app creates a local `data/` directory for notes, records, generated images, thumbnail-board state, and personal memory. That directory is intentionally ignored by Git.
+
+### Personal memory (`data/memory/`)
+
+| Path | Purpose |
+|---|---|
+| `instructions.md` | Durable personal operating instructions |
+| `preferences.json` | Preferences and hard interaction rules |
+| `profile.json` | Profile facts with provenance and sensitivity |
+| `daily.json` | Today’s priorities, projects, commitments, follow-ups, unresolved items |
+| `entries.json` | Durable memory entries |
+| `archive/daily-YYYY-MM-DD.json` | Archived daily context after date rollover |
+| `backups/{timestamp}-*.json` | Timestamped snapshots before destructive changes (last 10 retained) |
+
+**Durability boundaries**
+
+- Durable: instructions, preferences, profile, entries, and daily working context.
+- Temporary: realtime conversation transcript stays in the current session only and is not written to memory files.
+- Open/blocked daily items carry forward when the calendar date changes; done items do not.
+
+**Privacy and sensitivity**
+
+- Sensitivity levels: `normal`, `sensitive`, `secret`.
+- `secret` values are excluded from automatic Realtime prompt injection.
+- `sensitive` values appear in injected context only as redacted labels.
+- Raw sensitive/secret content is available only through an explicit confirmed `memory_view`.
+- Memory tool acknowledgements stay concise; secret payloads are not logged.
+
+**Backup and OneDrive**
+
+- Clearing memory or fully replacing instructions creates a backup snapshot first.
+- Because `data/` is gitignored but may still sync if the project folder lives under OneDrive, treat memory files as local personal data and exclude or pause sync if needed.
+
+**Memory commands**
+
+- `memory_view` — view instructions, preferences, profile, daily, entries, or all
+- `memory_remember` — store an entry or profile fact
+- `memory_correct` — supersede a stored item while preserving history
+- `memory_update_daily` — update today’s working context
+- `memory_set_preference` — update preferences/hard rules
+- `memory_set_instructions` — append or replace instructions (`confirmed=true` required for full replace)
+- `memory_clear` — clear `daily`, `entries`, `preferences`, `instructions`, or `all` (`confirmed=true` required)
 
 Do not commit:
 
