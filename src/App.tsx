@@ -82,7 +82,22 @@ export default function App() {
   function sendTextPrompt() {
     const trimmed = textPrompt.trim();
     if (!trimmed) return;
-    clientRef.current?.sendText(trimmed);
+
+    if (!isConnected) {
+      const message = "Connect voice first.";
+      setStatus(message);
+      setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+      return;
+    }
+
+    const sent = clientRef.current?.sendText(trimmed) ?? false;
+    if (!sent) {
+      const message = "Connect voice first.";
+      setStatus(message);
+      setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+      return;
+    }
+
     setTextPrompt("");
     setShowTypeInput(false);
   }
@@ -116,20 +131,25 @@ export default function App() {
 
         <footer className="bottom-console">
           {showTypeInput ? (
-            <section className="prompt-box">
-              <input
-                value={textPrompt}
-                onChange={(event) => setTextPrompt(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") sendTextPrompt();
-                }}
-                autoFocus
-                placeholder="Type to Ricky..."
-              />
-              <button onClick={sendTextPrompt} aria-label="Send typed prompt" title="Send typed prompt">
-                <Send size={15} />
-              </button>
-            </section>
+            <>
+              <section className="prompt-box">
+                <input
+                  value={textPrompt}
+                  onChange={(event) => setTextPrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") sendTextPrompt();
+                  }}
+                  autoFocus
+                  placeholder="Type to Jarvis..."
+                />
+                <button onClick={sendTextPrompt} aria-label="Send typed prompt" title="Send typed prompt">
+                  <Send size={15} />
+                </button>
+              </section>
+              {status !== "Idle" ? (
+                <small role="status">{status}</small>
+              ) : null}
+            </>
           ) : null}
 
           <section className="control-strip">
@@ -145,8 +165,8 @@ export default function App() {
             <button
               className={showTypeInput ? "simple-button active" : "simple-button"}
               onClick={() => setShowTypeInput((value) => !value)}
-              aria-label="Type to Ricky"
-              title="Type to Ricky"
+              aria-label="Type to Jarvis"
+              title="Type to Jarvis"
             >
               <Keyboard size={16} />
             </button>

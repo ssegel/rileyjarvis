@@ -154,10 +154,9 @@ export class RickyRealtimeClient {
     this.callbacks.onMouthShape(silentMouthShape());
   }
 
-  sendText(text: string): void {
+  sendText(text: string): boolean {
     if (!this.dc || this.dc.readyState !== "open") {
-      this.callbacks.onStatus("Connect Ricky before sending a text prompt.");
-      return;
+      return false;
     }
     this.callbacks.onTranscript(newEntry("user", text));
     this.sendEvent({
@@ -169,6 +168,7 @@ export class RickyRealtimeClient {
       },
     });
     this.sendEvent({ type: "response.create" });
+    return true;
   }
 
   private async handleServerEvent(raw: string): Promise<void> {
