@@ -1,4 +1,9 @@
 import { RealtimeDiagnosticsBuffer } from "./realtimeDiagnostics";
+import {
+  deliveryDiagMessage,
+  planTextResultDelivery,
+  readAssistantText,
+} from "./textDelivery";
 import type {
   JarvisTextHistoryItem,
   JarvisTextTurnResult,
@@ -18,7 +23,7 @@ export type TextClientCallbacks = {
   onState: (state: TextTurnState) => void;
   onStatus: (message: string) => void;
   onUserText: (text: string) => void;
-  onAssistantText: (text: string) => void;
+  onAssistantText: (text: string, clientTurnId: string) => void;
   onArtifact: (artifact: RickyArtifact) => void;
   onError: (message: string, code?: string) => void;
 };
@@ -41,6 +46,10 @@ export class TextClient {
 
   getActiveTurnId(): string | null {
     return this.activeTurnId;
+  }
+
+  getGeneration(): number {
+    return this.generation;
   }
 
   isActive(): boolean {
@@ -93,8 +102,22 @@ export class TextClient {
         history,
       });
 
-      // Drop late results after cancel/timeout supersession.
-      if (generation !== this.generation || this.activeTurnId !== clientTurnId) {
+      const mainText = readAssistantText(result);
+      this.diag(
+        "info",
+        "text.delivery.main",
+        deliveryDiagMessage({
+          mainHasText: Boolean(mainText),
+          mainTextLen: mainText.length,
+        }),
+        clientTurnId,
+        result,
+      );
+
+      const plan = planTextResultDelivery(result, generation, this.generation);
+
+      // Drop late results after cancel/timeout supersession (generation only).
+      if (plan.action === "reject" && plan.reason === "stale") {
         this.setState("cancelled");
         this.diag("warn", "text.turn.late_result_dropped", "Late text result ignored after cancel", clientTurnId);
         return {
@@ -111,29 +134,28 @@ export class TextClient {
         };
       }
 
-      if (result.cancelled || result.outcome === "cancelled") {
+      if (plan.action === "reject" && plan.reason === "cancelled") {
         this.setState("cancelled");
         this.callbacks.onStatus("Text request cancelled.");
         this.diag("warn", "text.turn.cancelled", "Text turn cancelled", clientTurnId, result);
-        return result;
+        return result!;
       }
 
-      if (!result.ok) {
+      if (plan.action === "reject" && (plan.reason === "error" || plan.reason === "missing")) {
         this.setState("error");
-        const message = result.error?.message || "The text request failed. Try again.";
-        this.callbacks.onError(message, result.error?.code);
+        const message = result?.error?.message || "The text request failed. Try again.";
+        this.callbacks.onError(message, result?.error?.code);
         this.diag("error", "text.turn.error", message, clientTurnId, result);
         return result;
       }
 
-      const hasVisibleOutput =
-        Boolean(result.assistantText?.trim()) || (result.artifacts?.length ?? 0) > 0;
-      if (!hasVisibleOutput) {
+      if (plan.action === "empty_error") {
         const emptyResult: JarvisTextTurnResult = {
-          ...result,
+          ...(result as JarvisTextTurnResult),
           ok: false,
           outcome: "error",
           cancelled: false,
+          assistantText: "",
           error: {
             code: "api.bad_response",
             message: "Jarvis returned no visible response.",
@@ -146,20 +168,46 @@ export class TextClient {
         return emptyResult;
       }
 
-      if (result.toolTrace?.length) {
+      if (plan.action !== "deliver") {
+        this.setState("error");
+        this.callbacks.onError("The text request failed. Try again.", "unknown");
+        return result;
+      }
+
+      // Successful visible delivery path.
+      if (result!.toolTrace?.length) {
         this.setState("tool-running");
       }
 
-      // Deliver visible output before completing so the log updates before idle.
-      for (const artifact of result.artifacts || []) {
+      for (const artifact of result!.artifacts || []) {
         this.callbacks.onArtifact(artifact);
       }
-      if (result.assistantText?.trim()) {
-        this.callbacks.onAssistantText(result.assistantText);
+
+      let clientDelivered = false;
+      if (plan.assistantText) {
+        this.callbacks.onAssistantText(plan.assistantText, clientTurnId);
+        clientDelivered = true;
       }
+
+      this.diag(
+        "info",
+        "text.delivery.client",
+        deliveryDiagMessage({
+          mainHasText: Boolean(plan.assistantTextLen),
+          mainTextLen: plan.assistantTextLen,
+          clientDelivered,
+        }),
+        clientTurnId,
+        result,
+      );
+
       this.setState("completed");
       this.diag("info", "text.turn.completed", "Text turn completed", clientTurnId, result);
-      return result;
+      // Preserve nonempty assistantText on the returned result for App verification.
+      return {
+        ...result!,
+        assistantText: plan.assistantText || result!.assistantText || "",
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : "The text request failed. Try again.";
       this.setState("error");
@@ -232,3 +280,11 @@ export class TextClient {
     });
   }
 }
+
+export {
+  deliveryDiagMessage,
+  hasDeliverableTextResult,
+  isCurrentTextGeneration,
+  planTextResultDelivery,
+  readAssistantText,
+} from "./textDelivery";

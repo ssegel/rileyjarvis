@@ -15,6 +15,7 @@ import {
 import { RealtimeDiagnosticsBuffer } from "./lib/realtimeDiagnostics";
 import { SessionOwnerLock } from "./lib/sessionOwner";
 import { buildTextHistoryFromTranscript } from "./lib/textHistory";
+import { deliveryDiagMessage, readAssistantText } from "./lib/textDelivery";
 import { TextClient, type TextTurnState } from "./lib/textClient";
 import type { RickyArtifact } from "./vite-env";
 
@@ -62,6 +63,27 @@ export default function App() {
   const textClientRef = useRef<TextClient | null>(null);
   const transcriptRef = useRef(transcript);
   transcriptRef.current = transcript;
+  const deliveredAssistantTurnRef = useRef<string | null>(null);
+  const appendAssistantToLogRef = useRef<(text: string, clientTurnId: string) => boolean>(() => false);
+
+  function appendAssistantToLog(text: string, clientTurnId: string): boolean {
+    const trimmed = String(text || "").trim();
+    if (!trimmed) return false;
+    if (deliveredAssistantTurnRef.current === clientTurnId) return true;
+    deliveredAssistantTurnRef.current = clientTurnId;
+    setTranscript((items) => [newEntry("ricky", trimmed), ...items].slice(0, 80));
+    diagnosticsRef.current.record({
+      level: "info",
+      event: "text.delivery.app",
+      connectionId: `text:${clientTurnId}`,
+      message: deliveryDiagMessage({
+        appAppended: true,
+        appTextLen: trimmed.length,
+      }),
+    });
+    return true;
+  }
+  appendAssistantToLogRef.current = appendAssistantToLog;
 
   if (!textClientRef.current) {
     textClientRef.current = new TextClient(
@@ -78,8 +100,8 @@ export default function App() {
         onUserText: (text) => {
           setTranscript((items) => [newEntry("user", text), ...items].slice(0, 80));
         },
-        onAssistantText: (text) => {
-          setTranscript((items) => [newEntry("ricky", text), ...items].slice(0, 80));
+        onAssistantText: (text, clientTurnId) => {
+          appendAssistantToLogRef.current(text, clientTurnId);
         },
         onArtifact: (nextArtifact) => {
           setArtifact(nextArtifact);
@@ -234,11 +256,35 @@ export default function App() {
 
     try {
       const result = await textClientRef.current?.submit(trimmed, history);
-      const delivered =
-        Boolean(result?.ok) &&
-        (Boolean(result?.assistantText?.trim()) || (result?.artifacts?.length ?? 0) > 0);
-      // Keep the input until a visible assistant response or artifact is delivered.
-      if (delivered) {
+      const assistantText = readAssistantText(result);
+      const hasArtifact = (result?.artifacts?.length ?? 0) > 0;
+
+      // Append successful assistant text to the Running Response Log BEFORE closing the field.
+      let appended = false;
+      if (result?.ok && assistantText && result.clientTurnId) {
+        appended = appendAssistantToLog(assistantText, result.clientTurnId);
+      }
+
+      const delivered = Boolean(result?.ok) && ((appended && Boolean(assistantText)) || hasArtifact);
+
+      if (result?.ok && assistantText && !appended) {
+        const message = "Jarvis responded, but the reply could not be shown. Try again.";
+        setStatus(message);
+        setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+        diagnosticsRef.current.record({
+          level: "error",
+          event: "text.delivery.app_failed",
+          connectionId: `text:${result.clientTurnId || "unknown"}`,
+          message: deliveryDiagMessage({
+            mainHasText: true,
+            mainTextLen: assistantText.length,
+            clientDelivered: deliveredAssistantTurnRef.current === result.clientTurnId,
+            appAppended: false,
+            appTextLen: 0,
+          }),
+        });
+      } else if (delivered) {
+        // Clear/close only after visible assistant text or an artifact has been delivered.
         setTextPrompt("");
         setShowTypeInput(false);
         setLastError(null);

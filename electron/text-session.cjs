@@ -182,6 +182,7 @@ function createTextSessionController(deps) {
             outcome: "completed",
             usage,
             toolCalls: toolTrace.length,
+            assistantTextLen: visibleText.length,
           });
           return {
             ok: true,
@@ -761,6 +762,9 @@ function logTextUsage(details) {
       inputTokens: details.usage?.inputTokens || 0,
       outputTokens: details.usage?.outputTokens || 0,
       toolCalls: details.toolCalls || 0,
+      // Length only — never log assistant response content.
+      assistantTextLen:
+        typeof details.assistantTextLen === "number" ? details.assistantTextLen : undefined,
       errorCode: details.errorCode || undefined,
       httpStatus: details.httpStatus || undefined,
       apiErrorType: details.apiErrorType || undefined,

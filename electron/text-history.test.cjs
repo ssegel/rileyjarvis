@@ -136,7 +136,7 @@ test("App builds history before TextClient submit appends the current user turn"
 
 test("successful assistant text is delivered before completed/idle state", () => {
   const textClient = fs.readFileSync(path.join(root, "src", "lib", "textClient.ts"), "utf8");
-  const assistantIdx = textClient.indexOf("this.callbacks.onAssistantText(result.assistantText)");
+  const assistantIdx = textClient.indexOf("this.callbacks.onAssistantText(plan.assistantText, clientTurnId)");
   const completedIdx = textClient.indexOf('this.setState("completed")');
   assert.ok(assistantIdx >= 0 && completedIdx > assistantIdx);
 });
@@ -169,14 +169,14 @@ test("ok true with no assistant text and no artifact becomes a readable text err
 
   const textClient = fs.readFileSync(path.join(root, "src", "lib", "textClient.ts"), "utf8");
   assert.match(textClient, /Jarvis returned no visible response/);
-  assert.match(textClient, /hasVisibleOutput/);
+  assert.match(textClient, /empty_error|planTextResultDelivery/);
 });
 
 test("App clears and closes the input only after visible assistant text or artifact", () => {
   const app = fs.readFileSync(path.join(root, "src", "App.tsx"), "utf8");
   assert.match(app, /const delivered =/);
-  assert.match(app, /result\?\.assistantText\?\.trim\(\)/);
-  assert.match(app, /result\?\.artifacts\?\.length/);
+  assert.match(app, /appendAssistantToLog\(assistantText/);
+  assert.match(app, /hasArtifact/);
   assert.match(app, /if \(delivered\) \{/);
   assert.match(app, /setTextPrompt\(""\)/);
   assert.match(app, /setShowTypeInput\(false\)/);
