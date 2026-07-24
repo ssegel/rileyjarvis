@@ -249,6 +249,10 @@ function createTextSessionController(deps) {
         usage,
         toolCalls: toolTrace.length,
         errorCode: classified.code,
+        httpStatus: classified.httpStatus,
+        apiErrorType: classified.apiErrorType,
+        apiErrorCode: classified.apiErrorCode,
+        apiErrorParam: classified.apiErrorParam,
       });
       return {
         ok: false,
@@ -265,6 +269,9 @@ function createTextSessionController(deps) {
           message: classified.userMessage,
           httpStatus: classified.httpStatus,
           retryable: classified.retryable,
+          apiErrorType: classified.apiErrorType,
+          apiErrorCode: classified.apiErrorCode,
+          apiErrorParam: classified.apiErrorParam,
         },
       };
     } finally {
@@ -381,9 +388,8 @@ async function callResponsesApi(options) {
     tools,
     tool_choice: "auto",
     store: false,
-    tracing: {
-      workflow_name: "Jarvis Text",
-    },
+    // Responses API rejects the Realtime-style tracing object (unknown_parameter).
+    // Text identity is logged via [jarvis-text] usage only.
     input,
   };
 
@@ -413,26 +419,13 @@ async function callResponsesApi(options) {
 
   if (!response.ok) {
     const text = await response.text();
-    const lower = String(text || "").toLowerCase();
-    const classified = classifyHttpFailure({
+    throw createResponsesHttpError({
       httpStatus: response.status,
       bodyText: text,
       retryAfterHeader: response.headers.get("retry-after"),
+      classifyHttpFailure,
+      createTokenError,
     });
-    if (
-      lower.includes("model") &&
-      (lower.includes("not found") ||
-        lower.includes("does not exist") ||
-        lower.includes("invalid model") ||
-        lower.includes("model_not_found"))
-    ) {
-      throw createTokenError({
-        ...classified,
-        userMessage: "The configured text model is unavailable. Check OPENAI_TEXT_MODEL in `.env.local`.",
-        retryable: false,
-      });
-    }
-    throw createTokenError(classified);
   }
 
   let data;
@@ -493,19 +486,98 @@ function sanitizeToolResult(result) {
   };
 }
 
+function parseOpenAiErrorBody(bodyText) {
+  try {
+    const parsed = JSON.parse(String(bodyText || ""));
+    const err = parsed && parsed.error && typeof parsed.error === "object" ? parsed.error : null;
+    if (!err) return null;
+    return {
+      type: typeof err.type === "string" ? err.type.slice(0, 80) : undefined,
+      code: typeof err.code === "string" ? err.code.slice(0, 80) : undefined,
+      param: typeof err.param === "string" ? err.param.slice(0, 80) : undefined,
+      message: typeof err.message === "string" ? err.message.slice(0, 200) : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function createResponsesHttpError(options) {
+  const { httpStatus, bodyText, retryAfterHeader, classifyHttpFailure, createTokenError } = options;
+  const apiError = parseOpenAiErrorBody(bodyText);
+  const lower = String(bodyText || "").toLowerCase();
+  const classified = classifyHttpFailure({
+    httpStatus,
+    bodyText,
+    retryAfterHeader,
+  });
+
+  let userMessage = classified.userMessage;
+  let code = classified.code;
+  let retryable = classified.retryable !== false;
+
+  if (
+    lower.includes("model") &&
+    (lower.includes("not found") ||
+      lower.includes("does not exist") ||
+      lower.includes("invalid model") ||
+      lower.includes("model_not_found"))
+  ) {
+    code = classified.code || "unknown";
+    userMessage = "The configured text model is unavailable. Check OPENAI_TEXT_MODEL in `.env.local`.";
+    retryable = false;
+  } else if (
+    apiError?.code === "unknown_parameter" ||
+    apiError?.param === "tracing" ||
+    (apiError?.type === "invalid_request_error" && /unknown parameter/i.test(apiError.message || ""))
+  ) {
+    code = "api.bad_response";
+    userMessage = "Text request configuration was rejected. Check the text-mode settings and try again.";
+    retryable = false;
+  } else if (classified.code === "unknown" && httpStatus >= 400 && httpStatus < 500) {
+    code = "api.bad_response";
+    userMessage = "The text request failed. Try again, or check OPENAI_TEXT_MODEL in `.env.local`.";
+  }
+
+  const error = createTokenError({
+    ...classified,
+    code,
+    userMessage,
+    retryable,
+  });
+  error.apiErrorType = apiError?.type;
+  error.apiErrorCode = apiError?.code;
+  error.apiErrorParam = apiError?.param;
+  error.userMessage = userMessage;
+  error.retryable = retryable;
+  return error;
+}
+
 function classifyThrown(error, classifyHttpFailure) {
   const message = error instanceof Error ? error.message : String(error || "");
+  const apiMeta = {
+    apiErrorType: error && error.apiErrorType,
+    apiErrorCode: error && error.apiErrorCode,
+    apiErrorParam: error && error.apiErrorParam,
+  };
   if (message.startsWith("JARVIS_TOKEN_ERROR:")) {
     try {
       const payload = JSON.parse(message.slice("JARVIS_TOKEN_ERROR:".length));
       return {
         code: payload.code || "unknown",
-        userMessage: payload.message || "Something went wrong connecting Jarvis.",
+        userMessage:
+          (error && error.userMessage) ||
+          payload.message ||
+          "The text request failed. Try again.",
         retryable:
-          payload.code !== "quota.exhausted" &&
-          payload.code !== "config.missing_api_key" &&
-          payload.code !== "config.invalid_api_key",
-        httpStatus: payload.httpStatus,
+          typeof error?.retryable === "boolean"
+            ? error.retryable
+            : payload.code !== "quota.exhausted" &&
+              payload.code !== "config.missing_api_key" &&
+              payload.code !== "config.invalid_api_key" &&
+              payload.code !== "api.bad_response",
+        httpStatus: payload.httpStatus || error?.httpStatus,
+        ...apiMeta,
       };
     } catch {
       // fall through
@@ -517,16 +589,21 @@ function classifyThrown(error, classifyHttpFailure) {
       userMessage: error.userMessage,
       retryable: Boolean(error.retryable),
       httpStatus: error.httpStatus,
+      ...apiMeta,
     };
   }
   const statusMatch = message.match(/\b(401|403|429|500|502|503|504)\b/);
   if (statusMatch) {
-    return classifyHttpFailure({ httpStatus: Number(statusMatch[1]), bodyText: message });
+    return {
+      ...classifyHttpFailure({ httpStatus: Number(statusMatch[1]), bodyText: message }),
+      ...apiMeta,
+    };
   }
   return {
     code: "unknown",
-    userMessage: "Something went wrong connecting Jarvis.",
+    userMessage: "The text request failed. Try again.",
     retryable: true,
+    ...apiMeta,
   };
 }
 
@@ -590,6 +667,10 @@ function logTextUsage(details) {
       outputTokens: details.usage?.outputTokens || 0,
       toolCalls: details.toolCalls || 0,
       errorCode: details.errorCode || undefined,
+      httpStatus: details.httpStatus || undefined,
+      apiErrorType: details.apiErrorType || undefined,
+      apiErrorCode: details.apiErrorCode || undefined,
+      apiErrorParam: details.apiErrorParam || undefined,
     }),
   );
 }
@@ -600,6 +681,8 @@ module.exports = {
   mapToolsForResponses,
   extractOutputText,
   sanitizeToolResult,
+  parseOpenAiErrorBody,
+  createResponsesHttpError,
   DEFAULT_TEXT_MODEL,
   DEFAULT_TIMEOUT_MS,
   MAX_TOOL_LOOP_ITERATIONS,

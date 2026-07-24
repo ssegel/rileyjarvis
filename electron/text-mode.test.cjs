@@ -545,11 +545,98 @@ test("history builder excludes tool roles and bounds recent transcript", () => {
   assert.equal(mapped[0].type, "function");
 });
 
+test("Responses request bodies omit tracing; Realtime tracing unchanged", () => {
+  const textSession = read("electron/text-session.cjs");
+  const main = read("electron/main.cjs");
+  assert.match(textSession, /v1\/responses/);
+  assert.doesNotMatch(textSession, /\btracing\s*:/);
+  assert.doesNotMatch(textSession, /workflow_name:\s*"Jarvis Text"/);
+  assert.match(textSession, /\[jarvis-text\] usage/);
+  assert.match(main, /v1\/realtime\/client_secrets/);
+  assert.match(main, /workflow_name:\s*"Jarvis Desktop Companion"/);
+  assert.match(main, /tracing:\s*\{/);
+});
+
+test("simulated 400 unknown_parameter preserves structured fields and text-specific message", async () => {
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => {
+    logs.push(args.map(String).join(" "));
+  };
+  try {
+    const controller = createTextSessionController({
+      getApiKey: () => "sk-test",
+      getTextModel: () => "gpt-4.1",
+      buildInstructions: async () => "instructions",
+      getToolSpecs: () => [],
+      executeTool: async () => ({ ok: true }),
+      classifyHttpFailure: () => ({
+        code: "unknown",
+        userMessage: "Something went wrong connecting Jarvis.",
+        retryable: true,
+        httpStatus: 400,
+      }),
+      createTokenError: (c) => {
+        const err = new Error(
+          `JARVIS_TOKEN_ERROR:${JSON.stringify({
+            code: c.code,
+            message: c.userMessage,
+            httpStatus: c.httpStatus,
+          })}`,
+        );
+        err.code = c.code;
+        err.httpStatus = c.httpStatus;
+        return err;
+      },
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(init.body);
+        assert.equal(Object.prototype.hasOwnProperty.call(body, "tracing"), false);
+        return {
+          ok: false,
+          status: 400,
+          headers: { get: () => null },
+          async text() {
+            return JSON.stringify({
+              error: {
+                message: "Unknown parameter: 'tracing'.",
+                type: "invalid_request_error",
+                param: "tracing",
+                code: "unknown_parameter",
+              },
+            });
+          },
+        };
+      },
+    });
+
+    const result = await controller.runTextTurn({ clientTurnId: "turn-tracing", text: "hello" });
+    assert.equal(result.ok, false);
+    assert.equal(result.error.httpStatus, 400);
+    assert.equal(result.error.apiErrorType, "invalid_request_error");
+    assert.equal(result.error.apiErrorCode, "unknown_parameter");
+    assert.equal(result.error.apiErrorParam, "tracing");
+    assert.match(result.error.message, /Text request configuration was rejected/i);
+    assert.doesNotMatch(result.error.message, /connecting Jarvis/i);
+    assert.doesNotMatch(JSON.stringify(result), /sk-test/);
+    assert.doesNotMatch(JSON.stringify(result), /Unknown parameter: 'tracing'\./);
+
+    const usageLog = logs.find((line) => line.includes("[jarvis-text] usage"));
+    assert.ok(usageLog);
+    assert.match(usageLog, /"httpStatus":400/);
+    assert.match(usageLog, /"apiErrorCode":"unknown_parameter"/);
+    assert.match(usageLog, /"apiErrorParam":"tracing"/);
+    assert.doesNotMatch(usageLog, /sk-test/);
+    assert.doesNotMatch(usageLog, /Authorization/);
+  } finally {
+    console.info = originalInfo;
+  }
+});
+
 test("Realtime and Responses transports remain separate", () => {
   const textSession = read("electron/text-session.cjs");
   const main = read("electron/main.cjs");
   assert.match(textSession, /v1\/responses/);
   assert.match(main, /v1\/realtime\/client_secrets/);
-  assert.match(textSession, /Jarvis Text/);
+  assert.match(textSession, /\[jarvis-text\]/);
   assert.match(main, /Jarvis Desktop Companion/);
 });

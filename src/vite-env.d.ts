@@ -67,6 +67,9 @@ export type JarvisTextTurnError = {
   message: string;
   httpStatus?: number;
   retryable?: boolean;
+  apiErrorType?: string;
+  apiErrorCode?: string;
+  apiErrorParam?: string;
 };
 
 export type JarvisTextTurnResult = {

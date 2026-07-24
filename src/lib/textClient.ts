@@ -120,7 +120,7 @@ export class TextClient {
 
       if (!result.ok) {
         this.setState("error");
-        const message = result.error?.message || "Something went wrong connecting Jarvis.";
+        const message = result.error?.message || "The text request failed. Try again.";
         this.callbacks.onError(message, result.error?.code);
         this.diag("error", "text.turn.error", message, clientTurnId, result);
         return result;
@@ -140,7 +140,7 @@ export class TextClient {
       this.diag("info", "text.turn.completed", "Text turn completed", clientTurnId, result);
       return result;
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Something went wrong connecting Jarvis.";
+      const message = error instanceof Error ? error.message : "The text request failed. Try again.";
       this.setState("error");
       this.callbacks.onError(message, "unknown");
       this.diag("error", "text.turn.exception", message, clientTurnId);
@@ -200,6 +200,10 @@ export class TextClient {
         result?.usage ? `model=${result.usage.model}` : null,
         result?.usage ? `inputTokens=${result.usage.inputTokens}` : null,
         result?.usage ? `outputTokens=${result.usage.outputTokens}` : null,
+        result?.error?.httpStatus != null ? `httpStatus=${result.error.httpStatus}` : null,
+        result?.error?.apiErrorType ? `apiErrorType=${result.error.apiErrorType}` : null,
+        result?.error?.apiErrorCode ? `apiErrorCode=${result.error.apiErrorCode}` : null,
+        result?.error?.apiErrorParam ? `apiErrorParam=${result.error.apiErrorParam}` : null,
       ]
         .filter(Boolean)
         .join(" "),

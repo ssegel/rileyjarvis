@@ -85,13 +85,10 @@ export default function App() {
           setArtifactVisible(true);
           if (nextArtifact.fullscreen) setArtifactFullscreen(true);
         },
-        onError: (message, code) => {
-          setLastError({
-            code: (code as ClassifiedRealtimeError["code"]) || "unknown",
-            userMessage: message,
-            retryable: true,
-          });
+        onError: (message) => {
+          // Text errors must not overwrite Realtime lastError / voice recovery UI.
           setStatus(message);
+          setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
         },
       },
       diagnosticsRef.current,
@@ -287,7 +284,8 @@ export default function App() {
     );
   }
 
-  const statusLine = lastError?.userMessage || (status !== "Idle" ? status : SESSION_LABELS[sessionUiState]);
+  const statusLine =
+    status !== "Idle" ? status : lastError?.userMessage || SESSION_LABELS[sessionUiState];
 
   return (
     <main className="app-shell">
