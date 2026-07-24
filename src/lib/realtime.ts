@@ -6,6 +6,7 @@ import {
   releaseRemoteAudioElement,
   type RealtimeResourceCounts,
 } from "./realtimeAudioLifecycle";
+import { RealtimeDiagnosticsBuffer } from "./realtimeDiagnostics";
 import {
   afterActiveResponseFinished,
   afterResponseCreated,
@@ -14,9 +15,27 @@ import {
   planBargeIn,
   shouldAcceptResponseScopedEvent,
 } from "./realtimeInterruptGate";
+import {
+  MAX_CONNECT_ATTEMPTS,
+  buildError,
+  classifyHttpFailure,
+  classifySessionError,
+  classifyThrownValue,
+  computeRetryDelayMs,
+  sanitizeDiagnosticText,
+  type ClassifiedRealtimeError,
+} from "./realtimeErrors";
 
 export type RickyConnectionState = "idle" | "connecting" | "connected" | "error";
 export type RickyMood = "idle" | "listening" | "thinking" | "speaking" | "working" | "error";
+export type SessionUiState =
+  | "disconnected"
+  | "connecting"
+  | "listening"
+  | "thinking"
+  | "speaking"
+  | "reconnecting"
+  | "error";
 
 export type MouthShape = {
   open: number;
@@ -41,6 +60,8 @@ export type RealtimeCallbacks = {
   onMode: (mode: "display" | "computer") => void;
   onStatus: (message: string) => void;
   onThumbnailReady: () => void;
+  onSessionUiState?: (state: SessionUiState) => void;
+  onError?: (error: ClassifiedRealtimeError | null) => void;
 };
 
 type ServerEvent = {
@@ -97,6 +118,19 @@ export class RickyRealtimeClient {
   private boundTrackHandler: ((event: RTCTrackEvent) => void) | null = null;
   private boundDcOpenHandler: (() => void) | null = null;
   private boundDcMessageHandler: ((event: MessageEvent) => void) | null = null;
+  private boundPcStateHandler: (() => void) | null = null;
+  private boundDcCloseHandler: (() => void) | null = null;
+  private diagnostics = new RealtimeDiagnosticsBuffer();
+  private connectionId = "";
+  private lastError: ClassifiedRealtimeError | null = null;
+  private userCancelled = false;
+  private intentionalClose = false;
+  private handlingTransportLoss = false;
+  private retryAttempt = 0;
+  private retryTimer: number | null = null;
+  private retryWaitResolve: (() => void) | null = null;
+  private sessionConnected = false;
+  private reconnecting = false;
 
   constructor(callbacks: RealtimeCallbacks) {
     this.callbacks = callbacks;
@@ -112,39 +146,174 @@ export class RickyRealtimeClient {
     });
   }
 
-  async connect(): Promise<void> {
-    this.log("connect start", this.getResourceCounts());
-    // Drop any leftover resources from a failed or partial prior connect on this instance.
-    this.releaseAllResources({ emitIdle: false });
+  getLastError(): ClassifiedRealtimeError | null {
+    return this.lastError;
+  }
 
-    this.callbacks.onConnectionState("connecting");
+  getDiagnosticReport(): string {
+    return this.diagnostics.buildCopyableReport({
+      appVersion: "1.0.0",
+      platform: typeof navigator !== "undefined" ? navigator.platform : "unknown",
+      userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
+      lastErrorCode: this.lastError?.code,
+    });
+  }
+
+  async connect(): Promise<void> {
+    this.userCancelled = false;
+    this.intentionalClose = false;
+    this.handlingTransportLoss = false;
+    this.retryAttempt = 0;
+    this.reconnecting = false;
+    this.lastError = null;
+    this.callbacks.onError?.(null);
+    await this.connectWithRetryBudget();
+  }
+
+  async retry(): Promise<void> {
+    this.userCancelled = false;
+    this.intentionalClose = false;
+    this.handlingTransportLoss = false;
+    this.retryAttempt = 0;
+    this.reconnecting = false;
+    this.clearRetryTimer();
+    this.releaseAllResources({ emitIdle: false });
+    this.lastError = null;
+    this.callbacks.onError?.(null);
+    await this.connectWithRetryBudget();
+  }
+
+  disconnect(): void {
+    this.log("disconnect start", this.getResourceCounts());
+    this.userCancelled = true;
+    this.intentionalClose = true;
+    this.clearRetryTimer();
+    this.reconnecting = false;
+    this.sessionConnected = false;
+    this.lastError = null;
+    this.callbacks.onError?.(null);
+    this.releaseAllResources({ emitIdle: true });
+    this.emitSessionUiState("disconnected");
+    this.callbacks.onStatus("Disconnected");
+    this.log("disconnect complete", this.getResourceCounts());
+  }
+
+  dismissError(): void {
+    this.userCancelled = true;
+    this.intentionalClose = true;
+    this.clearRetryTimer();
+    this.reconnecting = false;
+    this.sessionConnected = false;
+    // Keep diagnostics; clear visible error and return to disconnected.
+    this.lastError = null;
+    this.callbacks.onError?.(null);
+    this.releaseAllResources({ emitIdle: true });
+    this.emitSessionUiState("disconnected");
+    this.callbacks.onStatus("Disconnected");
+  }
+
+  private async connectWithRetryBudget(): Promise<void> {
+    while (!this.userCancelled) {
+      const attemptIndex = this.retryAttempt;
+      this.connectionId = crypto.randomUUID();
+      this.reconnecting = attemptIndex > 0;
+      this.emitConnectingState();
+      this.diag("info", attemptIndex > 0 ? "reconnect.start" : "connect.start", "Starting Realtime connect", {
+        resourceCounts: this.getResourceCounts(),
+      });
+
+      // Drop any leftover resources from a failed or partial prior connect on this instance.
+      this.releaseAllResources({ emitIdle: false });
+
+      try {
+        await this.connectOnce();
+        this.retryAttempt = 0;
+        this.reconnecting = false;
+        this.lastError = null;
+        this.callbacks.onError?.(null);
+        return;
+      } catch (error) {
+        const classified = classifyThrownValue(error);
+        this.diag("error", "connect.fail", classified.userMessage, {
+          httpStatus: classified.httpStatus,
+          errorCode: classified.code,
+          resourceCounts: this.getResourceCounts(),
+        });
+
+        // Complete Phase 8 cleanup before retry or durable error display.
+        this.intentionalClose = true;
+        this.releaseAllResources({ emitIdle: false });
+        this.intentionalClose = false;
+
+        if (this.userCancelled) {
+          this.releaseAllResources({ emitIdle: true });
+          this.emitSessionUiState("disconnected");
+          return;
+        }
+
+        const canRetry = classified.retryable && attemptIndex < MAX_CONNECT_ATTEMPTS - 1;
+        if (!canRetry) {
+          this.settleError(classified);
+          return;
+        }
+
+        const delayMs = computeRetryDelayMs(attemptIndex, classified.retryAfterMs);
+        this.retryAttempt = attemptIndex + 1;
+        this.reconnecting = true;
+        this.emitSessionUiState("reconnecting");
+        this.callbacks.onStatus(`Retrying in ${Math.ceil(delayMs / 1000)}s…`);
+        this.diag("warn", "connect.retry_wait", `Waiting ${delayMs}ms before retry`, {
+          errorCode: classified.code,
+          httpStatus: classified.httpStatus,
+        });
+        await this.waitForRetry(delayMs);
+      }
+    }
+
+    this.releaseAllResources({ emitIdle: true });
+    this.emitSessionUiState("disconnected");
+  }
+
+  private async connectOnce(): Promise<void> {
     this.callbacks.onMood("thinking");
     this.callbacks.onStatus("Minting a Realtime client secret.");
 
+    this.toolSpecs = await window.ricky.getToolSpecs();
+    const token = await window.ricky.createRealtimeToken();
+    const pc = new RTCPeerConnection();
+    this.pc = pc;
+    const audio = createRemoteAudioElement();
+    this.remoteAudio = audio;
+    this.sessionConnected = false;
+
+    this.boundTrackHandler = (event: RTCTrackEvent) => {
+      const stream = event.streams[0] || new MediaStream([event.track]);
+      this.log("remote track received", {
+        trackKind: event.track.kind,
+        streamId: stream.id,
+        hasRemoteAudio: Boolean(this.remoteAudio),
+      });
+      if (!this.remoteAudio) return;
+      this.remoteMediaStream = stream;
+      this.remoteAudio.srcObject = stream;
+      // Exactly one analyser per successful connection.
+      if (!this.outputAnalyser) {
+        this.startOutputMeter(stream);
+      }
+    };
+    pc.addEventListener("track", this.boundTrackHandler);
+
+    this.boundPcStateHandler = () => {
+      const state = pc.connectionState;
+      this.diag("info", "pc.state", `Peer connection state: ${state}`);
+      if (this.intentionalClose || this.handlingTransportLoss || !this.sessionConnected) return;
+      if (state === "failed" || state === "closed") {
+        void this.handleUnexpectedTransportLoss();
+      }
+    };
+    pc.addEventListener("connectionstatechange", this.boundPcStateHandler);
+
     try {
-      this.toolSpecs = await window.ricky.getToolSpecs();
-      const token = await window.ricky.createRealtimeToken();
-      const pc = new RTCPeerConnection();
-      const audio = createRemoteAudioElement();
-      this.remoteAudio = audio;
-
-      this.boundTrackHandler = (event: RTCTrackEvent) => {
-        const stream = event.streams[0] || new MediaStream([event.track]);
-        this.log("remote track received", {
-          trackKind: event.track.kind,
-          streamId: stream.id,
-          hasRemoteAudio: Boolean(this.remoteAudio),
-        });
-        if (!this.remoteAudio) return;
-        this.remoteMediaStream = stream;
-        this.remoteAudio.srcObject = stream;
-        // Exactly one analyser per successful connection.
-        if (!this.outputAnalyser) {
-          this.startOutputMeter(stream);
-        }
-      };
-      pc.addEventListener("track", this.boundTrackHandler);
-
       this.micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -152,25 +321,43 @@ export class RickyRealtimeClient {
           autoGainControl: true,
         },
       });
-      pc.addTrack(this.micStream.getAudioTracks()[0], this.micStream);
+    } catch (error) {
+      throw classifyThrownValue(error);
+    }
+    pc.addTrack(this.micStream.getAudioTracks()[0], this.micStream);
 
-      const dc = pc.createDataChannel("oai-events");
-      this.boundDcOpenHandler = () => {
-        this.callbacks.onConnectionState("connected");
-        this.callbacks.onMood("idle");
-        this.callbacks.onStatus("Ricky is live. Start talking naturally.");
-        this.log("connect success", this.getResourceCounts());
-      };
-      this.boundDcMessageHandler = (event: MessageEvent) => {
-        this.enqueueServerEvent(String(event.data));
-      };
-      dc.addEventListener("open", this.boundDcOpenHandler);
-      dc.addEventListener("message", this.boundDcMessageHandler);
+    const dc = pc.createDataChannel("oai-events");
+    this.dc = dc;
+    this.boundDcOpenHandler = () => {
+      this.sessionConnected = true;
+      this.reconnecting = false;
+      this.callbacks.onConnectionState("connected");
+      this.callbacks.onMood("idle");
+      this.callbacks.onStatus("Ricky is live. Start talking naturally.");
+      this.emitSessionUiState("listening");
+      this.diag("info", "connect.success", "Realtime data channel open", {
+        resourceCounts: this.getResourceCounts(),
+      });
+      this.log("connect success", this.getResourceCounts());
+    };
+    this.boundDcMessageHandler = (event: MessageEvent) => {
+      this.enqueueServerEvent(String(event.data));
+    };
+    this.boundDcCloseHandler = () => {
+      this.diag("warn", "dc.close", "Data channel closed");
+      if (this.intentionalClose || this.handlingTransportLoss || !this.sessionConnected) return;
+      void this.handleUnexpectedTransportLoss();
+    };
+    dc.addEventListener("open", this.boundDcOpenHandler);
+    dc.addEventListener("message", this.boundDcMessageHandler);
+    dc.addEventListener("close", this.boundDcCloseHandler);
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
 
-      const sdpResponse = await fetch(realtimeUrl, {
+    let sdpResponse: Response;
+    try {
+      sdpResponse = await fetch(realtimeUrl, {
         method: "POST",
         body: offer.sdp,
         headers: {
@@ -178,35 +365,138 @@ export class RickyRealtimeClient {
           "Content-Type": "application/sdp",
         },
       });
-
-      if (!sdpResponse.ok) {
-        throw new Error(`Realtime WebRTC call failed: ${sdpResponse.status} ${await sdpResponse.text()}`);
-      }
-
-      await pc.setRemoteDescription({
-        type: "answer",
-        sdp: await sdpResponse.text(),
-      });
-
-      this.pc = pc;
-      this.dc = dc;
-
-      const counts = this.getResourceCounts();
-      if (!assertSingleRealtimePath(counts)) {
-        this.log("connect warning: resource path not singular", counts);
-      }
     } catch (error) {
-      this.callbacks.onConnectionState("error");
-      this.callbacks.onMood("error");
-      this.callbacks.onStatus(error instanceof Error ? error.message : String(error));
-      this.disconnect();
+      throw classifyThrownValue(error);
+    }
+
+    if (!sdpResponse.ok) {
+      const bodyText = await sdpResponse.text();
+      throw classifyHttpFailure({
+        httpStatus: sdpResponse.status,
+        bodyText,
+        retryAfterHeader: sdpResponse.headers.get("retry-after"),
+      });
+    }
+
+    const answerSdp = await sdpResponse.text();
+    if (!answerSdp || looksLikeSdpFailure(answerSdp)) {
+      throw buildError("webrtc.connect_failed");
+    }
+
+    await pc.setRemoteDescription({
+      type: "answer",
+      sdp: answerSdp,
+    });
+
+    const counts = this.getResourceCounts();
+    if (!assertSingleRealtimePath(counts)) {
+      this.log("connect warning: resource path not singular", counts);
     }
   }
 
-  disconnect(): void {
-    this.log("disconnect start", this.getResourceCounts());
-    this.releaseAllResources({ emitIdle: true });
-    this.log("disconnect complete", this.getResourceCounts());
+  private async handleUnexpectedTransportLoss(): Promise<void> {
+    if (this.intentionalClose || this.handlingTransportLoss || this.userCancelled) return;
+    this.handlingTransportLoss = true;
+    const classified = buildError("webrtc.disconnected");
+    this.diag("error", "transport.lost", classified.userMessage, { errorCode: classified.code });
+    this.sessionConnected = false;
+    this.intentionalClose = true;
+    this.releaseAllResources({ emitIdle: false });
+    this.intentionalClose = false;
+    this.handlingTransportLoss = false;
+
+    if (this.userCancelled) {
+      this.releaseAllResources({ emitIdle: true });
+      this.emitSessionUiState("disconnected");
+      return;
+    }
+
+    // Mid-session drops use the same bounded retry budget.
+    this.retryAttempt = 0;
+    this.reconnecting = true;
+    this.lastError = classified;
+    await this.connectWithRetryBudget();
+  }
+
+  private settleError(classified: ClassifiedRealtimeError): void {
+    this.lastError = classified;
+    this.reconnecting = false;
+    this.sessionConnected = false;
+    this.callbacks.onConnectionState("error");
+    this.callbacks.onMood("error");
+    this.callbacks.onStatus(classified.userMessage);
+    this.callbacks.onError?.(classified);
+    this.emitSessionUiState("error");
+    this.diag("error", "session.error_state", classified.userMessage, {
+      errorCode: classified.code,
+      httpStatus: classified.httpStatus,
+      resourceCounts: this.getResourceCounts(),
+    });
+  }
+
+  private emitConnectingState(): void {
+    this.callbacks.onConnectionState("connecting");
+    this.callbacks.onMood("thinking");
+    this.emitSessionUiState(this.reconnecting ? "reconnecting" : "connecting");
+  }
+
+  private emitSessionUiState(state: SessionUiState): void {
+    this.callbacks.onSessionUiState?.(state);
+  }
+
+  private waitForRetry(ms: number): Promise<void> {
+    this.clearRetryTimer();
+    return new Promise((resolve) => {
+      this.retryWaitResolve = resolve;
+      this.retryTimer = window.setTimeout(() => {
+        this.retryTimer = null;
+        this.retryWaitResolve = null;
+        resolve();
+      }, ms);
+    });
+  }
+
+  private clearRetryTimer(): void {
+    if (this.retryTimer !== null) {
+      window.clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    if (this.retryWaitResolve) {
+      const resolve = this.retryWaitResolve;
+      this.retryWaitResolve = null;
+      resolve();
+    }
+  }
+
+  private diag(
+    level: "info" | "warn" | "error",
+    event: string,
+    message: string,
+    extra?: {
+      responseId?: string;
+      httpStatus?: number;
+      errorCode?: string;
+      resourceCounts?: RealtimeResourceCounts;
+    },
+  ): void {
+    const safeMessage = sanitizeDiagnosticText(message, 240);
+    this.diagnostics.record({
+      level,
+      event,
+      connectionId: this.connectionId || "none",
+      message: safeMessage,
+      responseId: extra?.responseId,
+      httpStatus: extra?.httpStatus,
+      errorCode: extra?.errorCode,
+      resourceCounts: extra?.resourceCounts,
+    });
+    this.log(event, {
+      message: safeMessage,
+      responseId: extra?.responseId,
+      httpStatus: extra?.httpStatus,
+      errorCode: extra?.errorCode,
+      resourceCounts: extra?.resourceCounts,
+    });
   }
 
   sendText(text: string): boolean {
@@ -229,7 +519,7 @@ export class RickyRealtimeClient {
     this.eventChain = this.eventChain
       .then(() => this.handleServerEvent(raw))
       .catch((error) => {
-        this.log("server event handler error", String(error));
+        this.log("server event handler error", sanitizeDiagnosticText(error instanceof Error ? error.message : String(error)));
       });
   }
 
@@ -240,13 +530,21 @@ export class RickyRealtimeClient {
     if (this.dc && this.boundDcMessageHandler) {
       this.dc.removeEventListener("message", this.boundDcMessageHandler);
     }
+    if (this.dc && this.boundDcCloseHandler) {
+      this.dc.removeEventListener("close", this.boundDcCloseHandler);
+    }
     if (this.pc && this.boundTrackHandler) {
       this.pc.removeEventListener("track", this.boundTrackHandler);
+    }
+    if (this.pc && this.boundPcStateHandler) {
+      this.pc.removeEventListener("connectionstatechange", this.boundPcStateHandler);
     }
 
     this.boundDcOpenHandler = null;
     this.boundDcMessageHandler = null;
+    this.boundDcCloseHandler = null;
     this.boundTrackHandler = null;
+    this.boundPcStateHandler = null;
 
     try {
       this.dc?.close();
@@ -282,6 +580,7 @@ export class RickyRealtimeClient {
     this.playbackPausedForBargeIn = false;
     this.toolRunning = false;
     this.eventChain = Promise.resolve();
+    this.sessionConnected = false;
 
     if (options.emitIdle) {
       this.callbacks.onConnectionState("idle");
@@ -341,8 +640,21 @@ export class RickyRealtimeClient {
     if (!event.type) return;
 
     if (event.type === "error") {
+      const classified = classifySessionError(event.error?.message);
+      this.diag("error", "session.server_error", classified.userMessage, {
+        errorCode: classified.code,
+        responseId: extractResponseId(event) || undefined,
+      });
       this.callbacks.onMood("error");
-      this.callbacks.onStatus(event.error?.message || "Realtime API returned an error.");
+      this.callbacks.onStatus(classified.userMessage);
+      this.lastError = classified;
+      this.callbacks.onError?.(classified);
+      if (!classified.retryable) {
+        this.intentionalClose = true;
+        this.releaseAllResources({ emitIdle: false });
+        this.intentionalClose = false;
+        this.settleError(classified);
+      }
       return;
     }
 
@@ -366,12 +678,14 @@ export class RickyRealtimeClient {
         this.toolRunning = false;
       }
       this.callbacks.onMood("listening");
+      this.emitSessionUiState("listening");
       return;
     }
 
     if (event.type === "input_audio_buffer.speech_stopped") {
       this.log("speech stopped");
       this.callbacks.onMood("thinking");
+      this.emitSessionUiState("thinking");
       return;
     }
 
@@ -413,13 +727,17 @@ export class RickyRealtimeClient {
       }
       this.resumeAssistantPlaybackIfNeeded();
       this.callbacks.onMood("speaking");
+      this.emitSessionUiState("speaking");
       return;
     }
 
     if (event.type === "response.output_audio.done" || event.type === "response.audio.done") {
       this.log("response audio completion", { type: event.type, responseId: extractResponseId(event) });
       this.responseAudioStarted = false;
-      if (!this.toolRunning) this.callbacks.onMood("idle");
+      if (!this.toolRunning) {
+        this.callbacks.onMood("idle");
+        this.emitSessionUiState("listening");
+      }
       return;
     }
 
@@ -475,6 +793,7 @@ export class RickyRealtimeClient {
         await this.executeFunctionCalls(functionCalls);
       } else if (!this.toolRunning) {
         this.callbacks.onMood("idle");
+        this.emitSessionUiState("listening");
       }
     }
   }
@@ -482,6 +801,7 @@ export class RickyRealtimeClient {
   private async executeFunctionCalls(items: ResponseOutputItem[]): Promise<void> {
     this.toolRunning = true;
     this.callbacks.onMood("working");
+    this.emitSessionUiState("thinking");
     let shouldCreateResponse = false;
 
     for (const item of items) {
@@ -608,10 +928,11 @@ export class RickyRealtimeClient {
   }
 
   private log(message: string, detail?: unknown): void {
+    const safeMessage = sanitizeDiagnosticText(message, 120);
     if (detail !== undefined) {
-      console.debug(LOG_PREFIX, message, detail);
+      console.debug(LOG_PREFIX, safeMessage, sanitizeLogDetail(detail));
     } else {
-      console.debug(LOG_PREFIX, message);
+      console.debug(LOG_PREFIX, safeMessage);
     }
   }
 }
@@ -632,6 +953,44 @@ export {
   planBargeIn,
   shouldAcceptResponseScopedEvent,
 } from "./realtimeInterruptGate";
+export {
+  MAX_CONNECT_ATTEMPTS,
+  RETRY_BACKOFF_MS,
+  buildError,
+  classifyHttpFailure,
+  classifySessionError,
+  classifyThrownValue,
+  computeRetryDelayMs,
+  sanitizeDiagnosticText,
+} from "./realtimeErrors";
+export type { ClassifiedRealtimeError, RealtimeErrorCode } from "./realtimeErrors";
+export { RealtimeDiagnosticsBuffer } from "./realtimeDiagnostics";
+
+function looksLikeSdpFailure(answerSdp: string): boolean {
+  const trimmed = answerSdp.trim().toLowerCase();
+  return trimmed.startsWith("<!doctype") || trimmed.startsWith("<html") || trimmed.startsWith("{");
+}
+
+function sanitizeLogDetail(detail: unknown): unknown {
+  if (typeof detail === "string") return sanitizeDiagnosticText(detail, 240);
+  if (!detail || typeof detail !== "object") return detail;
+  if (detail instanceof Error) {
+    return { name: detail.name, message: sanitizeDiagnosticText(detail.message, 240) };
+  }
+  const record = detail as Record<string, unknown>;
+  const safe: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (typeof value === "string") {
+      safe[key] = sanitizeDiagnosticText(value, 240);
+    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+      // Resource counts and similar plain objects are safe to pass through.
+      safe[key] = value;
+    } else {
+      safe[key] = value;
+    }
+  }
+  return safe;
+}
 
 function silentMouthShape(): MouthShape {
   return { open: 0, width: 0.18, round: 0, teeth: 0 };

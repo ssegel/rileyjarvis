@@ -662,59 +662,95 @@ function setWindowMode(mode) {
 ipcMain.handle("tools:list", () => toolSpecs);
 
 ipcMain.handle("realtime:create-token", async () => {
+  const {
+    missingApiKeyError,
+    classifyHttpFailure,
+    createTokenError,
+    badTokenResponseError,
+  } = require("./realtime-errors.cjs");
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    throw new Error("OPENAI_API_KEY is missing in .env.local");
+    throw missingApiKeyError();
   }
   const db = await readDb();
   const personalContext = await memoryStore.buildPersonalContextForSession();
   const instructions = `${RICKY_INSTRUCTIONS}\n\n${personalContext.text}\n\n${buildThumbnailBoardInstructions(db)}`;
 
-  const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "OpenAI-Safety-Identifier": crypto.createHash("sha256").update("riley-local-ricky").digest("hex"),
-    },
-    body: JSON.stringify({
-      session: {
-        type: "realtime",
-        model: "gpt-realtime-2",
-        instructions,
-        output_modalities: ["audio"],
-        reasoning: { effort: "low" },
-        tool_choice: "auto",
-        tools: toolSpecs,
-        audio: {
-          input: {
-            turn_detection: {
-              type: "semantic_vad",
-              eagerness: "medium",
-              create_response: true,
-              interrupt_response: true,
+  let response;
+  try {
+    response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "OpenAI-Safety-Identifier": crypto.createHash("sha256").update("riley-local-ricky").digest("hex"),
+      },
+      body: JSON.stringify({
+        session: {
+          type: "realtime",
+          model: "gpt-realtime-2",
+          instructions,
+          output_modalities: ["audio"],
+          reasoning: { effort: "low" },
+          tool_choice: "auto",
+          tools: toolSpecs,
+          audio: {
+            input: {
+              turn_detection: {
+                type: "semantic_vad",
+                eagerness: "medium",
+                create_response: true,
+                interrupt_response: true,
+              },
+            },
+            output: {
+              voice: "cedar",
             },
           },
-          output: {
-            voice: "cedar",
+          tracing: {
+            workflow_name: "Ricky Desktop Companion",
           },
         },
-        tracing: {
-          workflow_name: "Ricky Desktop Companion",
-        },
-      },
-    }),
-  });
+      }),
+    });
+  } catch (error) {
+    throw createTokenError({
+      code: "network.offline",
+      userMessage: "Network connection looks down.",
+      retryable: true,
+      bodyHash: undefined,
+    });
+  }
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Realtime token request failed: ${response.status} ${text}`);
+    const classified = classifyHttpFailure({
+      httpStatus: response.status,
+      bodyText: text,
+      retryAfterHeader: response.headers.get("retry-after"),
+    });
+    console.error(
+      "[jarvis-realtime] token mint failed",
+      JSON.stringify({
+        code: classified.code,
+        httpStatus: classified.httpStatus,
+        bodyHash: classified.bodyHash,
+      }),
+    );
+    throw createTokenError(classified);
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw badTokenResponseError("non-json token response");
+  }
+
   const value = data.value || data.client_secret?.value;
   if (!value) {
-    throw new Error("Realtime token response did not include a client secret value.");
+    throw badTokenResponseError("missing client secret value");
   }
   return { value, expiresAt: data.expires_at || data.client_secret?.expires_at || null };
 });
