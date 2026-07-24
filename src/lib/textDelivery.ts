@@ -65,6 +65,9 @@ export function deliveryDiagMessage(parts: {
   clientDelivered?: boolean;
   appAppended?: boolean;
   appTextLen?: number;
+  transcriptCount?: number;
+  panelMode?: string;
+  responseLogActive?: boolean;
 }): string {
   return [
     parts.mainHasText != null ? `mainHasText=${parts.mainHasText ? 1 : 0}` : null,
@@ -72,6 +75,9 @@ export function deliveryDiagMessage(parts: {
     parts.clientDelivered != null ? `clientDelivered=${parts.clientDelivered ? 1 : 0}` : null,
     parts.appAppended != null ? `appAppended=${parts.appAppended ? 1 : 0}` : null,
     parts.appTextLen != null ? `appTextLen=${parts.appTextLen}` : null,
+    parts.transcriptCount != null ? `transcriptCount=${parts.transcriptCount}` : null,
+    parts.panelMode ? `panelMode=${parts.panelMode}` : null,
+    parts.responseLogActive != null ? `responseLogActive=${parts.responseLogActive ? 1 : 0}` : null,
   ]
     .filter(Boolean)
     .join(" ");

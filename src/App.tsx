@@ -14,6 +14,11 @@ import {
 } from "./lib/realtime";
 import { RealtimeDiagnosticsBuffer } from "./lib/realtimeDiagnostics";
 import { SessionOwnerLock } from "./lib/sessionOwner";
+import {
+  buildRunningResponseLogArtifact,
+  isRunningResponseLogArtifact,
+  responseLogContainsAssistant,
+} from "./lib/responseLogArtifact";
 import { buildTextHistoryFromTranscript } from "./lib/textHistory";
 import { deliveryDiagMessage, readAssistantText } from "./lib/textDelivery";
 import { TextClient, type TextTurnState } from "./lib/textClient";
@@ -62,16 +67,34 @@ export default function App() {
   const diagnosticsRef = useRef(new RealtimeDiagnosticsBuffer());
   const textClientRef = useRef<TextClient | null>(null);
   const transcriptRef = useRef(transcript);
-  transcriptRef.current = transcript;
+  const artifactRef = useRef(artifact);
   const deliveredAssistantTurnRef = useRef<string | null>(null);
   const appendAssistantToLogRef = useRef<(text: string, clientTurnId: string) => boolean>(() => false);
+
+  function commitTranscriptEntry(entry: TranscriptEntry): TranscriptEntry[] {
+    const next = [entry, ...transcriptRef.current].slice(0, 80);
+    transcriptRef.current = next;
+    setTranscript(next);
+    return next;
+  }
+
+  function activateRunningResponseLog(entries: TranscriptEntry[]): boolean {
+    if (!responseLogContainsAssistant(entries)) return false;
+    const logArtifact = buildRunningResponseLogArtifact(entries);
+    artifactRef.current = logArtifact;
+    setArtifact(logArtifact);
+    setArtifactVisible(true);
+    return isRunningResponseLogArtifact(logArtifact);
+  }
 
   function appendAssistantToLog(text: string, clientTurnId: string): boolean {
     const trimmed = String(text || "").trim();
     if (!trimmed) return false;
     if (deliveredAssistantTurnRef.current === clientTurnId) return true;
     deliveredAssistantTurnRef.current = clientTurnId;
-    setTranscript((items) => [newEntry("ricky", trimmed), ...items].slice(0, 80));
+    // Legacy internal assistant role remains "ricky" for log/renderer compatibility.
+    const entry = newEntry("ricky", trimmed);
+    const next = commitTranscriptEntry(entry);
     diagnosticsRef.current.record({
       level: "info",
       event: "text.delivery.app",
@@ -79,6 +102,9 @@ export default function App() {
       message: deliveryDiagMessage({
         appAppended: true,
         appTextLen: trimmed.length,
+        transcriptCount: next.length,
+        panelMode: isRunningResponseLogArtifact(artifactRef.current) ? "responseLog" : "pending",
+        responseLogActive: isRunningResponseLogArtifact(artifactRef.current),
       }),
     });
     return true;
@@ -95,15 +121,16 @@ export default function App() {
         },
         onStatus: (message) => {
           setStatus(message);
-          setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+          commitTranscriptEntry(newEntry("system", message));
         },
         onUserText: (text) => {
-          setTranscript((items) => [newEntry("user", text), ...items].slice(0, 80));
+          commitTranscriptEntry(newEntry("user", text));
         },
         onAssistantText: (text, clientTurnId) => {
           appendAssistantToLogRef.current(text, clientTurnId);
         },
         onArtifact: (nextArtifact) => {
+          artifactRef.current = nextArtifact;
           setArtifact(nextArtifact);
           setArtifactVisible(true);
           if (nextArtifact.fullscreen) setArtifactFullscreen(true);
@@ -111,7 +138,7 @@ export default function App() {
         onError: (message) => {
           // Text errors must not overwrite Realtime lastError / voice recovery UI.
           setStatus(message);
-          setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+          commitTranscriptEntry(newEntry("system", message));
         },
       },
       diagnosticsRef.current,
@@ -132,8 +159,15 @@ export default function App() {
       onConnectionState: setConnectionState,
       onMood: setMood,
       onMouthShape: setMouthShape,
-      onTranscript: (entry) => setTranscript((items) => [entry, ...items].slice(0, 80)),
+      onTranscript: (entry) => {
+        const next = commitTranscriptEntry(entry);
+        // Voice assistant replies activate the same Running Response Log panel as text.
+        if (entry.role === "ricky") {
+          activateRunningResponseLog(next);
+        }
+      },
       onArtifact: (nextArtifact) => {
+        artifactRef.current = nextArtifact;
         setArtifact(nextArtifact);
         setArtifactVisible(true);
         if (nextArtifact.fullscreen) setArtifactFullscreen(true);
@@ -151,7 +185,7 @@ export default function App() {
       },
       onStatus: (message) => {
         setStatus(message);
-        setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+        commitTranscriptEntry(newEntry("system", message));
       },
       onSessionUiState: setSessionUiState,
       onError: setLastError,
@@ -213,7 +247,10 @@ export default function App() {
   async function switchMode(nextMode: RickyMode) {
     setMode(nextMode);
     const result = await window.jarvis.executeTool({ name: "set_mode", arguments: { mode: nextMode } });
-    if (result.artifact) setArtifact(result.artifact);
+    if (result.artifact) {
+      artifactRef.current = result.artifact;
+      setArtifact(result.artifact);
+    }
     if (nextMode === "computer") {
       setArtifactVisible(false);
       setArtifactFullscreen(false);
@@ -222,7 +259,7 @@ export default function App() {
     } else {
       setArtifactVisible(true);
     }
-    setTranscript((items) => [newEntry("system", `Mode switched to ${nextMode}.`), ...items].slice(0, 80));
+    commitTranscriptEntry(newEntry("system", `Mode switched to ${nextMode}.`));
   }
 
   async function sendTextPrompt() {
@@ -232,7 +269,7 @@ export default function App() {
     if (textTurnActive) {
       const message = "Jarvis is busy with another text turn.";
       setStatus(message);
-      setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+      commitTranscriptEntry(newEntry("system", message));
       return;
     }
 
@@ -240,14 +277,14 @@ export default function App() {
     if (voiceBusy) {
       const message = "Jarvis is busy with a voice response.";
       setStatus(message);
-      setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+      commitTranscriptEntry(newEntry("system", message));
       return;
     }
 
     const acquire = sessionOwnerRef.current.tryAcquireText();
     if (!acquire.ok) {
       setStatus(acquire.message);
-      setTranscript((items) => [newEntry("system", acquire.message), ...items].slice(0, 80));
+      commitTranscriptEntry(newEntry("system", acquire.message));
       return;
     }
 
@@ -259,18 +296,46 @@ export default function App() {
       const assistantText = readAssistantText(result);
       const hasArtifact = (result?.artifacts?.length ?? 0) > 0;
 
-      // Append successful assistant text to the Running Response Log BEFORE closing the field.
+      // Append successful assistant text BEFORE closing the field / releasing ownership.
       let appended = false;
       if (result?.ok && assistantText && result.clientTurnId) {
         appended = appendAssistantToLog(assistantText, result.clientTurnId);
       }
 
-      const delivered = Boolean(result?.ok) && ((appended && Boolean(assistantText)) || hasArtifact);
+      // Text-only replies must switch the artifacts panel from Ready → Running Response Log.
+      // Tool artifacts already activate the panel via onArtifact; do not clobber them.
+      let responseLogActive = isRunningResponseLogArtifact(artifactRef.current);
+      if (appended && !hasArtifact) {
+        responseLogActive = activateRunningResponseLog(transcriptRef.current);
+      }
 
-      if (result?.ok && assistantText && !appended) {
+      diagnosticsRef.current.record({
+        level: responseLogActive || hasArtifact ? "info" : "warn",
+        event: "text.delivery.panel",
+        connectionId: `text:${result?.clientTurnId || "unknown"}`,
+        message: deliveryDiagMessage({
+          appAppended: appended,
+          appTextLen: assistantText.length,
+          transcriptCount: transcriptRef.current.length,
+          panelMode: hasArtifact
+            ? "toolArtifact"
+            : responseLogActive
+              ? "responseLog"
+              : artifactRef.current
+                ? "other"
+                : "ready",
+          responseLogActive,
+        }),
+      });
+
+      const delivered =
+        Boolean(result?.ok) &&
+        ((appended && (responseLogActive || hasArtifact)) || (hasArtifact && !assistantText));
+
+      if (result?.ok && assistantText && (!appended || (!responseLogActive && !hasArtifact))) {
         const message = "Jarvis responded, but the reply could not be shown. Try again.";
         setStatus(message);
-        setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+        commitTranscriptEntry(newEntry("system", message));
         diagnosticsRef.current.record({
           level: "error",
           event: "text.delivery.app_failed",
@@ -279,12 +344,15 @@ export default function App() {
             mainHasText: true,
             mainTextLen: assistantText.length,
             clientDelivered: deliveredAssistantTurnRef.current === result.clientTurnId,
-            appAppended: false,
-            appTextLen: 0,
+            appAppended: appended,
+            appTextLen: appended ? assistantText.length : 0,
+            transcriptCount: transcriptRef.current.length,
+            panelMode: "ready",
+            responseLogActive: false,
           }),
         });
       } else if (delivered) {
-        // Clear/close only after visible assistant text or an artifact has been delivered.
+        // Clear/close only after visible assistant text (log) or an artifact has been delivered.
         setTextPrompt("");
         setShowTypeInput(false);
         setLastError(null);
@@ -293,7 +361,7 @@ export default function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : "The text request failed. Try again.";
       setStatus(message);
-      setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+      commitTranscriptEntry(newEntry("system", message));
     } finally {
       sessionOwnerRef.current.releaseText();
       setTextBusy(false);
