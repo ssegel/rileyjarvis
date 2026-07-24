@@ -667,21 +667,47 @@ ipcMain.handle("clipboard:write-text", (_event, text) => {
   return writeTextToClipboard(clipboard, text);
 });
 
+const { buildSessionInstructions } = require("./session-instructions.cjs");
+const { createTextSessionController } = require("./text-session.cjs");
+const realtimeErrors = require("./realtime-errors.cjs");
+
+async function buildSharedSessionInstructions() {
+  // Shared by Realtime mint and text turns. Do not log the injected memory block.
+  return buildSessionInstructions({
+    jarvisInstructions: `${JARVIS_INSTRUCTIONS}`,
+    memoryStore,
+    readDb,
+    buildThumbnailBoardInstructions,
+  });
+}
+
+const textSession = createTextSessionController({
+  getApiKey: () => process.env.OPENAI_API_KEY,
+  getTextModel: () => process.env.OPENAI_TEXT_MODEL || "gpt-4.1",
+  buildInstructions: buildSharedSessionInstructions,
+  getToolSpecs: () => toolSpecs,
+  executeTool: (toolCall) => executeTrustedTool(toolCall),
+  classifyHttpFailure: realtimeErrors.classifyHttpFailure,
+  createTokenError: realtimeErrors.createTokenError,
+  sanitizeDiagnosticText: realtimeErrors.sanitizeDiagnosticText,
+});
+
+ipcMain.handle("text:run", async (_event, request) => textSession.runTextTurn(request || {}));
+ipcMain.handle("text:cancel", async (_event, clientTurnId) => textSession.cancelTextTurn(clientTurnId));
+
 ipcMain.handle("realtime:create-token", async () => {
   const {
     missingApiKeyError,
     classifyHttpFailure,
     createTokenError,
     badTokenResponseError,
-  } = require("./realtime-errors.cjs");
+  } = realtimeErrors;
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     throw missingApiKeyError();
   }
-  const db = await readDb();
-  const personalContext = await memoryStore.buildPersonalContextForSession();
-  const instructions = `${JARVIS_INSTRUCTIONS}\n\n${personalContext.text}\n\n${buildThumbnailBoardInstructions(db)}`;
+  const instructions = await buildSharedSessionInstructions();
 
   let response;
   try {
@@ -761,7 +787,9 @@ ipcMain.handle("realtime:create-token", async () => {
   return { value, expiresAt: data.expires_at || data.client_secret?.expires_at || null };
 });
 
-ipcMain.handle("tools:execute", async (_event, toolCall) => {
+ipcMain.handle("tools:execute", async (_event, toolCall) => executeTrustedTool(toolCall));
+
+async function executeTrustedTool(toolCall) {
   const name = String(toolCall?.name || "");
   const args = asObject(toolCall?.arguments);
 
@@ -975,7 +1003,7 @@ ipcMain.handle("tools:execute", async (_event, toolCall) => {
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
-});
+}
 
 async function webSearch(args) {
   const exaKey = process.env.EXA_API_KEY;

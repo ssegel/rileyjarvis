@@ -5,4 +5,6 @@ contextBridge.exposeInMainWorld("jarvis", {
   executeTool: (toolCall) => ipcRenderer.invoke("tools:execute", toolCall),
   getToolSpecs: () => ipcRenderer.invoke("tools:list"),
   copyTextToClipboard: (text) => ipcRenderer.invoke("clipboard:write-text", text),
+  runTextTurn: (request) => ipcRenderer.invoke("text:run", request),
+  cancelTextTurn: (clientTurnId) => ipcRenderer.invoke("text:cancel", clientTurnId),
 });

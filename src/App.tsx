@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { BrainCircuit, Expand, History, Keyboard, Mic, MicOff, MonitorCog, PanelRight, Send } from "lucide-react";
+import { BrainCircuit, Expand, History, Keyboard, Mic, MicOff, MonitorCog, PanelRight, Send, Square } from "lucide-react";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { RickyFace } from "./components/RickyFace";
 import {
@@ -12,6 +12,9 @@ import {
   type SessionUiState,
   type TranscriptEntry,
 } from "./lib/realtime";
+import { RealtimeDiagnosticsBuffer } from "./lib/realtimeDiagnostics";
+import { SessionOwnerLock } from "./lib/sessionOwner";
+import { TextClient, type TextTurnState } from "./lib/textClient";
 import type { RickyArtifact } from "./vite-env";
 
 type RickyMode = "display" | "computer";
@@ -24,6 +27,13 @@ const SESSION_LABELS: Record<SessionUiState, string> = {
   speaking: "Speaking",
   reconnecting: "Reconnecting",
   error: "Error",
+};
+
+const TEXT_STATUS: Partial<Record<TextTurnState, string>> = {
+  sending: "Sending…",
+  waiting: "Waiting for Jarvis…",
+  "tool-running": "Running tools…",
+  cancelled: "Text request cancelled.",
 };
 
 export default function App() {
@@ -44,11 +54,54 @@ export default function App() {
   const [lastError, setLastError] = useState<ClassifiedRealtimeError | null>(null);
   const [textPrompt, setTextPrompt] = useState("");
   const [copyStatus, setCopyStatus] = useState("");
+  const [textBusy, setTextBusy] = useState(false);
   const clientRef = useRef<RickyRealtimeClient | null>(null);
+  const sessionOwnerRef = useRef(new SessionOwnerLock());
+  const diagnosticsRef = useRef(new RealtimeDiagnosticsBuffer());
+  const textClientRef = useRef<TextClient | null>(null);
+  const transcriptRef = useRef(transcript);
+  transcriptRef.current = transcript;
+
+  if (!textClientRef.current) {
+    textClientRef.current = new TextClient(
+      {
+        onState: (state: TextTurnState) => {
+          setTextBusy(state === "sending" || state === "waiting" || state === "tool-running");
+          const label = TEXT_STATUS[state];
+          if (label) setStatus(label);
+        },
+        onStatus: (message) => {
+          setStatus(message);
+          setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+        },
+        onUserText: (text) => {
+          setTranscript((items) => [newEntry("user", text), ...items].slice(0, 80));
+        },
+        onAssistantText: (text) => {
+          setTranscript((items) => [newEntry("ricky", text), ...items].slice(0, 80));
+        },
+        onArtifact: (nextArtifact) => {
+          setArtifact(nextArtifact);
+          setArtifactVisible(true);
+          if (nextArtifact.fullscreen) setArtifactFullscreen(true);
+        },
+        onError: (message, code) => {
+          setLastError({
+            code: (code as ClassifiedRealtimeError["code"]) || "unknown",
+            userMessage: message,
+            retryable: true,
+          });
+          setStatus(message);
+        },
+      },
+      diagnosticsRef.current,
+    );
+  }
 
   const isConnected = connectionState === "connected";
   const isBusy = connectionState === "connecting" || sessionUiState === "reconnecting";
   const showErrorControls = sessionUiState === "error" || connectionState === "error";
+  const textTurnActive = textBusy;
 
   function attachClient(): RickyRealtimeClient {
     // Prevent reconnect from retaining a prior client's audio path or peer connection.
@@ -83,6 +136,8 @@ export default function App() {
       onSessionUiState: setSessionUiState,
       onError: setLastError,
       onThumbnailReady: playThumbnailReadySound,
+      sessionOwner: sessionOwnerRef.current,
+      diagnostics: diagnosticsRef.current,
     });
     clientRef.current = client;
     return client;
@@ -124,6 +179,7 @@ export default function App() {
   async function copyDiagnostics() {
     const report =
       clientRef.current?.getDiagnosticReport() ||
+      textClientRef.current?.getDiagnosticReport(lastError?.code) ||
       ["Jarvis Realtime Diagnostics", JSON.stringify({ lastErrorCode: lastError?.code || null }, null, 2)].join("\n");
     try {
       const result = await window.jarvis.copyTextToClipboard(report);
@@ -149,27 +205,68 @@ export default function App() {
     setTranscript((items) => [newEntry("system", `Mode switched to ${nextMode}.`), ...items].slice(0, 80));
   }
 
-  function sendTextPrompt() {
+  async function sendTextPrompt() {
     const trimmed = textPrompt.trim();
     if (!trimmed) return;
 
-    if (!isConnected) {
-      const message = "Connect voice first.";
+    if (textTurnActive) {
+      const message = "Jarvis is busy with another text turn.";
       setStatus(message);
       setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
       return;
     }
 
-    const sent = clientRef.current?.sendText(trimmed) ?? false;
-    if (!sent) {
-      const message = "Connect voice first.";
+    const voiceBusy = clientRef.current?.isVoiceTurnBusy() === true || sessionOwnerRef.current.isVoiceBusy();
+    if (voiceBusy) {
+      const message = "Jarvis is busy with a voice response.";
       setStatus(message);
       setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
       return;
     }
 
-    setTextPrompt("");
-    setShowTypeInput(false);
+    const acquire = sessionOwnerRef.current.tryAcquireText();
+    if (!acquire.ok) {
+      setStatus(acquire.message);
+      setTranscript((items) => [newEntry("system", acquire.message), ...items].slice(0, 80));
+      return;
+    }
+
+    // Chronological permitted history only (newest-first UI log → reverse).
+    const history = transcriptRef.current
+      .filter((entry) => entry.role === "user" || entry.role === "ricky")
+      .slice(0, 12)
+      .reverse()
+      .map((entry) => ({
+        role: entry.role === "ricky" ? ("assistant" as const) : ("user" as const),
+        text: entry.text,
+      }));
+
+    try {
+      const result = await textClientRef.current?.submit(trimmed, history);
+      // Preserve typed text until main accepts the turn (not rejected / empty).
+      if (result && result.outcome !== "rejected" && result.outcome !== "error") {
+        setTextPrompt("");
+        setShowTypeInput(false);
+      } else if (result?.ok) {
+        setTextPrompt("");
+        setShowTypeInput(false);
+      }
+      if (result?.ok) {
+        setLastError(null);
+        setStatus("Idle");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Something went wrong connecting Jarvis.";
+      setStatus(message);
+      setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
+    } finally {
+      sessionOwnerRef.current.releaseText();
+      setTextBusy(false);
+    }
+  }
+
+  async function cancelTextPrompt() {
+    await textClientRef.current?.cancel();
   }
 
   if (mode === "computer") {
@@ -233,14 +330,29 @@ export default function App() {
                 value={textPrompt}
                 onChange={(event) => setTextPrompt(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter") sendTextPrompt();
+                  if (event.key === "Enter") void sendTextPrompt();
                 }}
                 autoFocus
                 placeholder="Type to Jarvis..."
+                disabled={textTurnActive}
               />
-              <button onClick={sendTextPrompt} aria-label="Send typed prompt" title="Send typed prompt">
-                <Send size={15} />
-              </button>
+              {textTurnActive ? (
+                <button
+                  onClick={() => void cancelTextPrompt()}
+                  aria-label="Cancel text request"
+                  title="Cancel text request"
+                >
+                  <Square size={15} />
+                </button>
+              ) : (
+                <button
+                  onClick={() => void sendTextPrompt()}
+                  aria-label="Send typed prompt"
+                  title="Send typed prompt"
+                >
+                  <Send size={15} />
+                </button>
+              )}
             </section>
           ) : null}
 

@@ -39,6 +39,55 @@ export type RickyToolResult = {
   [key: string]: unknown;
 };
 
+export type JarvisTextHistoryItem = {
+  role: "user" | "assistant" | "ricky";
+  text: string;
+};
+
+export type JarvisTextTurnRequest = {
+  clientTurnId: string;
+  text: string;
+  history?: JarvisTextHistoryItem[];
+};
+
+export type JarvisTextToolTraceItem = {
+  name: string;
+  ok: boolean;
+  requiresConfirmation?: boolean;
+};
+
+export type JarvisTextUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  model: string;
+};
+
+export type JarvisTextTurnError = {
+  code: string;
+  message: string;
+  httpStatus?: number;
+  retryable?: boolean;
+};
+
+export type JarvisTextTurnResult = {
+  ok: boolean;
+  clientTurnId: string;
+  assistantText: string;
+  artifacts: RickyArtifact[];
+  toolTrace: JarvisTextToolTraceItem[];
+  usage: JarvisTextUsage;
+  durationMs: number;
+  outcome: "completed" | "cancelled" | "error" | "rejected";
+  cancelled: boolean;
+  error?: JarvisTextTurnError;
+};
+
+export type JarvisTextCancelResult = {
+  ok: boolean;
+  cancelled?: boolean;
+  error?: JarvisTextTurnError;
+};
+
 declare global {
   interface Window {
     jarvis: {
@@ -46,6 +95,8 @@ declare global {
       executeTool: (toolCall: RickyToolCall) => Promise<RickyToolResult>;
       getToolSpecs: () => Promise<RickyToolSpec[]>;
       copyTextToClipboard: (text: string) => Promise<{ ok: boolean; error?: string }>;
+      runTextTurn: (request: JarvisTextTurnRequest) => Promise<JarvisTextTurnResult>;
+      cancelTextTurn: (clientTurnId: string) => Promise<JarvisTextCancelResult>;
     };
   }
 }

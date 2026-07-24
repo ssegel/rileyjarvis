@@ -25,6 +25,7 @@ import {
   sanitizeDiagnosticText,
   type ClassifiedRealtimeError,
 } from "./realtimeErrors";
+import type { SessionOwnerLock } from "./sessionOwner";
 
 export type RickyConnectionState = "idle" | "connecting" | "connected" | "error";
 export type RickyMood = "idle" | "listening" | "thinking" | "speaking" | "working" | "error";
@@ -62,6 +63,10 @@ export type RealtimeCallbacks = {
   onThumbnailReady: () => void;
   onSessionUiState?: (state: SessionUiState) => void;
   onError?: (error: ClassifiedRealtimeError | null) => void;
+  /** Phase 11: shared turn ownership across text and voice. */
+  sessionOwner?: SessionOwnerLock;
+  /** Optional shared diagnostics buffer (text + voice Copy diagnostics). */
+  diagnostics?: RealtimeDiagnosticsBuffer;
 };
 
 type ServerEvent = {
@@ -120,7 +125,7 @@ export class RickyRealtimeClient {
   private boundDcMessageHandler: ((event: MessageEvent) => void) | null = null;
   private boundPcStateHandler: (() => void) | null = null;
   private boundDcCloseHandler: (() => void) | null = null;
-  private diagnostics = new RealtimeDiagnosticsBuffer();
+  private diagnostics: RealtimeDiagnosticsBuffer;
   private connectionId = "";
   private lastError: ClassifiedRealtimeError | null = null;
   private userCancelled = false;
@@ -131,9 +136,16 @@ export class RickyRealtimeClient {
   private retryWaitResolve: (() => void) | null = null;
   private sessionConnected = false;
   private reconnecting = false;
+  private sessionOwner: SessionOwnerLock | null = null;
 
   constructor(callbacks: RealtimeCallbacks) {
     this.callbacks = callbacks;
+    this.diagnostics = callbacks.diagnostics || new RealtimeDiagnosticsBuffer();
+    this.sessionOwner = callbacks.sessionOwner || null;
+  }
+
+  isVoiceTurnBusy(): boolean {
+    return this.responseInFlight || this.toolRunning;
   }
 
   getResourceCounts(): RealtimeResourceCounts {
@@ -581,6 +593,7 @@ export class RickyRealtimeClient {
     this.toolRunning = false;
     this.eventChain = Promise.resolve();
     this.sessionConnected = false;
+    this.sessionOwner?.setVoiceBusy(false);
 
     if (options.emitIdle) {
       this.callbacks.onConnectionState("idle");
@@ -615,11 +628,16 @@ export class RickyRealtimeClient {
   }
 
   private requestClientResponseCreate(source: string): boolean {
+    if (this.sessionOwner && !this.sessionOwner.canStartVoiceResponse()) {
+      this.diag("warn", "voice.suppressed_while_text", "Client response.create skipped; text turn owns session");
+      return false;
+    }
     if (!canClientCreateResponse(this.responseInFlight)) {
       this.log("skip response.create; response already in flight", { source });
       return false;
     }
     this.responseInFlight = true;
+    this.sessionOwner?.setVoiceBusy(true);
     this.log("response creation", { source });
     this.sendEvent({ type: "response.create" });
     return true;
@@ -676,6 +694,7 @@ export class RickyRealtimeClient {
         if (bargeIn.clearInFlight) this.responseInFlight = false;
         if (bargeIn.flushPlayback) this.flushAssistantPlayback();
         this.toolRunning = false;
+        this.sessionOwner?.setVoiceBusy(false);
       }
       this.callbacks.onMood("listening");
       this.emitSessionUiState("listening");
@@ -690,10 +709,24 @@ export class RickyRealtimeClient {
     }
 
     if (event.type === "response.created") {
+      if (this.sessionOwner && !this.sessionOwner.canStartVoiceResponse()) {
+        const responseId = extractResponseId(event);
+        this.diag("warn", "voice.suppressed_while_text", "Voice response suppressed; text turn owns session", {
+          responseId: responseId || undefined,
+        });
+        if (responseId) this.supersededResponseIds.add(responseId);
+        this.sendEvent({ type: "response.cancel", response_id: responseId || undefined });
+        this.responseInFlight = false;
+        this.activeResponseId = null;
+        this.currentAssistantText = "";
+        this.sessionOwner.setVoiceBusy(false);
+        return;
+      }
       const responseId = extractResponseId(event);
       const next = afterResponseCreated(responseId);
       this.activeResponseId = next.activeResponseId;
       this.responseInFlight = next.responseInFlight;
+      this.sessionOwner?.setVoiceBusy(true);
       this.log("response creation", { type: event.type, responseId });
       return;
     }
@@ -777,7 +810,6 @@ export class RickyRealtimeClient {
       const responseId = extractResponseId(event);
       const output = event.response?.output || [];
       const spoken = this.currentAssistantText || output.map(collectOutputText).filter(Boolean).join("\n");
-      if (spoken) this.callbacks.onTranscript(newEntry("ricky", spoken));
       this.currentAssistantText = "";
       this.responseAudioStarted = false;
 
@@ -786,12 +818,34 @@ export class RickyRealtimeClient {
         activeResponseId: this.activeResponseId,
       });
       if (finish.clearActive) this.activeResponseId = null;
-      if (finish.clearInFlight) this.responseInFlight = false;
+      if (finish.clearInFlight) {
+        this.responseInFlight = false;
+        if (!this.toolRunning) this.sessionOwner?.setVoiceBusy(false);
+      }
+
+      if (this.sessionOwner && !this.sessionOwner.canStartVoiceResponse()) {
+        this.diag("warn", "voice.suppressed_while_text", "Voice assistant output suppressed; text turn owns session", {
+          responseId: responseId || undefined,
+        });
+        this.sessionOwner.setVoiceBusy(false);
+        this.toolRunning = false;
+        return;
+      }
+
+      if (spoken) this.callbacks.onTranscript(newEntry("ricky", spoken));
 
       const functionCalls = output.filter((item) => item.type === "function_call" && item.name && item.call_id);
       if (functionCalls.length > 0) {
+        if (this.sessionOwner && !this.sessionOwner.canStartVoiceResponse()) {
+          this.diag("warn", "voice.suppressed_while_text", "Voice tools skipped; text turn owns session", {
+            responseId: responseId || undefined,
+          });
+          this.sessionOwner.setVoiceBusy(false);
+          return;
+        }
         await this.executeFunctionCalls(functionCalls);
       } else if (!this.toolRunning) {
+        this.sessionOwner?.setVoiceBusy(false);
         this.callbacks.onMood("idle");
         this.emitSessionUiState("listening");
       }
@@ -799,7 +853,13 @@ export class RickyRealtimeClient {
   }
 
   private async executeFunctionCalls(items: ResponseOutputItem[]): Promise<void> {
+    if (this.sessionOwner && !this.sessionOwner.canStartVoiceResponse()) {
+      this.diag("warn", "voice.suppressed_while_text", "Voice tools skipped; text turn owns session");
+      this.sessionOwner.setVoiceBusy(false);
+      return;
+    }
     this.toolRunning = true;
+    this.sessionOwner?.setVoiceBusy(true);
     this.callbacks.onMood("working");
     this.emitSessionUiState("thinking");
     let shouldCreateResponse = false;
@@ -854,6 +914,9 @@ export class RickyRealtimeClient {
       this.requestClientResponseCreate("tool_followup");
     }
     this.toolRunning = false;
+    if (!this.responseInFlight) {
+      this.sessionOwner?.setVoiceBusy(false);
+    }
   }
 
   private async returnToolOutput(callId: string, result: RickyToolResult): Promise<void> {
