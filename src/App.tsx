@@ -126,8 +126,8 @@ export default function App() {
       clientRef.current?.getDiagnosticReport() ||
       ["Jarvis Realtime Diagnostics", JSON.stringify({ lastErrorCode: lastError?.code || null }, null, 2)].join("\n");
     try {
-      await navigator.clipboard.writeText(report);
-      setCopyStatus("Diagnostics copied.");
+      const result = await window.ricky.copyTextToClipboard(report);
+      setCopyStatus(result?.ok === true ? "Diagnostics copied." : "Could not copy diagnostics.");
     } catch {
       setCopyStatus("Could not copy diagnostics.");
     }

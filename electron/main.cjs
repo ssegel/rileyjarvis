@@ -1,4 +1,4 @@
-const { app, BrowserWindow, desktopCapturer, ipcMain, nativeImage, screen, shell } = require("electron");
+const { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, nativeImage, screen, shell } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const crypto = require("node:crypto");
@@ -660,6 +660,12 @@ function setWindowMode(mode) {
 }
 
 ipcMain.handle("tools:list", () => toolSpecs);
+
+ipcMain.handle("clipboard:write-text", (_event, text) => {
+  const { writeTextToClipboard } = require("./clipboard-write.cjs");
+  // Native write only. Do not log or forward clipboard contents.
+  return writeTextToClipboard(clipboard, text);
+});
 
 ipcMain.handle("realtime:create-token", async () => {
   const {

@@ -45,6 +45,7 @@ declare global {
       createRealtimeToken: () => Promise<{ value: string; expiresAt: number | null }>;
       executeTool: (toolCall: RickyToolCall) => Promise<RickyToolResult>;
       getToolSpecs: () => Promise<RickyToolSpec[]>;
+      copyTextToClipboard: (text: string) => Promise<{ ok: boolean; error?: string }>;
     };
   }
 }
