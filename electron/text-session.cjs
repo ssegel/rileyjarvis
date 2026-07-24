@@ -147,6 +147,34 @@ function createTextSessionController(deps) {
             });
           }
           const durationMs = now() - startedAt;
+          const visibleText = String(assistantText || "").trim();
+          const hasVisibleOutput = Boolean(visibleText) || artifacts.length > 0;
+          if (!hasVisibleOutput) {
+            logTextUsage({
+              clientTurnId,
+              model,
+              durationMs,
+              outcome: "error",
+              usage,
+              toolCalls: toolTrace.length,
+            });
+            return {
+              ok: false,
+              clientTurnId,
+              assistantText: "",
+              artifacts,
+              toolTrace,
+              usage,
+              durationMs,
+              outcome: "error",
+              cancelled: false,
+              error: {
+                code: "api.bad_response",
+                message: "Jarvis returned no visible response.",
+                retryable: true,
+              },
+            };
+          }
           logTextUsage({
             clientTurnId,
             model,
@@ -158,7 +186,7 @@ function createTextSessionController(deps) {
           return {
             ok: true,
             clientTurnId,
-            assistantText: assistantText || "",
+            assistantText: visibleText || assistantText || "",
             artifacts,
             toolTrace,
             usage,
@@ -330,13 +358,12 @@ function abortedOutcome(options) {
 }
 
 function buildInitialInput(text, history) {
+  const current = String(text || "").trim();
+  const normalized = normalizeTextHistory(history, current);
   const items = [];
-  const permitted = Array.isArray(history) ? history : [];
-  for (const entry of permitted.slice(-MAX_HISTORY_ITEMS)) {
-    const roleRaw = entry?.role;
-    if (roleRaw !== "user" && roleRaw !== "assistant" && roleRaw !== "ricky") continue;
-    const role = roleRaw === "assistant" || roleRaw === "ricky" ? "assistant" : "user";
-    const content = String(entry?.text || "").trim();
+  for (const entry of normalized) {
+    const role = entry.role === "assistant" || entry.role === "ricky" ? "assistant" : "user";
+    const content = String(entry.text || "").trim();
     if (!content) continue;
     if (role === "user") {
       items.push({
@@ -355,9 +382,77 @@ function buildInitialInput(text, history) {
   items.push({
     type: "message",
     role: "user",
-    content: [{ type: "input_text", text }],
+    content: [{ type: "input_text", text: current }],
   });
   return items;
+}
+
+/**
+ * Sanitize transcript history for Responses input.
+ * Permits only user/assistant (incl. legacy ricky) text; excludes tool/system/status/
+ * confirmation/artifact/error/empty lines; dedupes consecutive user messages and
+ * drops a trailing user message identical to the current prompt.
+ */
+function normalizeTextHistory(history, currentPrompt) {
+  const current = String(currentPrompt || "").trim();
+  const permitted = [];
+  for (const entry of Array.isArray(history) ? history : []) {
+    const roleRaw = entry?.role;
+    if (roleRaw !== "user" && roleRaw !== "assistant" && roleRaw !== "ricky") continue;
+    const text = String(entry?.text || "").trim();
+    if (!text) continue;
+    if (shouldExcludeHistoryText(text)) continue;
+    const role = roleRaw === "assistant" || roleRaw === "ricky" ? "assistant" : "user";
+    const prev = permitted[permitted.length - 1];
+    if (role === "user" && prev && prev.role === "user" && prev.text === text) continue;
+    permitted.push({ role, text });
+  }
+  // Ensure current prompt appears exactly once: strip trailing identical user turn.
+  while (
+    permitted.length > 0 &&
+    permitted[permitted.length - 1].role === "user" &&
+    permitted[permitted.length - 1].text === current
+  ) {
+    permitted.pop();
+  }
+  return permitted.slice(-MAX_HISTORY_ITEMS);
+}
+
+function shouldExcludeHistoryText(text) {
+  const value = String(text || "").trim();
+  if (!value) return true;
+  return [
+    /^sending/i,
+    /^waiting for jarvis/i,
+    /^running tools/i,
+    /^running [a-z0-9_]+/i,
+    /^disconnected$/i,
+    /^idle$/i,
+    /^connecting$/i,
+    /^listening$/i,
+    /^thinking$/i,
+    /^speaking$/i,
+    /^reconnecting$/i,
+    /^error$/i,
+    /connect voice first/i,
+    /jarvis is busy/i,
+    /text request/i,
+    /something went wrong connecting jarvis/i,
+    /the text request failed/i,
+    /confirmation required/i,
+    /requires confirmation/i,
+    /i need confirmation/i,
+    /confirm(ed)?\s*=\s*true/i,
+    /menu is open in the artifacts? panel/i,
+    /rendered in the ui/i,
+    /generating image/i,
+    /thumbnail board/i,
+    /ask jarvis to show/i,
+    /mode switched to/i,
+    /diagnostics copied/i,
+    /could not copy diagnostics/i,
+    /^append to memory:/i,
+  ].some((pattern) => pattern.test(value));
 }
 
 function mapToolsForResponses(toolSpecs) {
@@ -678,6 +773,8 @@ function logTextUsage(details) {
 module.exports = {
   createTextSessionController,
   buildInitialInput,
+  normalizeTextHistory,
+  shouldExcludeHistoryText,
   mapToolsForResponses,
   extractOutputText,
   sanitizeToolResult,

@@ -14,6 +14,7 @@ import {
 } from "./lib/realtime";
 import { RealtimeDiagnosticsBuffer } from "./lib/realtimeDiagnostics";
 import { SessionOwnerLock } from "./lib/sessionOwner";
+import { buildTextHistoryFromTranscript } from "./lib/textHistory";
 import { TextClient, type TextTurnState } from "./lib/textClient";
 import type { RickyArtifact } from "./vite-env";
 
@@ -228,32 +229,23 @@ export default function App() {
       return;
     }
 
-    // Chronological permitted history only (newest-first UI log → reverse).
-    const history = transcriptRef.current
-      .filter((entry) => entry.role === "user" || entry.role === "ricky")
-      .slice(0, 12)
-      .reverse()
-      .map((entry) => ({
-        role: entry.role === "ricky" ? ("assistant" as const) : ("user" as const),
-        text: entry.text,
-      }));
+    // Build sanitized history BEFORE TextClient appends the current user turn to the log.
+    const history = buildTextHistoryFromTranscript(transcriptRef.current, trimmed);
 
     try {
       const result = await textClientRef.current?.submit(trimmed, history);
-      // Preserve typed text until main accepts the turn (not rejected / empty).
-      if (result && result.outcome !== "rejected" && result.outcome !== "error") {
+      const delivered =
+        Boolean(result?.ok) &&
+        (Boolean(result?.assistantText?.trim()) || (result?.artifacts?.length ?? 0) > 0);
+      // Keep the input until a visible assistant response or artifact is delivered.
+      if (delivered) {
         setTextPrompt("");
         setShowTypeInput(false);
-      } else if (result?.ok) {
-        setTextPrompt("");
-        setShowTypeInput(false);
-      }
-      if (result?.ok) {
         setLastError(null);
         setStatus("Idle");
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Something went wrong connecting Jarvis.";
+      const message = error instanceof Error ? error.message : "The text request failed. Try again.";
       setStatus(message);
       setTranscript((items) => [newEntry("system", message), ...items].slice(0, 80));
     } finally {

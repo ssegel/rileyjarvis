@@ -12,6 +12,7 @@ const {
   mapToolsForResponses,
   MAX_TOOL_LOOP_ITERATIONS,
   DEFAULT_TEXT_MODEL,
+  normalizeTextHistory,
 } = require("./text-session.cjs");
 const { buildSessionInstructions } = require("./session-instructions.cjs");
 
@@ -543,6 +544,22 @@ test("history builder excludes tool roles and bounds recent transcript", () => {
   assert.doesNotMatch(serialized, /diag/);
   const mapped = mapToolsForResponses([{ type: "function", name: "show_menu", description: "m", parameters: {} }]);
   assert.equal(mapped[0].type, "function");
+});
+
+test("history builder drops excluded status and confirmation lines", () => {
+  const history = normalizeTextHistory(
+    [
+      { role: "user", text: "show menu" },
+      { role: "assistant", text: "Confirmation required before continuing." },
+      { role: "assistant", text: "Jarvis menu is open in the artifacts panel." },
+      { role: "user", text: "What is my first priority?" },
+    ],
+    "What is my first priority?",
+  );
+  assert.deepEqual(
+    history.map((e) => e.text),
+    ["show menu"],
+  );
 });
 
 test("Responses request bodies omit tracing; Realtime tracing unchanged", () => {

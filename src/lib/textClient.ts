@@ -126,14 +126,35 @@ export class TextClient {
         return result;
       }
 
+      const hasVisibleOutput =
+        Boolean(result.assistantText?.trim()) || (result.artifacts?.length ?? 0) > 0;
+      if (!hasVisibleOutput) {
+        const emptyResult: JarvisTextTurnResult = {
+          ...result,
+          ok: false,
+          outcome: "error",
+          cancelled: false,
+          error: {
+            code: "api.bad_response",
+            message: "Jarvis returned no visible response.",
+            retryable: true,
+          },
+        };
+        this.setState("error");
+        this.callbacks.onError(emptyResult.error!.message, emptyResult.error!.code);
+        this.diag("error", "text.turn.empty", emptyResult.error!.message, clientTurnId, emptyResult);
+        return emptyResult;
+      }
+
       if (result.toolTrace?.length) {
         this.setState("tool-running");
       }
 
+      // Deliver visible output before completing so the log updates before idle.
       for (const artifact of result.artifacts || []) {
         this.callbacks.onArtifact(artifact);
       }
-      if (result.assistantText) {
+      if (result.assistantText?.trim()) {
         this.callbacks.onAssistantText(result.assistantText);
       }
       this.setState("completed");
