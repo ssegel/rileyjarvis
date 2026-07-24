@@ -38,7 +38,7 @@ export default function App() {
   const [showTypeInput, setShowTypeInput] = useState(false);
   const [mouthShape, setMouthShape] = useState<MouthShape>({ open: 0, width: 0.18, round: 0, teeth: 0 });
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([
-    newEntry("system", "Ricky is ready. Connect voice, then talk naturally."),
+    newEntry("system", "Jarvis is ready. Connect voice, then talk naturally."),
   ]);
   const [status, setStatus] = useState("Idle");
   const [lastError, setLastError] = useState<ClassifiedRealtimeError | null>(null);
@@ -126,7 +126,7 @@ export default function App() {
       clientRef.current?.getDiagnosticReport() ||
       ["Jarvis Realtime Diagnostics", JSON.stringify({ lastErrorCode: lastError?.code || null }, null, 2)].join("\n");
     try {
-      const result = await window.ricky.copyTextToClipboard(report);
+      const result = await window.jarvis.copyTextToClipboard(report);
       setCopyStatus(result?.ok === true ? "Diagnostics copied." : "Could not copy diagnostics.");
     } catch {
       setCopyStatus("Could not copy diagnostics.");
@@ -136,7 +136,7 @@ export default function App() {
 
   async function switchMode(nextMode: RickyMode) {
     setMode(nextMode);
-    const result = await window.ricky.executeTool({ name: "set_mode", arguments: { mode: nextMode } });
+    const result = await window.jarvis.executeTool({ name: "set_mode", arguments: { mode: nextMode } });
     if (result.artifact) setArtifact(result.artifact);
     if (nextMode === "computer") {
       setArtifactVisible(false);
@@ -175,13 +175,13 @@ export default function App() {
   if (mode === "computer") {
     return (
       <main className="app-shell app-shell-mini">
-        <section className="mini-companion" aria-label="Ricky computer use mini mode">
+        <section className="mini-companion" aria-label="Jarvis computer use mini mode">
           <RickyFace mood={mood} mouthShape={mouthShape} />
           <button
             className="mini-restore-button"
             onClick={() => void switchMode("display")}
-            aria-label="Return to full Ricky window"
-            title="Return to full Ricky window"
+            aria-label="Return to full Jarvis window"
+            title="Return to full Jarvis window"
           >
             <Expand size={14} />
           </button>
@@ -309,7 +309,7 @@ export default function App() {
               {transcript.map((entry) => (
                 <article className={`entry entry-${entry.role}`} key={entry.id}>
                   <div>
-                    <strong>{entry.role === "ricky" ? "Ricky" : entry.role}</strong>
+                    <strong>{entry.role === "ricky" ? "Jarvis" : entry.role}</strong>
                     <time>{entry.at}</time>
                   </div>
                   <p>{entry.text}</p>

@@ -278,8 +278,8 @@ export class RickyRealtimeClient {
     this.callbacks.onMood("thinking");
     this.callbacks.onStatus("Minting a Realtime client secret.");
 
-    this.toolSpecs = await window.ricky.getToolSpecs();
-    const token = await window.ricky.createRealtimeToken();
+    this.toolSpecs = await window.jarvis.getToolSpecs();
+    const token = await window.jarvis.createRealtimeToken();
     const pc = new RTCPeerConnection();
     this.pc = pc;
     const audio = createRemoteAudioElement();
@@ -333,7 +333,7 @@ export class RickyRealtimeClient {
       this.reconnecting = false;
       this.callbacks.onConnectionState("connected");
       this.callbacks.onMood("idle");
-      this.callbacks.onStatus("Ricky is live. Start talking naturally.");
+      this.callbacks.onStatus("Jarvis is live. Start talking naturally.");
       this.emitSessionUiState("listening");
       this.diag("info", "connect.success", "Realtime data channel open", {
         resourceCounts: this.getResourceCounts(),
@@ -825,11 +825,11 @@ export class RickyRealtimeClient {
         this.callbacks.onArtifact({
           title: "Generating Image",
           kind: "imageLoading",
-          content: typeof parsedArgs.prompt === "string" ? parsedArgs.prompt : "Ricky is generating an image.",
+          content: typeof parsedArgs.prompt === "string" ? parsedArgs.prompt : "Jarvis is generating an image.",
         });
       }
       if (name === "thumbnail_generate" || name === "thumbnail_edit") {
-        const loadingResult = await window.ricky.executeTool({
+        const loadingResult = await window.jarvis.executeTool({
           name: "thumbnail_loading_prepare",
           arguments: {
             ...parsedArgs,
@@ -840,7 +840,7 @@ export class RickyRealtimeClient {
         if (typeof loadingResult.targetId === "string") parsedArgs.targetId = loadingResult.targetId;
         if (loadingResult.artifact) this.callbacks.onArtifact(loadingResult.artifact);
       }
-      const result = await window.ricky.executeTool({ name, arguments: parsedArgs } satisfies RickyToolCall);
+      const result = await window.jarvis.executeTool({ name, arguments: parsedArgs } satisfies RickyToolCall);
       if (result.mode === "display" || result.mode === "computer") {
         this.callbacks.onMode(result.mode);
       }

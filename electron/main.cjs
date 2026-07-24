@@ -17,7 +17,7 @@ let mainWindow = null;
 let normalWindowBounds = null;
 let dbWriteQueue = Promise.resolve();
 
-const RICKY_INSTRUCTIONS = `# Role and Objective
+const JARVIS_INSTRUCTIONS = `# Role and Objective
 You are Jarvis, Sarah's personal desktop AI operator. You speak through realtime voice and can use local computer tools when authorized.
 
 # Personality and Tone
@@ -681,7 +681,7 @@ ipcMain.handle("realtime:create-token", async () => {
   }
   const db = await readDb();
   const personalContext = await memoryStore.buildPersonalContextForSession();
-  const instructions = `${RICKY_INSTRUCTIONS}\n\n${personalContext.text}\n\n${buildThumbnailBoardInstructions(db)}`;
+  const instructions = `${JARVIS_INSTRUCTIONS}\n\n${personalContext.text}\n\n${buildThumbnailBoardInstructions(db)}`;
 
   let response;
   try {
@@ -715,7 +715,7 @@ ipcMain.handle("realtime:create-token", async () => {
             },
           },
           tracing: {
-            workflow_name: "Ricky Desktop Companion",
+            workflow_name: "Jarvis Desktop Companion",
           },
         },
       }),

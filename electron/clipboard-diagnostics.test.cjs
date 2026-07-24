@@ -128,8 +128,10 @@ test("wiring uses narrow clipboard IPC without exposing Electron", () => {
   assert.match(preload, /copyTextToClipboard/);
   assert.match(preload, /clipboard:write-text/);
   assert.doesNotMatch(preload, /require\("electron"\)\.clipboard|clipboard\.writeText/);
-  assert.match(app, /window\.ricky\.copyTextToClipboard/);
+  assert.match(app, /window\.jarvis\.copyTextToClipboard/);
   assert.match(app, /result\?\.ok === true/);
   assert.doesNotMatch(app, /navigator\.clipboard/);
   assert.match(viteEnv, /copyTextToClipboard/);
+  assert.match(viteEnv, /jarvis:/);
+  assert.doesNotMatch(viteEnv, /\bricky\s*:/);
 });
