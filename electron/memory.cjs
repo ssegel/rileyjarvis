@@ -1103,6 +1103,61 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     previewStore.clear();
   }
 
+  function buildPreviewRequestBinding(args = {}) {
+    const items = Array.isArray(args.items) ? args.items : args.item ? [args.item] : [];
+    return {
+      atPosition:
+        args.atPosition != null && args.atPosition !== "" ? Number(args.atPosition) : null,
+      targetDate: args.targetDate != null && args.targetDate !== "" ? String(args.targetDate) : null,
+      move: args.move === true,
+      backupId: args.backupId != null && args.backupId !== "" ? String(args.backupId) : null,
+      reference: args.reference != null ? args.reference : null,
+      order: Array.isArray(args.order) ? args.order : null,
+      itemTexts: items.map((raw) => String(raw?.text || raw?.name || "").trim()).filter(Boolean),
+    };
+  }
+
+  function confirmationConflictsWithPreview(args, entry) {
+    const bound = entry?.meta?.request;
+    if (!bound) return null;
+
+    if (args.atPosition != null && args.atPosition !== "" && bound.atPosition != null) {
+      if (Number(args.atPosition) !== Number(bound.atPosition)) {
+        return "Confirmation atPosition does not match the preview.";
+      }
+    }
+    if (args.targetDate != null && args.targetDate !== "" && bound.targetDate != null) {
+      if (String(args.targetDate) !== String(bound.targetDate)) {
+        return "Confirmation targetDate does not match the preview.";
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(args, "move") && Boolean(args.move) !== Boolean(bound.move)) {
+      return "Confirmation move flag does not match the preview.";
+    }
+    if (args.backupId != null && args.backupId !== "" && bound.backupId != null) {
+      if (String(args.backupId) !== String(bound.backupId)) {
+        return "Confirmation backupId does not match the preview.";
+      }
+    }
+    if (args.reference != null && bound.reference != null) {
+      if (JSON.stringify(args.reference) !== JSON.stringify(bound.reference)) {
+        return "Confirmation reference does not match the preview.";
+      }
+    }
+    if (Array.isArray(args.order) && Array.isArray(bound.order)) {
+      if (JSON.stringify(args.order) !== JSON.stringify(bound.order)) {
+        return "Confirmation order does not match the preview.";
+      }
+    }
+    const supplied = buildPreviewRequestBinding(args);
+    if (supplied.itemTexts.length && bound.itemTexts.length) {
+      if (JSON.stringify(supplied.itemTexts) !== JSON.stringify(bound.itemTexts)) {
+        return "Confirmation items do not match the preview.";
+      }
+    }
+    return null;
+  }
+
   function storePreview(operation, beforePriorities, afterPriorities, dailyUpdatedAt, meta = {}) {
     const token = createPreviewToken();
     const payload = { operation, beforePriorities, afterPriorities, dailyUpdatedAt, meta };
@@ -1404,6 +1459,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       const afterPriorities = loaded.restoredPriorities;
       const token = storePreview(operation, beforePriorities, afterPriorities, daily.updatedAt, {
         backupFile: loaded.file.name,
+        request: buildPreviewRequestBinding(args),
       });
       return {
         ok: true,
@@ -1428,19 +1484,27 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         dailyUpdatedAt: daily.updatedAt,
       });
     }
-    const token = storePreview(operation, beforePriorities, planned.nextPriorities, daily.updatedAt, planned.meta);
+    const request = buildPreviewRequestBinding(args);
+    const token = storePreview(operation, beforePriorities, planned.nextPriorities, daily.updatedAt, {
+      ...planned.meta,
+      request,
+      atPosition: request.atPosition,
+    });
+    const destructive = DESTRUCTIVE_OPERATIONS.has(operation);
     return {
       ok: true,
       operation: args._previewOnly ? operation : "preview",
       previewOperation: operation,
-      message: `Preview ready for ${operation.replace(/_/g, " ")}. Confirm to apply.`,
+      message: destructive
+        ? `Preview ready for ${operation.replace(/_/g, " ")}. Confirm to apply.`
+        : `Dry-run only for ${operation.replace(/_/g, " ")}. Execute ${operation} directly with the same arguments to apply; do not ask Sarah to confirm.`,
       previewToken: token,
       before: canonicalizePriorities(beforePriorities),
       after: canonicalizePriorities(planned.nextPriorities),
       priorities: canonicalizePriorities(beforePriorities),
       dailyUpdatedAt: daily.updatedAt,
       artifact: formatPrioritiesArtifact(planned.nextPriorities),
-      requiresConfirmation: DESTRUCTIVE_OPERATIONS.has(operation),
+      requiresConfirmation: destructive,
     };
   }
 
@@ -1483,7 +1547,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         prepared.push(item);
       }
       next.splice(at - 1, 0, ...prepared);
-      return { nextPriorities: next };
+      return { nextPriorities: next, meta: { atPosition: at } };
     }
 
     if (operation === "edit" || operation === "complete" || operation === "reopen" || operation === "remove") {
@@ -1680,10 +1744,45 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   async function applyPriorityOperation(args, daily, beforePriorities, startedAt, resolveOpts) {
     const operation = String(args.operation || "").trim().toLowerCase();
 
+    // Compatibility: if insert is called with a preview token, apply the stored plan
+    // exactly (or reject mismatched confirmation args). Never re-plan with a missing
+    // atPosition that could silently insert at position 1.
+    if (operation === "insert" && args.previewToken) {
+      const preview = readPreview(args.previewToken, "insert", daily.updatedAt);
+      if (preview.code) {
+        return failPriorityResult(operation, "STALE_PREVIEW", "Priority preview is stale or invalid.", startedAt, {
+          priorities: canonicalizePriorities(daily.priorities),
+          dailyUpdatedAt: daily.updatedAt,
+        });
+      }
+      const conflict = confirmationConflictsWithPreview(args, preview.entry);
+      if (conflict) {
+        return failPriorityResult(operation, "STALE_PREVIEW", conflict, startedAt, {
+          priorities: canonicalizePriorities(daily.priorities),
+          dailyUpdatedAt: daily.updatedAt,
+        });
+      }
+      const nextDaily = { ...daily, priorities: clonePriorities(preview.entry.afterPriorities) };
+      const result = await commitPriorityDaily(daily, nextDaily, operation, startedAt);
+      if (result.ok) {
+        const beforeIds = new Set(beforePriorities.map((item) => item.id));
+        const inserted = result.priorities.find((item) => !beforeIds.has(item.id));
+        recentPriorityId = inserted?.id || recentPriorityId;
+      }
+      return result;
+    }
+
     if (DESTRUCTIVE_OPERATIONS.has(operation) && args.confirmed === true && args.previewToken) {
       const preview = readPreview(args.previewToken, operation, daily.updatedAt);
       if (preview.code) {
         return failPriorityResult(operation, "STALE_PREVIEW", "Priority preview is stale or invalid.", startedAt, {
+          priorities: canonicalizePriorities(daily.priorities),
+          dailyUpdatedAt: daily.updatedAt,
+        });
+      }
+      const conflict = confirmationConflictsWithPreview(args, preview.entry);
+      if (conflict) {
+        return failPriorityResult(operation, "STALE_PREVIEW", conflict, startedAt, {
           priorities: canonicalizePriorities(daily.priorities),
           dailyUpdatedAt: daily.updatedAt,
         });
@@ -1795,6 +1894,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         return result;
       }
 
+      // Destructive confirm: apply the exact stored preview plan; do not re-plan from confirm args.
       const nextDaily = { ...daily, priorities: clonePriorities(preview.entry.afterPriorities) };
       const result = await commitPriorityDaily(daily, nextDaily, operation, startedAt);
       if (result.ok && preview.entry.meta?.touchedId) recentPriorityId = preview.entry.meta.touchedId;

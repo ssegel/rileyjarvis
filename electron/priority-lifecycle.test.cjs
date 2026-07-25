@@ -132,10 +132,149 @@ test("insert at position shifts without changing existing IDs", async () => {
       item: { text: "B" },
     });
     assert.deepEqual(texts(inserted), ["A", "B", "C"]);
+    assert.equal(inserted.requiresConfirmation, undefined);
     const after = await store.loadAll();
     assert.equal(after.daily.priorities[0].id, idA);
     assert.equal(after.daily.priorities[2].id, idC);
     assert.notEqual(after.daily.priorities[1].id, idA);
+  });
+});
+
+test("direct insert at position 1, 2, and end preserves existing IDs without confirmation", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await store.memoryPriorities({
+      operation: "add",
+      items: [{ text: "Middle" }, { text: "Tail" }],
+    });
+    let data = await store.loadAll();
+    const idMiddle = data.daily.priorities[0].id;
+    const idTail = data.daily.priorities[1].id;
+
+    const atOne = await store.memoryPriorities({
+      operation: "insert",
+      atPosition: 1,
+      item: { text: "Head" },
+    });
+    assert.equal(atOne.ok, true);
+    assert.equal(atOne.code, undefined);
+    assert.doesNotMatch(String(atOne.message || ""), /confirm/i);
+    assert.deepEqual(texts(atOne), ["Head", "Middle", "Tail"]);
+    assert.equal(atOne.priorities[1].id, idMiddle);
+    assert.equal(atOne.priorities[2].id, idTail);
+
+    data = await store.loadAll();
+    const idHead = data.daily.priorities[0].id;
+    const atTwo = await store.memoryPriorities({
+      operation: "insert",
+      atPosition: 2,
+      item: { text: "Second" },
+    });
+    assert.deepEqual(texts(atTwo), ["Head", "Second", "Middle", "Tail"]);
+    assert.equal(atTwo.priorities[0].id, idHead);
+    assert.equal(atTwo.priorities[2].id, idMiddle);
+    assert.equal(atTwo.priorities[3].id, idTail);
+
+    data = await store.loadAll();
+    const end = await store.memoryPriorities({
+      operation: "insert",
+      atPosition: data.daily.priorities.length + 1,
+      item: { text: "End" },
+    });
+    assert.deepEqual(texts(end), ["Head", "Second", "Middle", "Tail", "End"]);
+    assert.equal(end.priorities[0].id, idHead);
+    assert.equal(end.priorities[2].id, idMiddle);
+    assert.equal(end.priorities[3].id, idTail);
+  });
+});
+
+test("insert compatibility preview retains position; changed or omitted confirm position cannot silently become 1", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await store.memoryPriorities({
+      operation: "add",
+      items: [{ text: "call Cecilia" }, { text: "finish the website homepage" }],
+    });
+    const before = await store.loadAll();
+    const idCecilia = before.daily.priorities[0].id;
+    const idWebsite = before.daily.priorities[1].id;
+
+    const preview = await store.memoryPriorities({
+      operation: "preview",
+      previewOperation: "insert",
+      atPosition: 2,
+      item: { text: "review the scanner purchase" },
+    });
+    assert.equal(preview.ok, true);
+    assert.equal(preview.requiresConfirmation, false);
+    assert.deepEqual(
+      preview.after.map((item) => item.text),
+      ["call Cecilia", "review the scanner purchase", "finish the website homepage"],
+    );
+    assert.match(preview.message, /Dry-run only|Execute insert directly/i);
+    assert.doesNotMatch(preview.message, /Preview ready for insert\. Confirm to apply\./);
+
+    const mismatched = await store.memoryPriorities({
+      operation: "insert",
+      previewToken: preview.previewToken,
+      confirmed: true,
+      atPosition: 1,
+      item: { text: "review the scanner purchase" },
+    });
+    assert.equal(mismatched.ok, false);
+    assert.equal(mismatched.code, "STALE_PREVIEW");
+    let data = await store.loadAll();
+    assert.deepEqual(
+      data.daily.priorities.map((item) => item.text),
+      ["call Cecilia", "finish the website homepage"],
+    );
+
+    const omittedPosition = await store.memoryPriorities({
+      operation: "insert",
+      previewToken: preview.previewToken,
+      confirmed: true,
+      item: { text: "review the scanner purchase" },
+    });
+    assert.equal(omittedPosition.ok, true);
+    assert.deepEqual(texts(omittedPosition), [
+      "call Cecilia",
+      "review the scanner purchase",
+      "finish the website homepage",
+    ]);
+    assert.equal(omittedPosition.priorities[0].id, idCecilia);
+    assert.equal(omittedPosition.priorities[2].id, idWebsite);
+    assert.notEqual(omittedPosition.priorities[0].text, "review the scanner purchase");
+  });
+});
+
+test("destructive preview confirmation rejects mismatched payload and still applies exact stored plan", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await store.memoryPriorities({
+      operation: "add",
+      items: [{ text: "Keep" }, { text: "Drop" }],
+    });
+    const preview = await store.memoryPriorities({
+      operation: "remove",
+      reference: { by: "text", value: "Drop" },
+    });
+    assert.equal(preview.code, "CONFIRMATION_REQUIRED");
+
+    const mismatched = await store.memoryPriorities({
+      operation: "remove",
+      confirmed: true,
+      previewToken: preview.previewToken,
+      reference: { by: "text", value: "Keep" },
+    });
+    assert.equal(mismatched.code, "STALE_PREVIEW");
+
+    const confirmed = await store.memoryPriorities({
+      operation: "remove",
+      confirmed: true,
+      previewToken: preview.previewToken,
+    });
+    assert.equal(confirmed.ok, true);
+    assert.deepEqual(texts(confirmed), ["Keep"]);
   });
 });
 
