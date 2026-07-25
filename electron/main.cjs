@@ -26,7 +26,13 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 # Personal Memory
 - Durable personal instructions, preferences, profile facts, daily working context, and memory entries live in local files under data/memory/.
 - Temporary conversation history is session-only and is not persisted as durable memory.
-- Use memory_view, memory_remember, memory_correct, memory_update_daily, memory_set_preference, memory_set_instructions, and memory_clear to manage personal context.
+- Use memory_view, memory_remember, memory_correct, memory_update_daily, memory_priorities, memory_set_preference, memory_set_instructions, and memory_clear to manage personal context.
+- Use memory_priorities for every daily-priority lifecycle request: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry, restore backup, and preview.
+- Never ask Sarah for internal priority IDs. Resolve by ordinal, exact wording, distinctive phrase, or the recently changed item.
+- Never use memory_update_daily.priorities for add, edit, complete, reopen, remove, reorder, replace, clear, carry, or restore.
+- On AMBIGUOUS_MATCH, ask one concise clarification and do not write.
+- For remove, replace, clear completed, carry, and restore backup: present the preview, wait for explicit confirmation, then call again with confirmed=true and the matching previewToken.
+- After every successful priority write, briefly confirm and report the resulting ordered list.
 - Require confirmed=true before memory_clear and before full replacement of instructions.
 - Never invent commitments. Prefer explicit user confirmation before irreversible actions.
 - Do not put secret memory values into ordinary responses; use confirmed memory_view when Sarah asks to see secrets.
@@ -276,17 +282,62 @@ const toolSpecs = [
   {
     type: "function",
     name: "memory_update_daily",
-    description: "Update today's working context: summary, priorities, projects, commitments, follow-ups, and unresolved items.",
+    description:
+      "Update today's non-priority working context: summary, projects, commitments, follow-ups, and unresolved items. Do not pass priorities — use memory_priorities for daily-priority lifecycle changes.",
     parameters: {
       type: "object",
       properties: {
         summary: { type: "string" },
-        priorities: { type: "array", items: { type: "object", additionalProperties: true } },
         activeProjects: { type: "array", items: { type: "object", additionalProperties: true } },
         commitments: { type: "array", items: { type: "object", additionalProperties: true } },
         followUps: { type: "array", items: { type: "object", additionalProperties: true } },
         unresolved: { type: "array", items: { type: "object", additionalProperties: true } },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "memory_priorities",
+    description:
+      "Manage today's daily priorities with deterministic reference resolution. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, carry, restore_backup, preview. Destructive ops require preview then confirmed=true with previewToken. Never ask the user for UUIDs.",
+    parameters: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: [
+            "list",
+            "add",
+            "insert",
+            "edit",
+            "complete",
+            "reopen",
+            "remove",
+            "reorder",
+            "replace",
+            "clear_completed",
+            "carry",
+            "restore_backup",
+            "preview",
+          ],
+        },
+        confirmed: { type: "boolean" },
+        expectedUpdatedAt: { type: "string" },
+        items: { type: "array", items: { type: "object", additionalProperties: true } },
+        item: { type: "object", additionalProperties: true },
+        reference: { type: "object", additionalProperties: true },
+        atPosition: { type: "number" },
+        order: { type: "array", items: { type: "object", additionalProperties: true } },
+        targetDate: { type: "string" },
+        backupId: { type: "string" },
+        previewToken: { type: "string" },
+        previewOperation: { type: "string" },
+        listScope: { type: "string", enum: ["open", "all"] },
+        allowDuplicates: { type: "boolean" },
+        move: { type: "boolean" },
+      },
+      required: ["operation"],
       additionalProperties: false,
     },
   },
@@ -907,6 +958,9 @@ async function executeTrustedTool(toolCall) {
     if (name === "memory_update_daily") {
       return await memoryStore.memoryUpdateDaily(args);
     }
+    if (name === "memory_priorities") {
+      return await memoryStore.memoryPriorities(args);
+    }
     if (name === "memory_set_preference") {
       return await memoryStore.memorySetPreference(args);
     }
@@ -1123,7 +1177,9 @@ Here is what you can ask me to do.
 ## Personal Memory
 
 - View durable instructions, preferences, profile facts, daily context, and memory entries.
-- Remember facts, correct stored items, and update today's priorities, projects, commitments, and follow-ups.
+- Remember facts, correct stored items, and update today's projects, commitments, and follow-ups.
+- Manage daily priorities with natural language: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry to another day, and restore a backup.
+- Removing, replacing, clearing completed priorities, carrying across dates, or restoring a backup requires an explicit confirmation after preview.
 - Clearing memory or fully replacing instructions requires explicit confirmation.
 - Conversation transcript stays temporary for the current session only.
 

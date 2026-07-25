@@ -11,6 +11,22 @@ const {
   NO_OPEN_DAILY_PRIORITIES_REPLY,
 } = require("./memory.cjs");
 
+async function seedPriorities(store, priorities) {
+  const preview = await store.memoryPriorities({
+    operation: "replace",
+    items: priorities,
+  });
+  assert.equal(preview.code, "CONFIRMATION_REQUIRED");
+  const confirmed = await store.memoryPriorities({
+    operation: "replace",
+    items: priorities,
+    confirmed: true,
+    previewToken: preview.previewToken,
+  });
+  assert.equal(confirmed.ok, true);
+  return confirmed;
+}
+
 async function withStore(run, options = {}) {
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "rj-memory-"));
   const clock = { value: options.startDate ? new Date(options.startDate) : new Date("2026-07-22T15:00:00.000Z") };
@@ -94,12 +110,12 @@ test("daily rollover archives and carries open work", async () => {
     await store.ensureMemory();
     await store.memoryUpdateDaily({
       summary: "Yesterday plan",
-      priorities: [{ text: "Ship Phase 6", status: "open" }],
       commitments: [{ text: "Call attorney", status: "blocked" }],
       followUps: [{ text: "Email draft", status: "done" }],
       unresolved: [{ text: "Open question", status: "open" }],
       activeProjects: [{ name: "Jarvis", note: "memory" }],
     });
+    await seedPriorities(store, [{ text: "Ship Phase 6", status: "open" }]);
     helpers.setDate("2026-07-23T12:00:00.000Z");
     const rolled = await store.rolloverDailyIfNeeded();
     assert.equal(rolled.rolled, true);
@@ -247,8 +263,8 @@ test("secret exclusion, sensitive redaction, ordering, and size caps", async () 
     await store.memoryUpdateDaily({
       summary: "Focus day",
       commitments: [{ text: "Keep this commitment", status: "open" }],
-      priorities: [{ text: "Priority A", status: "open" }],
     });
+    await seedPriorities(store, [{ text: "Priority A", status: "open" }]);
     await store.memoryRemember({
       text: "Secret value should never inject",
       sensitivity: "secret",
@@ -318,11 +334,11 @@ test("one open daily priority outranks every open follow-up and unresolved item"
   await withStore(async (store) => {
     await store.ensureMemory();
     await store.memoryUpdateDaily({
-      priorities: [{ text: "Ship priority-selection fix", status: "open" }],
       followUps: [{ text: "Review seeded memory through memory_view", status: "open" }],
       unresolved: [{ text: "Which systems to integrate first", status: "open" }],
       activeProjects: [{ name: "Jarvis personal desktop assistant" }],
     });
+    await seedPriorities(store, [{ text: "Ship priority-selection fix", status: "open" }]);
     const data = await store.loadAll();
     const block = store.buildPersonalContextBlock(data);
     const planned = planBroadPriorityAnswer(data.daily, data.daily.date);
@@ -339,13 +355,11 @@ test("one open daily priority outranks every open follow-up and unresolved item"
 test("multiple open daily priorities preserve their stored order", async () => {
   await withStore(async (store) => {
     await store.ensureMemory();
-    await store.memoryUpdateDaily({
-      priorities: [
-        { text: "First stored priority", status: "open" },
-        { text: "Second stored priority", status: "open" },
-        { text: "Third stored priority", status: "open" },
-      ],
-    });
+    await seedPriorities(store, [
+      { text: "First stored priority", status: "open" },
+      { text: "Second stored priority", status: "open" },
+      { text: "Third stored priority", status: "open" },
+    ]);
     const data = await store.loadAll();
     const planned = planBroadPriorityAnswer(data.daily, data.daily.date);
     assert.deepEqual(planned.items, [
@@ -364,13 +378,13 @@ test("all daily priorities done produces no-open-daily-priorities context and re
   await withStore(async (store) => {
     await store.ensureMemory();
     await store.memoryUpdateDaily({
-      priorities: [
-        { text: "Realtime diagnostics", status: "done" },
-        { text: "Validate routine daily use", status: "done" },
-        { text: "Remove remaining Ricky branding", status: "done" },
-      ],
       followUps: [{ text: "Review the complete seeded memory through memory_view", status: "open" }],
     });
+    await seedPriorities(store, [
+      { text: "Realtime diagnostics", status: "done" },
+      { text: "Validate routine daily use", status: "done" },
+      { text: "Remove remaining Ricky branding", status: "done" },
+    ]);
     const data = await store.loadAll();
     const block = store.buildPersonalContextBlock(data);
     const planned = planBroadPriorityAnswer(data.daily, data.daily.date);
@@ -386,9 +400,9 @@ test("optional follow-up is labeled as a follow-up and never as the first daily 
   await withStore(async (store) => {
     await store.ensureMemory();
     await store.memoryUpdateDaily({
-      priorities: [{ text: "Already done priority", status: "done" }],
       followUps: [{ text: "Review the complete seeded memory through memory_view", status: "open" }],
     });
+    await seedPriorities(store, [{ text: "Already done priority", status: "done" }]);
     const data = await store.loadAll();
     const planned = planBroadPriorityAnswer(data.daily, data.daily.date);
     assert.equal(planned.categoryLabel, "follow-up");

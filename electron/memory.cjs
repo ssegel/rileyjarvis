@@ -1,6 +1,22 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const {
+  PREVIEW_TTL_MS,
+  DESTRUCTIVE_OPERATIONS,
+  canonicalizePriorities,
+  formatPrioritiesArtifact,
+  clonePriorities,
+  resolvePriorityReference,
+  validatePrioritiesArray,
+  validateDailyShape,
+  assertUnchangedFields,
+  normalizeIncomingItem,
+  hashPreviewPayload,
+  createPreviewToken,
+  addDaysToDate,
+  logPrioritiesEvent,
+} = require("./priority-lifecycle.cjs");
 
 const SCHEMA_VERSION = 1;
 const MAX_BACKUPS = 10;
@@ -162,7 +178,12 @@ function createMemoryStore(options = {}) {
     entries: path.join(rootDir, "entries.json"),
     archive: path.join(rootDir, "archive"),
     backups: path.join(rootDir, "backups"),
+    future: path.join(rootDir, "future"),
   };
+
+  /** @type {Map<string, { expiresAt: number, operation: string, hash: string, afterPriorities: any[], beforePriorities: any[], dailyUpdatedAt: string, meta?: any }>} */
+  const previewStore = new Map();
+  let recentPriorityId = null;
 
   function isoNow() {
     return now().toISOString();
@@ -458,6 +479,9 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   }
 
   async function createBackupSnapshot(reason = "backup", extras = {}) {
+    if (typeof options.failBackup === "function" && options.failBackup()) {
+      throw new Error("Simulated backup failure.");
+    }
     await fsApi.mkdir(paths.backups, { recursive: true });
     const stamp = isoNow().replace(/[:.]/g, "-");
     const prefix = `${stamp}-${String(reason).replace(/[^a-z0-9_-]+/gi, "").slice(0, 40) || "backup"}`;
@@ -509,9 +533,30 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     await atomicWriteJson(archivePath, daily);
 
     const carried = openDailyItems(daily);
+    let priorities = carried.priorities;
+    const futurePath = path.join(paths.future, `daily-${today}.json`);
+    if (await pathExists(futurePath)) {
+      try {
+        const futureDaily = await readJsonFile(futurePath, (raw) => normalizeDaily(raw, today), () => defaultDaily(today));
+        const seen = new Set(priorities.map((item) => item.id));
+        for (const item of futureDaily.priorities || []) {
+          if (!seen.has(item.id)) {
+            priorities.push(item);
+            seen.add(item.id);
+          }
+        }
+      } finally {
+        try {
+          await fsApi.unlink(futurePath);
+        } catch {
+          // Ignore missing future file races.
+        }
+      }
+    }
+
     const next = {
       ...defaultDaily(today),
-      priorities: carried.priorities,
+      priorities,
       commitments: carried.commitments,
       followUps: carried.followUps,
       unresolved: carried.unresolved,
@@ -527,6 +572,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     await fsApi.mkdir(paths.root, { recursive: true });
     await fsApi.mkdir(paths.archive, { recursive: true });
     await fsApi.mkdir(paths.backups, { recursive: true });
+    await fsApi.mkdir(paths.future, { recursive: true });
 
     if (!(await pathExists(paths.instructions))) {
       await atomicWriteText(paths.instructions, defaultInstructions());
@@ -817,11 +863,18 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
 
   async function memoryUpdateDaily(args = {}) {
     return enqueue(async () => {
+      if (Object.prototype.hasOwnProperty.call(args, "priorities")) {
+        return {
+          ok: false,
+          code: "USE_MEMORY_PRIORITIES",
+          error:
+            "Use memory_priorities for daily-priority lifecycle changes. memory_update_daily no longer accepts priorities.",
+        };
+      }
       await ensureMemoryUnlocked();
       await rolloverDailyIfNeeded();
       const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
       if (typeof args.summary === "string") daily.summary = args.summary;
-      if (args.priorities) daily.priorities = upsertWorkList(daily.priorities, args.priorities, (item) => normalizeWorkItem(item));
       if (args.activeProjects) {
         daily.activeProjects = upsertWorkList(daily.activeProjects, args.activeProjects, (item) => {
           const project = normalizeWorkItem({ ...item, text: item.name || item.text });
@@ -1046,6 +1099,737 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     return buildPersonalContextBlock(data);
   }
 
+  function invalidatePreviews() {
+    previewStore.clear();
+  }
+
+  function storePreview(operation, beforePriorities, afterPriorities, dailyUpdatedAt, meta = {}) {
+    const token = createPreviewToken();
+    const payload = { operation, beforePriorities, afterPriorities, dailyUpdatedAt, meta };
+    previewStore.set(token, {
+      expiresAt: Date.now() + PREVIEW_TTL_MS,
+      operation,
+      hash: hashPreviewPayload(payload),
+      beforePriorities: clonePriorities(beforePriorities),
+      afterPriorities: clonePriorities(afterPriorities),
+      dailyUpdatedAt,
+      meta,
+    });
+    return token;
+  }
+
+  function readPreview(token, operation, dailyUpdatedAt) {
+    const entry = previewStore.get(String(token || ""));
+    if (!entry) return { code: "STALE_PREVIEW" };
+    if (Date.now() > entry.expiresAt) {
+      previewStore.delete(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.operation !== operation) return { code: "STALE_PREVIEW" };
+    if (entry.dailyUpdatedAt !== dailyUpdatedAt) return { code: "STALE_PREVIEW" };
+    return { entry };
+  }
+
+  function successPriorityResult(options) {
+    const { operation, priorities, dailyUpdatedAt, message, backupId, startedAt, extra } = options;
+    logPrioritiesEvent({
+      operation,
+      ok: true,
+      itemCount: priorities.length,
+      backupId,
+      durationMs: Date.now() - startedAt,
+    });
+    return {
+      ok: true,
+      message,
+      operation,
+      priorities: canonicalizePriorities(priorities),
+      dailyUpdatedAt,
+      backupId,
+      artifact: formatPrioritiesArtifact(priorities),
+      confirmation: message,
+      ...extra,
+    };
+  }
+
+  function failPriorityResult(operation, code, message, startedAt, extra = {}) {
+    logPrioritiesEvent({
+      operation,
+      ok: false,
+      code,
+      itemCount: extra.priorities ? extra.priorities.length : undefined,
+      durationMs: Date.now() - startedAt,
+    });
+    return {
+      ok: false,
+      code,
+      error: message,
+      message,
+      operation,
+      ...extra,
+    };
+  }
+
+  async function commitPriorityDaily(beforeDaily, nextDaily, operation, startedAt) {
+    const unchanged = assertUnchangedFields(beforeDaily, nextDaily);
+    if (unchanged) {
+      return failPriorityResult(operation, "VALIDATION_FAILED", unchanged, startedAt, {
+        priorities: canonicalizePriorities(beforeDaily.priorities),
+        dailyUpdatedAt: beforeDaily.updatedAt,
+      });
+    }
+    const validationError = validateDailyShape(nextDaily);
+    if (validationError) {
+      return failPriorityResult(operation, "VALIDATION_FAILED", validationError, startedAt, {
+        priorities: canonicalizePriorities(beforeDaily.priorities),
+        dailyUpdatedAt: beforeDaily.updatedAt,
+      });
+    }
+
+    let backupId = null;
+    try {
+      const snapshot = await createBackupSnapshot(`priorities-${operation}`);
+      backupId = snapshot.createdAt;
+    } catch (error) {
+      return failPriorityResult(
+        operation,
+        "BACKUP_FAILED",
+        error instanceof Error ? error.message : "Backup creation failed.",
+        startedAt,
+        {
+          priorities: canonicalizePriorities(beforeDaily.priorities),
+          dailyUpdatedAt: beforeDaily.updatedAt,
+        },
+      );
+    }
+
+    nextDaily.updatedAt = isoNow();
+    try {
+      if (typeof options.failAtomicWrite === "function" && options.failAtomicWrite()) {
+        throw new Error("Simulated atomic write failure.");
+      }
+      await atomicWriteJson(paths.daily, nextDaily);
+    } catch (error) {
+      return failPriorityResult(
+        operation,
+        "WRITE_FAILED",
+        error instanceof Error ? error.message : "Atomic write failed.",
+        startedAt,
+        {
+          priorities: canonicalizePriorities(beforeDaily.priorities),
+          dailyUpdatedAt: beforeDaily.updatedAt,
+          backupId,
+        },
+      );
+    }
+
+    let reread;
+    try {
+      if (typeof options.failReread === "function" && options.failReread()) {
+        throw new Error("Simulated reread failure.");
+      }
+      reread = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
+    } catch (error) {
+      return failPriorityResult(
+        operation,
+        "WRITE_FAILED",
+        error instanceof Error ? error.message : "Reread failed after write.",
+        startedAt,
+        {
+          priorities: canonicalizePriorities(nextDaily.priorities),
+          dailyUpdatedAt: nextDaily.updatedAt,
+          backupId,
+        },
+      );
+    }
+
+    invalidatePreviews();
+
+    return successPriorityResult({
+      operation,
+      priorities: reread.priorities,
+      dailyUpdatedAt: reread.updatedAt,
+      message: `Daily priorities ${operation.replace(/_/g, " ")} completed.`,
+      backupId,
+      startedAt,
+      extra: { daily: reread },
+    });
+  }
+
+  async function memoryPriorities(args = {}) {
+    const startedAt = Date.now();
+    const operation = String(args.operation || "").trim().toLowerCase();
+    if (!operation) {
+      return failPriorityResult("unknown", "UNSUPPORTED_OPERATION", "operation is required.", startedAt);
+    }
+
+    return enqueue(async () => {
+      await ensureMemoryUnlocked();
+      await rolloverDailyIfNeeded();
+      const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
+      const beforePriorities = clonePriorities(daily.priorities);
+      const listScope = args.listScope === "all" ? "all" : "open";
+
+      if (args.expectedUpdatedAt && args.expectedUpdatedAt !== daily.updatedAt) {
+        return failPriorityResult(operation, "STALE_WRITE", "Daily context changed since the last read.", startedAt, {
+          priorities: canonicalizePriorities(daily.priorities),
+          dailyUpdatedAt: daily.updatedAt,
+          artifact: formatPrioritiesArtifact(daily.priorities),
+        });
+      }
+
+      const resolveOpts = { listScope, recentId: recentPriorityId };
+
+      if (operation === "list") {
+        logPrioritiesEvent({
+          operation,
+          ok: true,
+          itemCount: daily.priorities.length,
+          durationMs: Date.now() - startedAt,
+        });
+        return {
+          ok: true,
+          operation,
+          message: "Current daily priorities.",
+          priorities: canonicalizePriorities(daily.priorities),
+          dailyUpdatedAt: daily.updatedAt,
+          artifact: formatPrioritiesArtifact(daily.priorities),
+          confirmation: "Listed current daily priorities.",
+        };
+      }
+
+      if (operation === "preview") {
+        const nested = { ...args, operation: String(args.previewOperation || args.targetOperation || "").trim() };
+        if (!nested.operation) {
+          return failPriorityResult(operation, "UNSUPPORTED_OPERATION", "preview requires previewOperation.", startedAt);
+        }
+        nested.confirmed = false;
+        nested._previewOnly = true;
+        return memoryPrioritiesPreviewPlan(nested, daily, beforePriorities, startedAt, resolveOpts);
+      }
+
+      if (DESTRUCTIVE_OPERATIONS.has(operation)) {
+        if (args.confirmed !== true || !args.previewToken) {
+          const planned = await memoryPrioritiesPreviewPlan(
+            { ...args, _previewOnly: true },
+            daily,
+            beforePriorities,
+            startedAt,
+            resolveOpts,
+          );
+          if (planned.ok === false && planned.code !== "CONFIRMATION_REQUIRED") return planned;
+          return {
+            ok: false,
+            code: "CONFIRMATION_REQUIRED",
+            requiresConfirmation: true,
+            message: planned.message || `Confirmation required before ${operation.replace(/_/g, " ")}.`,
+            operation,
+            previewToken: planned.previewToken,
+            before: planned.before,
+            after: planned.after,
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+            artifact: planned.artifact || formatPrioritiesArtifact(daily.priorities),
+          };
+        }
+        const preview = readPreview(args.previewToken, operation, daily.updatedAt);
+        if (preview.code) {
+          return failPriorityResult(operation, "STALE_PREVIEW", "Priority preview is stale or invalid.", startedAt, {
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+      }
+
+      return applyPriorityOperation(args, daily, beforePriorities, startedAt, resolveOpts);
+    });
+  }
+
+  async function loadValidatedBackupPriorities(backupId) {
+    const files = await listBackupFiles();
+    let file = null;
+    if (backupId) {
+      file = files.find(
+        (item) =>
+          item.name.includes(String(backupId)) ||
+          item.name === backupId ||
+          item.full.endsWith(String(backupId)),
+      );
+    } else {
+      file = files[0];
+    }
+    if (!file) {
+      return { error: { code: "RESTORE_FAILED", message: "No backup was found to restore." } };
+    }
+    let snapshot;
+    try {
+      snapshot = JSON.parse(await readText(file.full));
+    } catch (error) {
+      return {
+        error: {
+          code: "RESTORE_FAILED",
+          message: error instanceof Error ? error.message : "Backup could not be read.",
+        },
+      };
+    }
+    if (!snapshot || typeof snapshot !== "object" || !snapshot.daily || typeof snapshot.daily !== "object") {
+      return { error: { code: "RESTORE_FAILED", message: "Backup is missing a valid daily snapshot." } };
+    }
+    const restoredPriorities = (Array.isArray(snapshot.daily.priorities) ? snapshot.daily.priorities : []).map((item) =>
+      normalizeWorkItem(item),
+    );
+    const validationError = validatePrioritiesArray(restoredPriorities);
+    if (validationError) {
+      return {
+        error: {
+          code: "RESTORE_FAILED",
+          message: `Backup priorities failed validation: ${validationError}`,
+        },
+      };
+    }
+    return { file, restoredPriorities };
+  }
+
+  async function memoryPrioritiesPreviewPlan(args, daily, beforePriorities, startedAt, resolveOpts) {
+    const operation = String(args.operation || "").trim().toLowerCase();
+
+    if (operation === "restore_backup") {
+      const loaded = await loadValidatedBackupPriorities(args.backupId);
+      if (loaded.error) {
+        return failPriorityResult(operation, loaded.error.code, loaded.error.message, startedAt, {
+          priorities: canonicalizePriorities(daily.priorities),
+          dailyUpdatedAt: daily.updatedAt,
+        });
+      }
+      const afterPriorities = loaded.restoredPriorities;
+      const token = storePreview(operation, beforePriorities, afterPriorities, daily.updatedAt, {
+        backupFile: loaded.file.name,
+      });
+      return {
+        ok: true,
+        operation: "preview",
+        previewOperation: operation,
+        message: `Preview ready for restore from ${loaded.file.name}. Confirm to apply.`,
+        previewToken: token,
+        before: canonicalizePriorities(beforePriorities),
+        after: canonicalizePriorities(afterPriorities),
+        priorities: canonicalizePriorities(beforePriorities),
+        dailyUpdatedAt: daily.updatedAt,
+        artifact: formatPrioritiesArtifact(afterPriorities),
+        requiresConfirmation: true,
+      };
+    }
+
+    const planned = planPriorityMutation(args, daily, resolveOpts);
+    if (planned.error) {
+      return failPriorityResult(operation, planned.error.code, planned.error.message, startedAt, {
+        candidates: planned.error.candidates,
+        priorities: canonicalizePriorities(daily.priorities),
+        dailyUpdatedAt: daily.updatedAt,
+      });
+    }
+    const token = storePreview(operation, beforePriorities, planned.nextPriorities, daily.updatedAt, planned.meta);
+    return {
+      ok: true,
+      operation: args._previewOnly ? operation : "preview",
+      previewOperation: operation,
+      message: `Preview ready for ${operation.replace(/_/g, " ")}. Confirm to apply.`,
+      previewToken: token,
+      before: canonicalizePriorities(beforePriorities),
+      after: canonicalizePriorities(planned.nextPriorities),
+      priorities: canonicalizePriorities(beforePriorities),
+      dailyUpdatedAt: daily.updatedAt,
+      artifact: formatPrioritiesArtifact(planned.nextPriorities),
+      requiresConfirmation: DESTRUCTIVE_OPERATIONS.has(operation),
+    };
+  }
+
+  function planPriorityMutation(args, daily, resolveOpts) {
+    const operation = String(args.operation || "").trim().toLowerCase();
+    const priorities = clonePriorities(daily.priorities);
+
+    if (operation === "add") {
+      const incoming = Array.isArray(args.items) ? args.items : args.item ? [args.item] : [];
+      if (!incoming.length) return { error: { code: "VALIDATION_FAILED", message: "add requires items." } };
+      const next = clonePriorities(priorities);
+      for (const raw of incoming) {
+        const item = normalizeIncomingItem(raw, randomUUID, isoNow);
+        if (!item.text) return { error: { code: "VALIDATION_FAILED", message: "Priority wording is required." } };
+        const dup = next.some((p) => p.text.toLowerCase() === item.text.toLowerCase());
+        if (dup && args.allowDuplicates !== true) {
+          return { error: { code: "DUPLICATE_TEXT", message: "A priority with that wording already exists." } };
+        }
+        next.push(item);
+      }
+      return { nextPriorities: next };
+    }
+
+    if (operation === "insert") {
+      const incoming = Array.isArray(args.items) ? args.items : args.item ? [args.item] : [];
+      const at = Number(args.atPosition);
+      if (!incoming.length) return { error: { code: "VALIDATION_FAILED", message: "insert requires items." } };
+      if (!Number.isInteger(at) || at < 1 || at > priorities.length + 1) {
+        return { error: { code: "VALIDATION_FAILED", message: "insert requires a valid 1-based atPosition." } };
+      }
+      const next = clonePriorities(priorities);
+      const prepared = [];
+      for (const raw of incoming) {
+        const item = normalizeIncomingItem(raw, randomUUID, isoNow);
+        if (!item.text) return { error: { code: "VALIDATION_FAILED", message: "Priority wording is required." } };
+        const dup = next.some((p) => p.text.toLowerCase() === item.text.toLowerCase());
+        if (dup && args.allowDuplicates !== true) {
+          return { error: { code: "DUPLICATE_TEXT", message: "A priority with that wording already exists." } };
+        }
+        prepared.push(item);
+      }
+      next.splice(at - 1, 0, ...prepared);
+      return { nextPriorities: next };
+    }
+
+    if (operation === "edit" || operation === "complete" || operation === "reopen" || operation === "remove") {
+      const resolved = resolvePriorityReference(priorities, args.reference || args.item, resolveOpts);
+      if (resolved.code) {
+        return {
+          error: {
+            code: resolved.code,
+            message:
+              resolved.code === "AMBIGUOUS_MATCH"
+                ? "Multiple priorities matched. Ask one concise clarification."
+                : "No matching priority was found.",
+            candidates: resolved.candidates,
+          },
+        };
+      }
+      const next = clonePriorities(priorities);
+      if (operation === "remove") {
+        next.splice(resolved.fullIndex, 1);
+        return { nextPriorities: next, meta: { removedId: resolved.item.id } };
+      }
+      if (operation === "edit") {
+        const text = String(args.item?.text || args.text || "").trim();
+        if (!text) return { error: { code: "VALIDATION_FAILED", message: "edit requires new wording." } };
+        const dup = next.some(
+          (p, idx) => idx !== resolved.fullIndex && p.text.toLowerCase() === text.toLowerCase(),
+        );
+        if (dup && args.allowDuplicates !== true) {
+          return { error: { code: "DUPLICATE_TEXT", message: "A priority with that wording already exists." } };
+        }
+        next[resolved.fullIndex] = {
+          ...next[resolved.fullIndex],
+          text,
+          updatedAt: isoNow(),
+        };
+        return { nextPriorities: next, meta: { touchedId: resolved.item.id } };
+      }
+      next[resolved.fullIndex] = {
+        ...next[resolved.fullIndex],
+        status: operation === "complete" ? "done" : "open",
+        updatedAt: isoNow(),
+      };
+      return { nextPriorities: next, meta: { touchedId: resolved.item.id } };
+    }
+
+    if (operation === "reorder") {
+      if (Array.isArray(args.order) && args.order.length) {
+        const next = [];
+        const used = new Set();
+        for (const ref of args.order) {
+          const resolved = resolvePriorityReference(priorities, ref, { ...resolveOpts, listScope: "all" });
+          if (resolved.code) {
+            return {
+              error: {
+                code: resolved.code,
+                message: "Could not resolve reorder reference.",
+                candidates: resolved.candidates,
+              },
+            };
+          }
+          if (used.has(resolved.item.id)) {
+            return { error: { code: "VALIDATION_FAILED", message: "reorder order contains duplicates." } };
+          }
+          used.add(resolved.item.id);
+          next.push({ ...resolved.item });
+        }
+        if (next.length !== priorities.length) {
+          return { error: { code: "VALIDATION_FAILED", message: "full reorder must include every priority." } };
+        }
+        return { nextPriorities: next };
+      }
+      const resolved = resolvePriorityReference(priorities, args.reference || args.item, resolveOpts);
+      if (resolved.code) {
+        return {
+          error: {
+            code: resolved.code,
+            message: "Could not resolve reorder target.",
+            candidates: resolved.candidates,
+          },
+        };
+      }
+      const at = Number(args.atPosition);
+      if (!Number.isInteger(at) || at < 1 || at > priorities.length) {
+        return { error: { code: "VALIDATION_FAILED", message: "reorder requires a valid 1-based atPosition." } };
+      }
+      const next = clonePriorities(priorities);
+      const [moved] = next.splice(resolved.fullIndex, 1);
+      next.splice(at - 1, 0, moved);
+      return { nextPriorities: next, meta: { touchedId: moved.id } };
+    }
+
+    if (operation === "replace") {
+      const incoming = Array.isArray(args.items) ? args.items : [];
+      const next = [];
+      const seenText = new Set();
+      for (const raw of incoming) {
+        const byId =
+          typeof raw?.id === "string" && raw.id
+            ? priorities.find((item) => item.id === raw.id)
+            : null;
+        const byText = priorities.find(
+          (item) => String(item.text || "").toLowerCase() === String(raw?.text || "").trim().toLowerCase(),
+        );
+        const existing = byId || byText || null;
+        const item = normalizeIncomingItem(raw, randomUUID, isoNow, { existing });
+        if (!item.text) return { error: { code: "VALIDATION_FAILED", message: "replace items require wording." } };
+        if (seenText.has(item.text.toLowerCase()) && args.allowDuplicates !== true) {
+          return { error: { code: "DUPLICATE_TEXT", message: "Replace list contains duplicate wording." } };
+        }
+        seenText.add(item.text.toLowerCase());
+        next.push(item);
+      }
+      return { nextPriorities: next };
+    }
+
+    if (operation === "clear_completed") {
+      return { nextPriorities: priorities.filter((item) => item.status !== "done") };
+    }
+
+    if (operation === "carry") {
+      const targetDate =
+        args.targetDate === "tomorrow" || !args.targetDate
+          ? addDaysToDate(daily.date, 1)
+          : String(args.targetDate);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+        return { error: { code: "VALIDATION_FAILED", message: "carry requires a valid targetDate." } };
+      }
+      if (targetDate === daily.date) {
+        return {
+          error: {
+            code: "VALIDATION_FAILED",
+            message: "carry targetDate must be a different day than the current daily date.",
+          },
+        };
+      }
+      let selected = [];
+      if (Array.isArray(args.order) && args.order.length) {
+        for (const ref of args.order) {
+          const resolved = resolvePriorityReference(priorities, ref, resolveOpts);
+          if (resolved.code) {
+            return {
+              error: {
+                code: resolved.code,
+                message: "Could not resolve carry reference.",
+                candidates: resolved.candidates,
+              },
+            };
+          }
+          selected.push(resolved.item);
+        }
+      } else if (args.reference || args.item) {
+        const resolved = resolvePriorityReference(priorities, args.reference || args.item, resolveOpts);
+        if (resolved.code) {
+          return {
+            error: {
+              code: resolved.code,
+              message: "Could not resolve carry reference.",
+              candidates: resolved.candidates,
+            },
+          };
+        }
+        selected = [resolved.item];
+      } else {
+        selected = priorities.filter((item) => item.status === "open" || item.status === "blocked");
+      }
+      selected = selected.filter((item) => item.status === "open" || item.status === "blocked");
+      if (!selected.length) {
+        return { error: { code: "NOT_FOUND", message: "No open priorities available to carry." } };
+      }
+      const move = args.move === true;
+      const next = move
+        ? priorities.filter((item) => !selected.some((sel) => sel.id === item.id))
+        : clonePriorities(priorities);
+      return {
+        nextPriorities: next,
+        meta: {
+          targetDate,
+          carryItems: selected.map((item) => ({ ...item })),
+          move,
+        },
+      };
+    }
+
+    if (operation === "restore_backup") {
+      return {
+        nextPriorities: null,
+        meta: { restore: true, backupId: args.backupId || null },
+      };
+    }
+
+    return { error: { code: "UNSUPPORTED_OPERATION", message: `Unsupported operation: ${operation}` } };
+  }
+
+  async function applyPriorityOperation(args, daily, beforePriorities, startedAt, resolveOpts) {
+    const operation = String(args.operation || "").trim().toLowerCase();
+
+    if (DESTRUCTIVE_OPERATIONS.has(operation) && args.confirmed === true && args.previewToken) {
+      const preview = readPreview(args.previewToken, operation, daily.updatedAt);
+      if (preview.code) {
+        return failPriorityResult(operation, "STALE_PREVIEW", "Priority preview is stale or invalid.", startedAt, {
+          priorities: canonicalizePriorities(daily.priorities),
+          dailyUpdatedAt: daily.updatedAt,
+        });
+      }
+      if (operation === "restore_backup") {
+        const backupFile = preview.entry.meta?.backupFile;
+        if (!backupFile) {
+          return failPriorityResult(operation, "RESTORE_FAILED", "Restore preview is missing its backup reference.", startedAt, {
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+        const full = path.join(paths.backups, backupFile);
+        if (!(await pathExists(full))) {
+          return failPriorityResult(operation, "RESTORE_FAILED", "Backup file is no longer available.", startedAt, {
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+        let snapshot;
+        try {
+          snapshot = JSON.parse(await readText(full));
+        } catch (error) {
+          return failPriorityResult(
+            operation,
+            "RESTORE_FAILED",
+            error instanceof Error ? error.message : "Backup could not be read.",
+            startedAt,
+          );
+        }
+        if (!snapshot || typeof snapshot !== "object" || !snapshot.daily || typeof snapshot.daily !== "object") {
+          return failPriorityResult(operation, "RESTORE_FAILED", "Backup is missing a valid daily snapshot.", startedAt, {
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+        const restoredPriorities = (Array.isArray(snapshot.daily.priorities) ? snapshot.daily.priorities : []).map((item) =>
+          normalizeWorkItem(item),
+        );
+        const validationError = validatePrioritiesArray(restoredPriorities);
+        if (validationError) {
+          return failPriorityResult(
+            operation,
+            "RESTORE_FAILED",
+            `Backup priorities failed validation: ${validationError}`,
+            startedAt,
+            {
+              priorities: canonicalizePriorities(daily.priorities),
+              dailyUpdatedAt: daily.updatedAt,
+            },
+          );
+        }
+        if (
+          JSON.stringify(canonicalizePriorities(restoredPriorities)) !==
+          JSON.stringify(canonicalizePriorities(preview.entry.afterPriorities))
+        ) {
+          return failPriorityResult(operation, "STALE_PREVIEW", "Backup contents changed since preview.", startedAt, {
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+        const nextDaily = { ...daily, priorities: restoredPriorities };
+        const result = await commitPriorityDaily(daily, nextDaily, operation, startedAt);
+        if (result.ok) recentPriorityId = result.priorities[0]?.id || recentPriorityId;
+        return result;
+      }
+      if (operation === "carry") {
+        const meta = preview.entry.meta || {};
+        const targetDate = meta.targetDate;
+        const carryItems = meta.carryItems || [];
+        if (!targetDate || !/^\d{4}-\d{2}-\d{2}$/.test(String(targetDate)) || targetDate === daily.date) {
+          return failPriorityResult(operation, "VALIDATION_FAILED", "Carry preview has an invalid target date.", startedAt, {
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+        await fsApi.mkdir(paths.future, { recursive: true });
+        const futurePath = path.join(paths.future, `daily-${targetDate}.json`);
+        let futureDaily = defaultDaily(targetDate);
+        if (await pathExists(futurePath)) {
+          futureDaily = await readJsonFile(futurePath, (raw) => normalizeDaily(raw, targetDate), () => defaultDaily(targetDate));
+        }
+        const seen = new Set((futureDaily.priorities || []).map((item) => item.id));
+        for (const item of carryItems) {
+          if (!seen.has(item.id)) {
+            futureDaily.priorities.push({ ...item, status: "open", updatedAt: isoNow() });
+            seen.add(item.id);
+          }
+        }
+        futureDaily.updatedAt = isoNow();
+        try {
+          await createBackupSnapshot(`priorities-carry-future-${targetDate}`);
+          await atomicWriteJson(futurePath, futureDaily);
+        } catch (error) {
+          return failPriorityResult(
+            operation,
+            "WRITE_FAILED",
+            error instanceof Error ? error.message : "Failed to write carry target.",
+            startedAt,
+          );
+        }
+        const nextDaily = { ...daily, priorities: clonePriorities(preview.entry.afterPriorities) };
+        const result = await commitPriorityDaily(daily, nextDaily, operation, startedAt);
+        if (result.ok) {
+          result.message = `Carried ${carryItems.length} open priorit${carryItems.length === 1 ? "y" : "ies"} to ${targetDate}.`;
+          result.confirmation = result.message;
+          result.targetDate = targetDate;
+        }
+        return result;
+      }
+
+      const nextDaily = { ...daily, priorities: clonePriorities(preview.entry.afterPriorities) };
+      const result = await commitPriorityDaily(daily, nextDaily, operation, startedAt);
+      if (result.ok && preview.entry.meta?.touchedId) recentPriorityId = preview.entry.meta.touchedId;
+      if (result.ok && preview.entry.meta?.removedId) {
+        recentPriorityId = result.priorities[0]?.id || null;
+      }
+      return result;
+    }
+
+    const planned = planPriorityMutation(args, daily, resolveOpts);
+    if (planned.error) {
+      return failPriorityResult(operation, planned.error.code, planned.error.message, startedAt, {
+        candidates: planned.error.candidates,
+        priorities: canonicalizePriorities(daily.priorities),
+        dailyUpdatedAt: daily.updatedAt,
+        artifact: formatPrioritiesArtifact(daily.priorities),
+      });
+    }
+
+    if (operation === "carry") {
+      // Non-confirm path should not write; confirmation branch handles it.
+      return failPriorityResult(operation, "CONFIRMATION_REQUIRED", "Confirmation required before carry.", startedAt);
+    }
+
+    const nextDaily = { ...daily, priorities: planned.nextPriorities };
+    const result = await commitPriorityDaily(daily, nextDaily, operation, startedAt);
+    if (result.ok) {
+      if (planned.meta?.touchedId) recentPriorityId = planned.meta.touchedId;
+      else if (operation === "add" || operation === "insert") {
+        recentPriorityId = result.priorities[result.priorities.length - 1]?.id || recentPriorityId;
+      }
+    }
+    return result;
+  }
+
   return {
     SCHEMA_VERSION,
     PERSONAL_CONTEXT_SOFT_CAP,
@@ -1062,6 +1846,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     memoryRemember,
     memoryCorrect,
     memoryUpdateDaily,
+    memoryPriorities,
     memorySetPreference,
     memorySetInstructions,
     memoryClear,
@@ -1079,6 +1864,14 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     atomicWriteJson,
     atomicWriteText,
     todayDate,
+    // test helpers
+    _test: {
+      getRecentPriorityId: () => recentPriorityId,
+      setRecentPriorityId: (id) => {
+        recentPriorityId = id;
+      },
+      clearPreviews: () => invalidatePreviews(),
+    },
   };
 }
 
@@ -1092,4 +1885,5 @@ module.exports = {
   formatDailyWorkingContext,
   planBroadPriorityAnswer,
   createMemoryStore,
+  priorityLifecycle: require("./priority-lifecycle.cjs"),
 };
