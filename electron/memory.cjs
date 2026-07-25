@@ -10,6 +10,142 @@ const DAILY_SECTION_CAP = 2_000;
 const PREFS_SECTION_CAP = 1_500;
 const ENTRIES_SECTION_CAP = 3_000;
 
+const PRIORITY_SELECTION_PRECEDENCE = [
+  "open daily priorities",
+  "open commitments explicitly due now",
+  "open follow-ups",
+  "open unresolved items",
+  "active projects",
+];
+
+const NO_OPEN_DAILY_PRIORITIES_LINE = "Open daily priorities: none.";
+const NO_OPEN_DAILY_PRIORITIES_REPLY = "You currently have no open daily priorities.";
+
+function isOpenWorkStatus(status) {
+  return status === "open" || status === "blocked";
+}
+
+function isCommitmentDueNow(item, today) {
+  const due = String(item?.due || "").trim();
+  if (!due) return false;
+  return due <= String(today || "");
+}
+
+function formatCommitmentLine(item) {
+  if (item.sensitivity === "secret") return `- [secret commitment stored] (${item.id})`;
+  if (item.sensitivity === "sensitive") return `- [sensitive commitment stored] (${item.id})`;
+  return `- ${item.text}${item.due ? ` (due ${item.due})` : ""}`;
+}
+
+/**
+ * Build the labeled daily working-context sections used by personal-context injection.
+ * Preserves stored list order within each category.
+ */
+function formatDailyWorkingContext(daily, today) {
+  const openPriorities = (daily.priorities || []).filter((item) => isOpenWorkStatus(item.status));
+  const openCommitments = (daily.commitments || []).filter((item) => isOpenWorkStatus(item.status));
+  const dueNowCommitments = openCommitments.filter((item) => isCommitmentDueNow(item, today));
+  const otherCommitments = openCommitments.filter((item) => !isCommitmentDueNow(item, today));
+  const openFollowUps = (daily.followUps || []).filter((item) => isOpenWorkStatus(item.status));
+  const openUnresolved = (daily.unresolved || []).filter((item) => isOpenWorkStatus(item.status));
+  const activeProjects = daily.activeProjects || [];
+
+  const lines = [
+    `Date: ${daily.date}`,
+    daily.summary ? `Summary: ${daily.summary}` : null,
+    "Priority selection order: open daily priorities, then commitments due now, then follow-ups, then unresolved items, then active projects.",
+    openPriorities.length
+      ? `Daily priorities:\n${openPriorities.map((item) => `- ${item.text}`).join("\n")}`
+      : NO_OPEN_DAILY_PRIORITIES_LINE,
+    dueNowCommitments.length
+      ? `Commitments due now:\n${dueNowCommitments.map((item) => formatCommitmentLine(item)).join("\n")}`
+      : null,
+    otherCommitments.length
+      ? `Commitments:\n${otherCommitments.map((item) => formatCommitmentLine(item)).join("\n")}`
+      : null,
+    openFollowUps.length ? `Follow-ups:\n${openFollowUps.map((item) => `- ${item.text}`).join("\n")}` : null,
+    openUnresolved.length
+      ? `Unresolved items:\n${openUnresolved.map((item) => `- ${item.text}`).join("\n")}`
+      : null,
+    activeProjects.length
+      ? `Active projects:\n${activeProjects.map((item) => `- ${item.name}${item.note ? `: ${item.note}` : ""}`).join("\n")}`
+      : null,
+  ];
+
+  return {
+    text: lines.filter(Boolean).join("\n"),
+    openPriorities,
+    dueNowCommitments,
+    openFollowUps,
+    openUnresolved,
+    activeProjects,
+  };
+}
+
+/**
+ * Deterministic precedence planner for broad priority questions (tests + docs alignment).
+ * Does not invent memory values; only selects among open categories.
+ */
+function planBroadPriorityAnswer(daily, today) {
+  const formatted = formatDailyWorkingContext(daily, today);
+  if (formatted.openPriorities.length > 0) {
+    return {
+      category: "daily_priorities",
+      items: formatted.openPriorities.map((item) => item.text),
+      leadText: formatted.openPriorities[0].text,
+      mustSayNoOpenDailyPriorities: false,
+      categoryLabel: null,
+    };
+  }
+  if (formatted.dueNowCommitments.length > 0) {
+    return {
+      category: "commitments_due_now",
+      items: formatted.dueNowCommitments.map((item) => item.text),
+      leadText: formatted.dueNowCommitments[0].text,
+      mustSayNoOpenDailyPriorities: true,
+      categoryLabel: "commitment due now",
+      optionalLead: `Your next open commitment due now is ${formatted.dueNowCommitments[0].text}`,
+    };
+  }
+  if (formatted.openFollowUps.length > 0) {
+    return {
+      category: "follow_ups",
+      items: formatted.openFollowUps.map((item) => item.text),
+      leadText: formatted.openFollowUps[0].text,
+      mustSayNoOpenDailyPriorities: true,
+      categoryLabel: "follow-up",
+      optionalLead: `Your next open follow-up is ${formatted.openFollowUps[0].text}`,
+    };
+  }
+  if (formatted.openUnresolved.length > 0) {
+    return {
+      category: "unresolved",
+      items: formatted.openUnresolved.map((item) => item.text),
+      leadText: formatted.openUnresolved[0].text,
+      mustSayNoOpenDailyPriorities: true,
+      categoryLabel: "unresolved item",
+      optionalLead: `Your next open unresolved item is ${formatted.openUnresolved[0].text}`,
+    };
+  }
+  if (formatted.activeProjects.length > 0) {
+    return {
+      category: "active_projects",
+      items: formatted.activeProjects.map((item) => item.name),
+      leadText: formatted.activeProjects[0].name,
+      mustSayNoOpenDailyPriorities: true,
+      categoryLabel: "active project",
+      optionalLead: `Your next active project is ${formatted.activeProjects[0].name}`,
+    };
+  }
+  return {
+    category: "none",
+    items: [],
+    leadText: null,
+    mustSayNoOpenDailyPriorities: true,
+    categoryLabel: null,
+  };
+}
+
 function createMemoryStore(options = {}) {
   const rootDir = options.rootDir || path.join(process.cwd(), "data", "memory");
   const fsApi = options.fs || fs;
@@ -829,39 +965,17 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       `Confirm before: ${preferences.prefs.confirmBefore.join(", ") || "none listed"}.`,
     ].join("\n");
 
-    const openCommitments = (daily.commitments || []).filter((item) => item.status === "open" || item.status === "blocked");
-    const openPriorities = (daily.priorities || []).filter((item) => item.status === "open" || item.status === "blocked");
-    const openFollowUps = (daily.followUps || []).filter((item) => item.status === "open" || item.status === "blocked");
-    const openUnresolved = (daily.unresolved || []).filter((item) => item.status === "open" || item.status === "blocked");
-
-    const dailyLines = [
-      `Date: ${daily.date}`,
-      daily.summary ? `Summary: ${daily.summary}` : null,
-      openPriorities.length ? `Priorities:\n${openPriorities.map((item) => `- ${item.text}`).join("\n")}` : null,
-      (daily.activeProjects || []).length
-        ? `Active projects:\n${daily.activeProjects.map((item) => `- ${item.name}${item.note ? `: ${item.note}` : ""}`).join("\n")}`
-        : null,
-      openCommitments.length
-        ? `Commitments:\n${openCommitments
-            .map((item) => {
-              if (item.sensitivity === "secret") return `- [secret commitment stored] (${item.id})`;
-              if (item.sensitivity === "sensitive") return `- [sensitive commitment stored] (${item.id})`;
-              return `- ${item.text}${item.due ? ` (due ${item.due})` : ""}`;
-            })
-            .join("\n")}`
-        : null,
-      openFollowUps.length ? `Follow-ups:\n${openFollowUps.map((item) => `- ${item.text}`).join("\n")}` : null,
-      openUnresolved.length ? `Unresolved:\n${openUnresolved.map((item) => `- ${item.text}`).join("\n")}` : null,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    const openCommitments = (daily.commitments || []).filter((item) => isOpenWorkStatus(item.status));
+    const openPriorities = (daily.priorities || []).filter((item) => isOpenWorkStatus(item.status));
+    const formattedDaily = formatDailyWorkingContext(daily, daily.date || todayDate());
+    const dailyLines = formattedDaily.text;
 
     let prefsBlock = trimToBudget(`# Personal Preferences And Hard Rules\n${hardRules}`, PREFS_SECTION_CAP);
     let instructionsBlock = trimToBudget(
       `# Personal Operating Instructions (excerpt)\n${instructions}`,
       INSTRUCTIONS_EXCERPT_CAP,
     );
-    let dailyBlock = trimToBudget(`# Today's Working Context\n${dailyLines || "No open daily items."}`, DAILY_SECTION_CAP);
+    let dailyBlock = trimToBudget(`# Today's Working Context\n${dailyLines}`, DAILY_SECTION_CAP);
 
     const entryLines = [];
     for (const entry of selectedEntries) {
@@ -895,16 +1009,19 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       truncated = true;
       entriesBlock = trimToBudget(entriesBlock, Math.max(400, Math.floor(ENTRIES_SECTION_CAP / 3)));
       instructionsBlock = trimToBudget(instructionsBlock, Math.max(500, Math.floor(INSTRUCTIONS_EXCERPT_CAP / 2)));
-      dailyBlock = trimToBudget(
-        `# Today's Working Context\nDate: ${daily.date}\nCommitments:\n${
+      const compactDaily = [
+        `Date: ${daily.date}`,
+        openPriorities.length
+          ? `Daily priorities:\n${openPriorities.map((item) => `- ${item.text}`).join("\n")}`
+          : NO_OPEN_DAILY_PRIORITIES_LINE,
+        `Commitments:\n${
           openCommitments
-            .map((item) => {
-              if (item.sensitivity === "secret") return `- [secret commitment stored] (${item.id})`;
-              if (item.sensitivity === "sensitive") return `- [sensitive commitment stored] (${item.id})`;
-              return `- ${item.text}`;
-            })
+            .map((item) => formatCommitmentLine(item))
             .join("\n") || "- none"
-        }\nPriorities:\n${openPriorities.map((item) => `- ${item.text}`).join("\n") || "- none"}`,
+        }`,
+      ].join("\n");
+      dailyBlock = trimToBudget(
+        `# Today's Working Context\n${compactDaily}`,
         Math.max(600, Math.floor(DAILY_SECTION_CAP / 2)),
       );
       marker =
@@ -969,5 +1086,10 @@ module.exports = {
   SCHEMA_VERSION,
   PERSONAL_CONTEXT_SOFT_CAP,
   MAX_BACKUPS,
+  PRIORITY_SELECTION_PRECEDENCE,
+  NO_OPEN_DAILY_PRIORITIES_LINE,
+  NO_OPEN_DAILY_PRIORITIES_REPLY,
+  formatDailyWorkingContext,
+  planBroadPriorityAnswer,
   createMemoryStore,
 };

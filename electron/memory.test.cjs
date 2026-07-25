@@ -3,7 +3,13 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { createMemoryStore, PERSONAL_CONTEXT_SOFT_CAP, SCHEMA_VERSION } = require("./memory.cjs");
+const {
+  createMemoryStore,
+  PERSONAL_CONTEXT_SOFT_CAP,
+  SCHEMA_VERSION,
+  planBroadPriorityAnswer,
+  NO_OPEN_DAILY_PRIORITIES_REPLY,
+} = require("./memory.cjs");
 
 async function withStore(run, options = {}) {
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "rj-memory-"));
@@ -305,5 +311,92 @@ test("memory module never invokes desktop automation code", async () => {
     assert.equal(source.includes("SendInput"), false);
     assert.equal(source.includes("desktopCapturer"), false);
     assert.equal(source.includes("windows-ui.ps1"), false);
+  });
+});
+
+test("one open daily priority outranks every open follow-up and unresolved item", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await store.memoryUpdateDaily({
+      priorities: [{ text: "Ship priority-selection fix", status: "open" }],
+      followUps: [{ text: "Review seeded memory through memory_view", status: "open" }],
+      unresolved: [{ text: "Which systems to integrate first", status: "open" }],
+      activeProjects: [{ name: "Jarvis personal desktop assistant" }],
+    });
+    const data = await store.loadAll();
+    const block = store.buildPersonalContextBlock(data);
+    const planned = planBroadPriorityAnswer(data.daily, data.daily.date);
+    assert.equal(planned.category, "daily_priorities");
+    assert.equal(planned.leadText, "Ship priority-selection fix");
+    assert.equal(planned.mustSayNoOpenDailyPriorities, false);
+    assert.match(block.text, /Daily priorities:\n- Ship priority-selection fix/);
+    assert.match(block.text, /Follow-ups:\n- Review seeded memory through memory_view/);
+    assert.ok(block.text.indexOf("Daily priorities:") < block.text.indexOf("Follow-ups:"));
+    assert.ok(block.text.indexOf("Daily priorities:") < block.text.indexOf("Unresolved items:"));
+  });
+});
+
+test("multiple open daily priorities preserve their stored order", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await store.memoryUpdateDaily({
+      priorities: [
+        { text: "First stored priority", status: "open" },
+        { text: "Second stored priority", status: "open" },
+        { text: "Third stored priority", status: "open" },
+      ],
+    });
+    const data = await store.loadAll();
+    const planned = planBroadPriorityAnswer(data.daily, data.daily.date);
+    assert.deepEqual(planned.items, [
+      "First stored priority",
+      "Second stored priority",
+      "Third stored priority",
+    ]);
+    const block = store.buildPersonalContextBlock(data);
+    const section = block.text.slice(block.text.indexOf("Daily priorities:"));
+    assert.ok(section.indexOf("First stored priority") < section.indexOf("Second stored priority"));
+    assert.ok(section.indexOf("Second stored priority") < section.indexOf("Third stored priority"));
+  });
+});
+
+test("all daily priorities done produces no-open-daily-priorities context and reply guidance", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await store.memoryUpdateDaily({
+      priorities: [
+        { text: "Realtime diagnostics", status: "done" },
+        { text: "Validate routine daily use", status: "done" },
+        { text: "Remove remaining Ricky branding", status: "done" },
+      ],
+      followUps: [{ text: "Review the complete seeded memory through memory_view", status: "open" }],
+    });
+    const data = await store.loadAll();
+    const block = store.buildPersonalContextBlock(data);
+    const planned = planBroadPriorityAnswer(data.daily, data.daily.date);
+    assert.match(block.text, /Open daily priorities: none\./);
+    assert.doesNotMatch(block.text, /Daily priorities:\n- Realtime diagnostics/);
+    assert.equal(planned.mustSayNoOpenDailyPriorities, true);
+    assert.equal(planned.category, "follow_ups");
+    assert.equal(NO_OPEN_DAILY_PRIORITIES_REPLY, "You currently have no open daily priorities.");
+  });
+});
+
+test("optional follow-up is labeled as a follow-up and never as the first daily priority", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await store.memoryUpdateDaily({
+      priorities: [{ text: "Already done priority", status: "done" }],
+      followUps: [{ text: "Review the complete seeded memory through memory_view", status: "open" }],
+    });
+    const data = await store.loadAll();
+    const planned = planBroadPriorityAnswer(data.daily, data.daily.date);
+    assert.equal(planned.categoryLabel, "follow-up");
+    assert.match(planned.optionalLead, /^Your next open follow-up is /);
+    assert.doesNotMatch(planned.optionalLead, /daily priority/i);
+    assert.notEqual(planned.category, "daily_priorities");
+    const block = store.buildPersonalContextBlock(data);
+    assert.match(block.text, /Follow-ups:\n- Review the complete seeded memory through memory_view/);
+    assert.match(block.text, /Open daily priorities: none\./);
   });
 });
