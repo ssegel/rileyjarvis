@@ -880,7 +880,12 @@ test("text and voice share identical memory_priorities tool schema and handler",
     assert.match(schemaBlock, new RegExp(`${field}:`));
   }
   assert.match(schemaBlock, /Reorder example|by":"text","value":"call Cecilia"/);
-  assert.match(main, /Do not retry the identical tool call with identical arguments/);
+  assert.match(schemaBlock, /complete targets an open priority/);
+  assert.match(schemaBlock, /reopen targets a completed priority/);
+  assert.match(schemaBlock, /enum:\s*\["open",\s*"done",\s*"all"\]/);
+  assert.match(main, /Do not retry identical or near-identical/);
+  assert.match(main, /complete targets an open priority \(status open, blocked, or active\)/);
+  assert.match(main, /reopen targets a completed priority \(status done\)/);
 });
 
 test("artifact contains canonical resulting list and confirmation is set", async () => {
@@ -965,5 +970,205 @@ test("restore validates backup and binds confirm to previewed backup file", asyn
     });
     assert.equal(confirmed.ok, true);
     assert.deepEqual(texts(confirmed), ["Snapshot me"]);
+  });
+});
+
+test("reopen resolves done scanner priority by distinctive phrase", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "call Cecilia", status: "open" },
+      { text: "review the scanner purchase", status: "done" },
+      { text: "finish the website homepage", status: "open" },
+    ]);
+    const before = await store.loadAll();
+    const scannerId = before.daily.priorities[1].id;
+    const reopened = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { by: "text", value: "scanner" },
+    });
+    assert.equal(reopened.ok, true);
+    assert.equal(reopened.priorities[1].status, "open");
+    assert.equal(reopened.priorities[1].id, scannerId);
+    assert.equal(reopened.priorities[1].text, "review the scanner purchase");
+    assert.deepEqual(texts(reopened), [
+      "call Cecilia",
+      "review the scanner purchase",
+      "finish the website homepage",
+    ]);
+    assert.deepEqual(statuses(reopened), ["open", "open", "open"]);
+  });
+});
+
+test("reopen by exact wording and canonical ID preserve array position", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "alpha open", status: "open" },
+      { text: "beta done exact", status: "done" },
+      { text: "gamma open", status: "open" },
+    ]);
+    const before = await store.loadAll();
+    const id = before.daily.priorities[1].id;
+
+    const byExact = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { by: "text", value: "beta done exact" },
+    });
+    assert.equal(byExact.ok, true);
+    assert.equal(byExact.priorities[1].status, "open");
+    assert.equal(byExact.priorities[1].id, id);
+    assert.equal(byExact.priorities[1].text, "beta done exact");
+
+    await store.memoryPriorities({
+      operation: "complete",
+      reference: { by: "id", value: id },
+    });
+    const byId = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { by: "id", value: id },
+    });
+    assert.equal(byId.ok, true);
+    assert.equal(byId.priorities[1].id, id);
+    assert.equal(byId.priorities[1].status, "open");
+    assert.deepEqual(texts(byId), ["alpha open", "beta done exact", "gamma open"]);
+  });
+});
+
+test("reopen ordinal resolves against completed priorities in stored order", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "open first", status: "open" },
+      { text: "done first", status: "done" },
+      { text: "open second", status: "open" },
+      { text: "done second", status: "done" },
+    ]);
+    const before = await store.loadAll();
+    const firstDoneId = before.daily.priorities[1].id;
+    const secondDoneId = before.daily.priorities[3].id;
+
+    const first = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { by: "ordinal", value: 1 },
+    });
+    assert.equal(first.ok, true);
+    assert.equal(first.priorities[1].id, firstDoneId);
+    assert.equal(first.priorities[1].status, "open");
+    assert.equal(first.priorities[3].status, "done");
+
+    const second = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { by: "ordinal", value: 1 },
+    });
+    assert.equal(second.ok, true);
+    assert.equal(second.priorities[3].id, secondDoneId);
+    assert.equal(second.priorities[3].status, "open");
+  });
+});
+
+test("complete prefers open items and ignores done duplicates", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "review the scanner purchase", status: "done" },
+      { text: "call scanner vendor", status: "open" },
+      { text: "finish homepage", status: "open" },
+    ]);
+    const before = await store.loadAll();
+    const openId = before.daily.priorities[1].id;
+    const doneId = before.daily.priorities[0].id;
+
+    const completed = await store.memoryPriorities({
+      operation: "complete",
+      reference: { by: "text", value: "scanner" },
+    });
+    assert.equal(completed.ok, true);
+    assert.equal(completed.priorities[1].id, openId);
+    assert.equal(completed.priorities[1].status, "done");
+    assert.equal(completed.priorities[0].id, doneId);
+    assert.equal(completed.priorities[0].status, "done");
+    assert.equal(completed.priorities[0].text, "review the scanner purchase");
+  });
+});
+
+test("reopen missing completed target returns NOT_FOUND without write", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "call Cecilia", status: "open" },
+      { text: "finish homepage", status: "open" },
+    ]);
+    const before = await store.loadAll();
+    const missing = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { by: "text", value: "scanner" },
+    });
+    assert.equal(missing.ok, false);
+    assert.equal(missing.code, "NOT_FOUND");
+    const after = await store.loadAll();
+    assert.deepEqual(after.daily.priorities, before.daily.priorities);
+  });
+});
+
+test("ambiguous completed phrase returns AMBIGUOUS_MATCH without write", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "review the scanner purchase", status: "done" },
+      { text: "call scanner vendor", status: "done" },
+      { text: "open other", status: "open" },
+    ]);
+    const before = await store.loadAll();
+    const ambiguous = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { by: "text", value: "scanner" },
+    });
+    assert.equal(ambiguous.ok, false);
+    assert.equal(ambiguous.code, "AMBIGUOUS_MATCH");
+    assert.ok(Array.isArray(ambiguous.candidates));
+    assert.equal(ambiguous.candidates.length, 2);
+    const after = await store.loadAll();
+    assert.deepEqual(after.daily.priorities, before.daily.priorities);
+  });
+});
+
+test("identical and near-identical NOT_FOUND reopen retries are suppressed", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "call Cecilia", status: "open" },
+      { text: "finish homepage", status: "open" },
+    ]);
+
+    const first = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { by: "text", value: "scanner" },
+    });
+    assert.equal(first.code, "NOT_FOUND");
+    assert.equal(first.suppressedRetry, undefined);
+
+    const identical = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { by: "text", value: "scanner" },
+    });
+    assert.equal(identical.code, "NOT_FOUND");
+    assert.equal(identical.suppressedRetry, true);
+    assert.match(identical.message, /do not retry/i);
+
+    // Near-identical: different reference shape, same normalized text.
+    const near = await store.memoryPriorities({
+      operation: "reopen",
+      reference: { text: "scanner" },
+    });
+    assert.equal(near.code, "NOT_FOUND");
+    assert.equal(near.suppressedRetry, true);
+
+    const viaItem = await store.memoryPriorities({
+      operation: "reopen",
+      item: { text: "scanner" },
+    });
+    assert.equal(viaItem.code, "NOT_FOUND");
+    assert.equal(viaItem.suppressedRetry, true);
   });
 });

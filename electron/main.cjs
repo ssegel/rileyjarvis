@@ -31,10 +31,11 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 - Never ask Sarah for internal priority IDs. Resolve by ordinal, exact wording, distinctive phrase, or the recently changed item.
 - Never use memory_update_daily.priorities for add, edit, complete, reopen, remove, reorder, replace, clear, carry, or restore.
 - On AMBIGUOUS_MATCH, ask one concise clarification and do not write.
+- complete targets an open priority (status open, blocked, or active). reopen targets a completed priority (status done).
 - For add, insert, edit, complete, reopen, and simple reorder: call memory_priorities once and execute immediately. Do not preview these operations and do not ask Sarah to confirm them.
 - For insert: call memory_priorities in one tool call with operation "insert", the item text, and the exact 1-based atPosition. Priority N means atPosition N (array index N-1). Never ask Sarah to confirm an ordinary insertion.
 - For reorder (move one item): call once with operation "reorder", a text reference, and the 1-based atPosition. Example: move call Cecilia to priority one → {"operation":"reorder","reference":{"by":"text","value":"call Cecilia"},"atPosition":1}. Equivalent reference shapes such as {"text":"call Cecilia"} or item {"text":"call Cecilia"} are also accepted.
-- On NOT_FOUND, report the failure once or ask one concise clarification. Do not retry the identical tool call with identical arguments in the same turn.
+- On NOT_FOUND, report the failure once or ask one concise clarification. Do not retry identical or near-identical tool calls (same operation, same normalized reference, same destination/material arguments, same error) in the same turn.
 - For remove, replace, clear completed, carry, and restore backup only: present the preview, wait for explicit confirmation, then call again with confirmed=true and the matching previewToken.
 - After every successful priority write, briefly confirm and report the resulting ordered list.
 - Require confirmed=true before memory_clear and before full replacement of instructions.
@@ -304,7 +305,7 @@ const toolSpecs = [
     type: "function",
     name: "memory_priorities",
     description:
-      "Manage today's daily priorities with deterministic reference resolution. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, carry, restore_backup, preview. Execute add/insert/edit/complete/reopen/reorder directly in one call (insert requires exact 1-based atPosition). Reorder example: {\"operation\":\"reorder\",\"reference\":{\"by\":\"text\",\"value\":\"call Cecilia\"},\"atPosition\":1}. Only remove/replace/clear_completed/carry/restore_backup require preview then confirmed=true with previewToken. On NOT_FOUND, do not retry identical arguments. Never ask the user for UUIDs.",
+      "Manage today's daily priorities with deterministic reference resolution. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, carry, restore_backup, preview. complete targets an open priority; reopen targets a completed priority. Execute add/insert/edit/complete/reopen/reorder directly in one call (insert requires exact 1-based atPosition). Reorder example: {\"operation\":\"reorder\",\"reference\":{\"by\":\"text\",\"value\":\"call Cecilia\"},\"atPosition\":1}. Only remove/replace/clear_completed/carry/restore_backup require preview then confirmed=true with previewToken. On NOT_FOUND, do not retry identical or near-identical arguments. Never ask the user for UUIDs.",
     parameters: {
       type: "object",
       properties: {
@@ -346,7 +347,7 @@ const toolSpecs = [
         backupId: { type: "string" },
         previewToken: { type: "string" },
         previewOperation: { type: "string" },
-        listScope: { type: "string", enum: ["open", "all"] },
+        listScope: { type: "string", enum: ["open", "done", "all"] },
         allowDuplicates: { type: "boolean" },
         move: { type: "boolean" },
       },
@@ -1192,6 +1193,7 @@ Here is what you can ask me to do.
 - View durable instructions, preferences, profile facts, daily context, and memory entries.
 - Remember facts, correct stored items, and update today's projects, commitments, and follow-ups.
 - Manage daily priorities with natural language: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry to another day, and restore a backup.
+- complete targets an open priority; reopen targets a completed priority.
 - Ordinary add, insert, edit, complete, reopen, and reorder run immediately without confirmation.
 - Removing, replacing, clearing completed priorities, carrying across dates, or restoring a backup requires an explicit confirmation after preview.
 - Clearing memory or fully replacing instructions requires explicit confirmation.

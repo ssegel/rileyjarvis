@@ -8,6 +8,8 @@ const {
   formatPrioritiesArtifact,
   clonePriorities,
   resolvePriorityReference,
+  normalizePriorityReference,
+  resolveListScope,
   validatePrioritiesArray,
   validateDailyShape,
   assertUnchangedFields,
@@ -191,23 +193,28 @@ function createMemoryStore(options = {}) {
     return now().toISOString();
   }
 
-  function fingerprintNotFoundArgs(args = {}) {
+  function fingerprintFailedArgs(args = {}, code = "NOT_FOUND") {
+    const operation = String(args.operation || "").trim().toLowerCase();
+    const rawRef = args.reference != null ? args.reference : args.item;
+    const normalizedRef = normalizePriorityReference(rawRef);
     return JSON.stringify({
-      operation: String(args.operation || "").trim().toLowerCase(),
-      reference: args.reference ?? null,
-      item: args.item ?? null,
+      operation,
+      reference: normalizedRef,
       atPosition: args.atPosition ?? null,
       order: args.order ?? null,
-      listScope: args.listScope ?? null,
+      listScope: resolveListScope(operation, args),
+      code: String(code || "NOT_FOUND"),
     });
   }
 
-  function applyNotFoundRetryPolicy(args, result) {
-    if (!result || result.code !== "NOT_FOUND") return result;
-    const fp = fingerprintNotFoundArgs(args);
+  function applyFailedRetryPolicy(args, result) {
+    if (!result || (result.code !== "NOT_FOUND" && result.code !== "AMBIGUOUS_MATCH")) return result;
+    const fp = fingerprintFailedArgs(args, result.code);
     if (notFoundFingerprints.has(fp)) {
       const message =
-        "No matching priority was found. This identical request already failed; do not retry it with the same arguments. Report once or ask one concise clarification.";
+        result.code === "AMBIGUOUS_MATCH"
+          ? "Multiple priorities matched. This identical request already failed; do not retry it with the same arguments. Ask one concise clarification."
+          : "No matching priority was found. This identical request already failed; do not retry it with the same arguments. Report once or ask one concise clarification.";
       return {
         ...result,
         suppressedRetry: true,
@@ -1351,7 +1358,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
 
     return enqueue(async () => {
       const result = await runMemoryPrioritiesOperation(args, operation, startedAt);
-      return applyNotFoundRetryPolicy(args, result);
+      return applyFailedRetryPolicy(args, result);
     });
   }
 
@@ -1360,7 +1367,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       await rolloverDailyIfNeeded();
       const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
       const beforePriorities = clonePriorities(daily.priorities);
-      const listScope = args.listScope === "all" ? "all" : "open";
+      const listScope = resolveListScope(operation, args);
 
       if (args.expectedUpdatedAt && args.expectedUpdatedAt !== daily.updatedAt) {
         return failPriorityResult(operation, "STALE_WRITE", "Daily context changed since the last read.", startedAt, {

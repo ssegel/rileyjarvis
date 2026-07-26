@@ -13,7 +13,11 @@ const DESTRUCTIVE_OPERATIONS = new Set([
 ]);
 
 function isOpenPriorityStatus(status) {
-  return status === "open" || status === "blocked";
+  return status === "open" || status === "blocked" || status === "active";
+}
+
+function isDonePriorityStatus(status) {
+  return status === "done";
 }
 
 function looksLikeUuid(value) {
@@ -51,9 +55,28 @@ function clonePriorities(list) {
 function scopedPool(priorities, listScope = "open") {
   const all = Array.isArray(priorities) ? priorities : [];
   if (listScope === "all") return all.map((item, index) => ({ item, fullIndex: index }));
+  if (listScope === "done") {
+    return all
+      .map((item, index) => ({ item, fullIndex: index }))
+      .filter(({ item }) => isDonePriorityStatus(item.status));
+  }
   return all
     .map((item, index) => ({ item, fullIndex: index }))
     .filter(({ item }) => isOpenPriorityStatus(item.status));
+}
+
+/**
+ * Default listScope for single-target resolution when the caller omits listScope.
+ * reopen → completed priorities; complete/edit/remove/etc → open-like priorities.
+ */
+function defaultListScopeForOperation(operation) {
+  return String(operation || "").trim().toLowerCase() === "reopen" ? "done" : "open";
+}
+
+function resolveListScope(operation, args = {}) {
+  const requested = args.listScope;
+  if (requested === "all" || requested === "done" || requested === "open") return requested;
+  return defaultListScopeForOperation(operation);
 }
 
 function candidatePayload(item, fullIndex) {
@@ -128,7 +151,10 @@ function normalizePriorityReference(reference) {
  * reference: { by?: "id"|"ordinal"|"text"|"phrase"|"recent", value?: string|number, query?: string, text?: string }
  */
 function resolvePriorityReference(priorities, reference, options = {}) {
-  const listScope = options.listScope === "all" ? "all" : "open";
+  const listScope =
+    options.listScope === "all" || options.listScope === "done" || options.listScope === "open"
+      ? options.listScope
+      : "open";
   const recentId = options.recentId || null;
   const pool = scopedPool(priorities, listScope);
 
@@ -283,6 +309,9 @@ module.exports = {
   canonicalizePriorities,
   formatPrioritiesArtifact,
   clonePriorities,
+  scopedPool,
+  defaultListScopeForOperation,
+  resolveListScope,
   normalizePriorityReference,
   resolvePriorityReference,
   validatePrioritiesArray,
@@ -293,6 +322,7 @@ module.exports = {
   createPreviewToken,
   addDaysToDate,
   isOpenPriorityStatus,
+  isDonePriorityStatus,
   logPrioritiesEvent,
   looksLikeUuid,
 };
