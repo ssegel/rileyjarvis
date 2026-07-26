@@ -1208,7 +1208,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   }) {
     const selectedLines = selected.map((item) => `- ${item.text}`).join("\n");
     return {
-      title: "Daily Priorities",
+      title: `Carry preview (${mode})`,
       kind: "markdown",
       content: [
         `# Carry preview (${mode})`,

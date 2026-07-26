@@ -882,13 +882,15 @@ test("text and voice share identical memory_priorities tool schema and handler",
   assert.match(schemaBlock, /Reorder example|by":"text","value":"call Cecilia"/);
   assert.match(schemaBlock, /complete targets an open priority/);
   assert.match(schemaBlock, /reopen targets a completed priority/);
-  assert.match(schemaBlock, /carry\/copy into another date defaults to copy/);
+  assert.match(schemaBlock, /Carry Call Cecilia into tomorrow/);
+  assert.match(schemaBlock, /\\"move\\":false/);
+  assert.match(schemaBlock, /\\"move\\":true/);
   assert.match(schemaBlock, /enum:\s*\["open",\s*"done",\s*"all"\]/);
   assert.match(main, /Do not retry identical or near-identical/);
   assert.match(main, /complete targets an open priority \(status open, blocked, or active\)/);
   assert.match(main, /reopen targets a completed priority \(status done\)/);
-  assert.match(main, /"carry" \/ "carry forward" \/ "copy" defaults to copy/);
-  assert.match(main, /Never call a copy operation a move/);
+  assert.match(main, /"carry", "carry forward", "carry into tomorrow", or "copy" means COPY/);
+  assert.match(main, /Never send move:true when Sarah only says carry/);
 });
 
 test("artifact contains canonical resulting list and confirmation is set", async () => {
