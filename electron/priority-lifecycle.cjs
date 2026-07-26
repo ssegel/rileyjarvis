@@ -36,15 +36,16 @@ function canonicalizePriorities(list) {
   }));
 }
 
-function formatPrioritiesArtifact(priorities) {
+function formatPrioritiesArtifact(priorities, options = {}) {
+  const label = options.label ? String(options.label) : "Daily Priorities";
   const rows = canonicalizePriorities(priorities);
   const body = rows.length
     ? rows.map((row) => `${row.order}. ${row.text} — ${row.status}`).join("\n")
     : "No priorities stored.";
   return {
-    title: "Daily Priorities",
+    title: label,
     kind: "markdown",
-    content: `# Daily Priorities\n\n${body}`,
+    content: `# ${label}\n\n${body}`,
   };
 }
 

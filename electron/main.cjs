@@ -43,6 +43,7 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
   - Example COPY — User: "Carry Call Cecilia into tomorrow." → {"operation":"carry","reference":{"by":"text","value":"Call Cecilia"},"targetDate":"tomorrow","move":false}
   - Example MOVE — User: "Move Call Cecilia to tomorrow." → {"operation":"carry","reference":{"by":"text","value":"Call Cecilia"},"targetDate":"tomorrow","move":true}
   - Present the preview wording exactly (copy keeps today unchanged; move removes from today), then confirm with the matching previewToken. Never call a copy operation a move.
+- To show tomorrow's (or another date's) daily priorities, call memory_priorities list with targetDate "tomorrow" or YYYY-MM-DD. Example: {"operation":"list","targetDate":"tomorrow"}. Never answer a tomorrow/future list request from today's priorities or from injected today context.
 - For remove, replace, clear completed, carry, and restore backup only: present the preview, wait for explicit confirmation, then call again with confirmed=true and the matching previewToken.
 - After every successful priority write, briefly confirm and report the resulting ordered list.
 - Require confirmed=true before memory_clear and before full replacement of instructions.
@@ -312,7 +313,7 @@ const toolSpecs = [
     type: "function",
     name: "memory_priorities",
     description:
-      "Manage today's daily priorities with deterministic reference resolution. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, carry, restore_backup, preview. complete targets an open priority; reopen targets a completed priority. Carry language: \"carry\"/\"carry forward\"/\"carry into tomorrow\"/\"copy\" = COPY (omit move or move:false; never move:true for carry-only wording). Only explicit \"move\"/\"transfer\"/\"remove from today and put tomorrow\" = move:true. COPY example: User \"Carry Call Cecilia into tomorrow.\" → {\"operation\":\"carry\",\"reference\":{\"by\":\"text\",\"value\":\"Call Cecilia\"},\"targetDate\":\"tomorrow\",\"move\":false}. MOVE example: User \"Move Call Cecilia to tomorrow.\" → {\"operation\":\"carry\",\"reference\":{\"by\":\"text\",\"value\":\"Call Cecilia\"},\"targetDate\":\"tomorrow\",\"move\":true}. Execute add/insert/edit/complete/reopen/reorder directly in one call (insert requires exact 1-based atPosition). Reorder example: {\"operation\":\"reorder\",\"reference\":{\"by\":\"text\",\"value\":\"call Cecilia\"},\"atPosition\":1}. Only remove/replace/clear_completed/carry/restore_backup require preview then confirmed=true with previewToken. On NOT_FOUND, do not retry identical or near-identical arguments. Never ask the user for UUIDs.",
+      "Manage today's daily priorities with deterministic reference resolution. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, carry, restore_backup, preview. complete targets an open priority; reopen targets a completed priority. Carry language: \"carry\"/\"carry forward\"/\"carry into tomorrow\"/\"copy\" = COPY (omit move or move:false; never move:true for carry-only wording). Only explicit \"move\"/\"transfer\"/\"remove from today and put tomorrow\" = move:true. COPY example: User \"Carry Call Cecilia into tomorrow.\" → {\"operation\":\"carry\",\"reference\":{\"by\":\"text\",\"value\":\"Call Cecilia\"},\"targetDate\":\"tomorrow\",\"move\":false}. MOVE example: User \"Move Call Cecilia to tomorrow.\" → {\"operation\":\"carry\",\"reference\":{\"by\":\"text\",\"value\":\"Call Cecilia\"},\"targetDate\":\"tomorrow\",\"move\":true}. List tomorrow with {\"operation\":\"list\",\"targetDate\":\"tomorrow\"} — never answer tomorrow from today's list. Execute add/insert/edit/complete/reopen/reorder directly in one call (insert requires exact 1-based atPosition). Reorder example: {\"operation\":\"reorder\",\"reference\":{\"by\":\"text\",\"value\":\"call Cecilia\"},\"atPosition\":1}. Only remove/replace/clear_completed/carry/restore_backup require preview then confirmed=true with previewToken. On NOT_FOUND, do not retry identical or near-identical arguments. Never ask the user for UUIDs.",
     parameters: {
       type: "object",
       properties: {
@@ -350,7 +351,11 @@ const toolSpecs = [
             anyOf: [{ type: "string" }, { type: "object", additionalProperties: true }],
           },
         },
-        targetDate: { type: "string" },
+        targetDate: {
+          type: "string",
+          description:
+            'For carry and list. "tomorrow" or YYYY-MM-DD. On list, reads that date\'s future file (not today). Omit on list to show today.',
+        },
         backupId: { type: "string" },
         previewToken: { type: "string" },
         previewOperation: { type: "string" },
@@ -1206,6 +1211,7 @@ Here is what you can ask me to do.
 - Manage daily priorities with natural language: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry to another day, and restore a backup.
 - complete targets an open priority; reopen targets a completed priority.
 - Carry/carry forward/copy into tomorrow keeps today's item (move:false). Only explicit move/transfer removes it from today (move:true).
+- Show tomorrow's priorities with list targetDate tomorrow — do not reuse today's list.
 - Ordinary add, insert, edit, complete, reopen, and reorder run immediately without confirmation.
 - Removing, replacing, clearing completed priorities, carrying across dates, or restoring a backup requires an explicit confirmation after preview.
 - Clearing memory or fully replacing instructions requires explicit confirmation.

@@ -891,6 +891,9 @@ test("text and voice share identical memory_priorities tool schema and handler",
   assert.match(main, /reopen targets a completed priority \(status done\)/);
   assert.match(main, /"carry", "carry forward", "carry into tomorrow", or "copy" means COPY/);
   assert.match(main, /Never send move:true when Sarah only says carry/);
+  assert.match(schemaBlock, /List tomorrow with/);
+  assert.match(main, /To show tomorrow's \(or another date's\) daily priorities/);
+  assert.match(main, /\{"operation":"list","targetDate":"tomorrow"\}/);
 });
 
 test("artifact contains canonical resulting list and confirmation is set", async () => {
@@ -1232,6 +1235,66 @@ test("omitted move defaults to copy and preserves today", async () => {
     assert.equal(after.daily.commitments[0].text, "Keep commitment");
     const future = JSON.parse(await fsp.readFile(path.join(store.paths.future, "daily-2026-07-23.json"), "utf8"));
     assert.equal(future.priorities.some((item) => item.text === "Call Cecilia" && item.id === ceciliaId), true);
+    assert.equal(future.priorities.length, 1);
+
+    const todayList = await store.memoryPriorities({ operation: "list" });
+    assert.deepEqual(texts(todayList), ["Finish website homepage", "Call Cecilia"]);
+    const tomorrowList = await store.memoryPriorities({ operation: "list", targetDate: "tomorrow" });
+    assert.equal(tomorrowList.ok, true);
+    assert.equal(tomorrowList.targetDate, "2026-07-23");
+    assert.deepEqual(texts(tomorrowList), ["Call Cecilia"]);
+    assert.equal(tomorrowList.priorities.length, 1);
+    assert.match(tomorrowList.artifact.title, /tomorrow/i);
+    assert.match(tomorrowList.message, /Tomorrow/i);
+  });
+});
+
+test("list tomorrow reads future file only; preview does not write", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "Finish website homepage", status: "open" },
+      { text: "Call Cecilia", status: "open" },
+      { text: "Review scanner options", status: "open" },
+    ]);
+
+    const emptyTomorrow = await store.memoryPriorities({ operation: "list", targetDate: "tomorrow" });
+    assert.equal(emptyTomorrow.ok, true);
+    assert.deepEqual(texts(emptyTomorrow), []);
+    assert.equal(await fsp.access(path.join(store.paths.future, "daily-2026-07-23.json")).then(() => true).catch(() => false), false);
+
+    const preview = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      move: false,
+    });
+    assert.equal(preview.code, "CONFIRMATION_REQUIRED");
+    assert.deepEqual(
+      preview.tomorrowAfter.map((item) => item.text),
+      ["Call Cecilia"],
+    );
+    assert.equal(await fsp.access(path.join(store.paths.future, "daily-2026-07-23.json")).then(() => true).catch(() => false), false);
+
+    await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      move: false,
+      confirmed: true,
+      previewToken: preview.previewToken,
+    });
+
+    const todayList = await store.memoryPriorities({ operation: "list" });
+    assert.deepEqual(texts(todayList), [
+      "Finish website homepage",
+      "Call Cecilia",
+      "Review scanner options",
+    ]);
+    const tomorrowList = await store.memoryPriorities({ operation: "list", targetDate: "tomorrow" });
+    assert.deepEqual(texts(tomorrowList), ["Call Cecilia"]);
+    assert.equal(tomorrowList.priorities.length, 1);
+    assert.notDeepEqual(texts(tomorrowList), texts(todayList));
   });
 });
 

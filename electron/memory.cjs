@@ -1478,20 +1478,50 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       const resolveOpts = { listScope, recentId: recentPriorityId };
 
       if (operation === "list") {
+        const requestedDate =
+          args.targetDate != null && args.targetDate !== ""
+            ? resolveCarryTargetDateArg(args.targetDate, daily.date)
+            : daily.date;
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(String(requestedDate))) {
+          return failPriorityResult(operation, "VALIDATION_FAILED", "list targetDate must be YYYY-MM-DD or tomorrow.", startedAt, {
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+
+        let listedPriorities = daily.priorities;
+        let listedUpdatedAt = daily.updatedAt;
+        let listLabel = "Daily Priorities";
+        let message = "Current daily priorities.";
+        let confirmation = "Listed current daily priorities.";
+
+        if (requestedDate !== daily.date) {
+          const futureDaily = await readFutureDaily(requestedDate);
+          listedPriorities = futureDaily.priorities || [];
+          listedUpdatedAt = futureDaily.updatedAt || null;
+          const isTomorrow = requestedDate === addDaysToDate(daily.date, 1);
+          listLabel = isTomorrow ? `Daily Priorities (tomorrow ${requestedDate})` : `Daily Priorities (${requestedDate})`;
+          message = isTomorrow
+            ? `Tomorrow's daily priorities (${requestedDate}).`
+            : `Daily priorities for ${requestedDate}.`;
+          confirmation = message;
+        }
+
         logPrioritiesEvent({
           operation,
           ok: true,
-          itemCount: daily.priorities.length,
+          itemCount: listedPriorities.length,
           durationMs: Date.now() - startedAt,
         });
         return {
           ok: true,
           operation,
-          message: "Current daily priorities.",
-          priorities: canonicalizePriorities(daily.priorities),
-          dailyUpdatedAt: daily.updatedAt,
-          artifact: formatPrioritiesArtifact(daily.priorities),
-          confirmation: "Listed current daily priorities.",
+          message,
+          targetDate: requestedDate,
+          priorities: canonicalizePriorities(listedPriorities),
+          dailyUpdatedAt: listedUpdatedAt,
+          artifact: formatPrioritiesArtifact(listedPriorities, { label: listLabel }),
+          confirmation,
         };
       }
 
