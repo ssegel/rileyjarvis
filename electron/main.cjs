@@ -33,6 +33,8 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 - On AMBIGUOUS_MATCH, ask one concise clarification and do not write.
 - For add, insert, edit, complete, reopen, and simple reorder: call memory_priorities once and execute immediately. Do not preview these operations and do not ask Sarah to confirm them.
 - For insert: call memory_priorities in one tool call with operation "insert", the item text, and the exact 1-based atPosition. Priority N means atPosition N (array index N-1). Never ask Sarah to confirm an ordinary insertion.
+- For reorder (move one item): call once with operation "reorder", a text reference, and the 1-based atPosition. Example: move call Cecilia to priority one → {"operation":"reorder","reference":{"by":"text","value":"call Cecilia"},"atPosition":1}. Equivalent reference shapes such as {"text":"call Cecilia"} or item {"text":"call Cecilia"} are also accepted.
+- On NOT_FOUND, report the failure once or ask one concise clarification. Do not retry the identical tool call with identical arguments in the same turn.
 - For remove, replace, clear completed, carry, and restore backup only: present the preview, wait for explicit confirmation, then call again with confirmed=true and the matching previewToken.
 - After every successful priority write, briefly confirm and report the resulting ordered list.
 - Require confirmed=true before memory_clear and before full replacement of instructions.
@@ -302,7 +304,7 @@ const toolSpecs = [
     type: "function",
     name: "memory_priorities",
     description:
-      "Manage today's daily priorities with deterministic reference resolution. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, carry, restore_backup, preview. Execute add/insert/edit/complete/reopen/reorder directly in one call (insert requires exact 1-based atPosition). Only remove/replace/clear_completed/carry/restore_backup require preview then confirmed=true with previewToken. Never ask the user for UUIDs.",
+      "Manage today's daily priorities with deterministic reference resolution. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, carry, restore_backup, preview. Execute add/insert/edit/complete/reopen/reorder directly in one call (insert requires exact 1-based atPosition). Reorder example: {\"operation\":\"reorder\",\"reference\":{\"by\":\"text\",\"value\":\"call Cecilia\"},\"atPosition\":1}. Only remove/replace/clear_completed/carry/restore_backup require preview then confirmed=true with previewToken. On NOT_FOUND, do not retry identical arguments. Never ask the user for UUIDs.",
     parameters: {
       type: "object",
       properties: {
@@ -328,9 +330,18 @@ const toolSpecs = [
         expectedUpdatedAt: { type: "string" },
         items: { type: "array", items: { type: "object", additionalProperties: true } },
         item: { type: "object", additionalProperties: true },
-        reference: { type: "object", additionalProperties: true },
+        reference: {
+          description:
+            'Priority reference. Prefer {"by":"text","value":"call Cecilia"}. Also accepts {"text":"call Cecilia"} or a plain string.',
+          anyOf: [{ type: "string" }, { type: "object", additionalProperties: true }],
+        },
         atPosition: { type: "number" },
-        order: { type: "array", items: { type: "object", additionalProperties: true } },
+        order: {
+          type: "array",
+          items: {
+            anyOf: [{ type: "string" }, { type: "object", additionalProperties: true }],
+          },
+        },
         targetDate: { type: "string" },
         backupId: { type: "string" },
         previewToken: { type: "string" },

@@ -66,35 +66,77 @@ function candidatePayload(item, fullIndex) {
 }
 
 /**
+ * Normalize single-priority references to canonical { by, value }.
+ * Accepts: { by, value }, { text }, { name }, { query }, bare string/number.
+ * Does not treat destination atPosition on the same object as the source identity.
+ */
+function normalizePriorityReference(reference) {
+  if (reference == null) return null;
+
+  if (typeof reference === "number") {
+    return { by: "ordinal", value: reference };
+  }
+
+  if (typeof reference === "string") {
+    const trimmed = reference.trim();
+    if (!trimmed) return { by: "text", value: "" };
+    if (trimmed === "recent") return { by: "recent", value: "recent" };
+    if (/^\d+$/.test(trimmed)) return { by: "ordinal", value: Number(trimmed) };
+    if (looksLikeUuid(trimmed)) return { by: "id", value: trimmed };
+    return { by: "text", value: trimmed };
+  }
+
+  if (typeof reference !== "object") return null;
+
+  let by = reference.by != null ? String(reference.by) : "";
+  let value =
+    reference.value != null
+      ? reference.value
+      : reference.query != null
+        ? reference.query
+        : reference.text != null
+          ? reference.text
+          : reference.name != null
+            ? reference.name
+            : undefined;
+
+  // Never use destination-like fields as the source reference identity.
+  if ((value == null || value === "") && reference.atPosition != null && !by) {
+    return { by: "text", value: "" };
+  }
+
+  if (by === "phrase") by = "text";
+
+  if (!by) {
+    if (value == null || value === "") return { by: "text", value: "" };
+    if (String(value) === "recent") by = "recent";
+    else if (typeof value === "number" || /^\d+$/.test(String(value))) by = "ordinal";
+    else if (looksLikeUuid(value)) by = "id";
+    else by = "text";
+  }
+
+  if (by === "text" || by === "phrase") {
+    const text = String(value != null ? value : "").trim();
+    return { by: "text", value: text };
+  }
+
+  return { by, value };
+}
+
+/**
  * Deterministic priority reference resolution.
- * reference: { by?: "id"|"ordinal"|"text"|"phrase"|"recent", value?: string|number, query?: string }
+ * reference: { by?: "id"|"ordinal"|"text"|"phrase"|"recent", value?: string|number, query?: string, text?: string }
  */
 function resolvePriorityReference(priorities, reference, options = {}) {
   const listScope = options.listScope === "all" ? "all" : "open";
   const recentId = options.recentId || null;
   const pool = scopedPool(priorities, listScope);
 
-  if (reference == null || (typeof reference !== "object" && typeof reference !== "number" && typeof reference !== "string")) {
-    return { code: "NOT_FOUND", candidates: [] };
-  }
+  const ref = normalizePriorityReference(reference);
+  if (!ref) return { code: "NOT_FOUND", candidates: [] };
 
-  // Allow bare string/number shorthand.
-  let ref = reference;
-  if (typeof reference === "string" || typeof reference === "number") {
-    ref = { value: reference };
-  }
-
-  let by = ref.by ? String(ref.by) : "";
-  let value = ref.value != null ? ref.value : ref.query;
-  if (ref.query != null && (value == null || value === "")) value = ref.query;
-
-  if (!by) {
-    if (String(value) === "recent") by = "recent";
-    else if (typeof value === "number" || /^\d+$/.test(String(value || ""))) by = "ordinal";
-    else if (looksLikeUuid(value)) by = "id";
-    else by = "text";
-  }
-  if (by === "phrase") by = "text";
+  const by = ref.by;
+  const value = ref.value;
 
   if (by === "recent") {
     if (!recentId) return { code: "NOT_FOUND", candidates: [] };
@@ -241,6 +283,7 @@ module.exports = {
   canonicalizePriorities,
   formatPrioritiesArtifact,
   clonePriorities,
+  normalizePriorityReference,
   resolvePriorityReference,
   validatePrioritiesArray,
   validateDailyShape,

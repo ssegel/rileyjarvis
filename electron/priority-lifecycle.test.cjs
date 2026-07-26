@@ -383,6 +383,141 @@ test("move one priority and full reorder preserve IDs", async () => {
   });
 });
 
+test("reorder accepts natural-language reference shapes for call Cecilia to priority one", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "review the scanner purchase", status: "open" },
+      { text: "call Cecilia", status: "open" },
+      { text: "finish the website homepage", status: "open" },
+    ]);
+    const before = await store.loadAll();
+    const ids = before.daily.priorities.map((item) => item.id);
+
+    const byItemText = await store.memoryPriorities({
+      operation: "reorder",
+      item: { text: "call Cecilia" },
+      atPosition: 1,
+    });
+    assert.equal(byItemText.ok, true);
+    assert.deepEqual(texts(byItemText), [
+      "call Cecilia",
+      "review the scanner purchase",
+      "finish the website homepage",
+    ]);
+    assert.deepEqual(
+      byItemText.priorities.map((item) => item.id).sort(),
+      [...ids].sort(),
+    );
+
+    await confirmReplace(store, [
+      { text: "review the scanner purchase", status: "open" },
+      { text: "call Cecilia", status: "open" },
+      { text: "finish the website homepage", status: "open" },
+    ]);
+    const byReferenceText = await store.memoryPriorities({
+      operation: "reorder",
+      reference: { text: "call Cecilia" },
+      atPosition: 1,
+    });
+    assert.equal(byReferenceText.ok, true);
+    assert.deepEqual(texts(byReferenceText), [
+      "call Cecilia",
+      "review the scanner purchase",
+      "finish the website homepage",
+    ]);
+
+    await confirmReplace(store, [
+      { text: "review the scanner purchase", status: "open" },
+      { text: "call Cecilia", status: "open" },
+      { text: "finish the website homepage", status: "open" },
+    ]);
+    const canonical = await store.memoryPriorities({
+      operation: "reorder",
+      reference: { by: "text", value: "call Cecilia" },
+      atPosition: 1,
+    });
+    assert.equal(canonical.ok, true);
+    assert.deepEqual(texts(canonical), [
+      "call Cecilia",
+      "review the scanner purchase",
+      "finish the website homepage",
+    ]);
+
+    await confirmReplace(store, [
+      { text: "review the scanner purchase", status: "open" },
+      { text: "call Cecilia", status: "open" },
+      { text: "finish the website homepage", status: "open" },
+    ]);
+    const caseInsensitive = await store.memoryPriorities({
+      operation: "reorder",
+      reference: { by: "text", value: "CALL cecilia" },
+      atPosition: 1,
+    });
+    assert.equal(caseInsensitive.ok, true);
+    assert.equal(caseInsensitive.priorities[0].text, "call Cecilia");
+
+    await confirmReplace(store, [
+      { text: "review the scanner purchase", status: "open" },
+      { text: "call Cecilia", status: "open" },
+      { text: "finish the website homepage", status: "open" },
+    ]);
+    const phrase = await store.memoryPriorities({
+      operation: "reorder",
+      reference: { value: "Cecilia" },
+      atPosition: 1,
+    });
+    assert.equal(phrase.ok, true);
+    assert.equal(phrase.priorities[0].text, "call Cecilia");
+  });
+});
+
+test("destination ordinal is not mistaken for the source reference", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "review the scanner purchase", status: "open" },
+      { text: "call Cecilia", status: "open" },
+      { text: "finish the website homepage", status: "open" },
+    ]);
+    const before = await store.loadAll();
+    const firstId = before.daily.priorities[0].id;
+    // item carries destination-like atPosition noise; source must still be call Cecilia via text.
+    const moved = await store.memoryPriorities({
+      operation: "reorder",
+      item: { text: "call Cecilia", atPosition: 1 },
+      atPosition: 1,
+    });
+    assert.equal(moved.ok, true);
+    assert.equal(moved.priorities[0].text, "call Cecilia");
+    assert.equal(moved.priorities[1].id, firstId);
+    assert.equal(moved.priorities[1].text, "review the scanner purchase");
+  });
+});
+
+test("identical NOT_FOUND reorder arguments are suppressed on retry", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "review the scanner purchase", status: "open" },
+      { text: "call Cecilia", status: "open" },
+    ]);
+    const args = {
+      operation: "reorder",
+      reference: { by: "text", value: "does-not-exist" },
+      atPosition: 1,
+    };
+    const first = await store.memoryPriorities(args);
+    assert.equal(first.code, "NOT_FOUND");
+    assert.equal(first.suppressedRetry, undefined);
+
+    const second = await store.memoryPriorities(args);
+    assert.equal(second.code, "NOT_FOUND");
+    assert.equal(second.suppressedRetry, true);
+    assert.match(second.message, /do not retry/i);
+  });
+});
+
 test("strict replacement with confirmation", async () => {
   await withStore(async (store) => {
     await store.ensureMemory();
@@ -744,7 +879,8 @@ test("text and voice share identical memory_priorities tool schema and handler",
   ]) {
     assert.match(schemaBlock, new RegExp(`${field}:`));
   }
-  assert.doesNotMatch(schemaBlock, /^\s*text:\s*\{/m);
+  assert.match(schemaBlock, /Reorder example|by":"text","value":"call Cecilia"/);
+  assert.match(main, /Do not retry the identical tool call with identical arguments/);
 });
 
 test("artifact contains canonical resulting list and confirmation is set", async () => {

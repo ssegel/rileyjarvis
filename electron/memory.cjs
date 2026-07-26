@@ -184,9 +184,39 @@ function createMemoryStore(options = {}) {
   /** @type {Map<string, { expiresAt: number, operation: string, hash: string, afterPriorities: any[], beforePriorities: any[], dailyUpdatedAt: string, meta?: any }>} */
   const previewStore = new Map();
   let recentPriorityId = null;
+  /** @type {Set<string>} */
+  const notFoundFingerprints = new Set();
 
   function isoNow() {
     return now().toISOString();
+  }
+
+  function fingerprintNotFoundArgs(args = {}) {
+    return JSON.stringify({
+      operation: String(args.operation || "").trim().toLowerCase(),
+      reference: args.reference ?? null,
+      item: args.item ?? null,
+      atPosition: args.atPosition ?? null,
+      order: args.order ?? null,
+      listScope: args.listScope ?? null,
+    });
+  }
+
+  function applyNotFoundRetryPolicy(args, result) {
+    if (!result || result.code !== "NOT_FOUND") return result;
+    const fp = fingerprintNotFoundArgs(args);
+    if (notFoundFingerprints.has(fp)) {
+      const message =
+        "No matching priority was found. This identical request already failed; do not retry it with the same arguments. Report once or ask one concise clarification.";
+      return {
+        ...result,
+        suppressedRetry: true,
+        message,
+        error: message,
+      };
+    }
+    notFoundFingerprints.add(fp);
+    return result;
   }
 
   function todayDate() {
@@ -1299,6 +1329,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     }
 
     invalidatePreviews();
+    notFoundFingerprints.clear();
 
     return successPriorityResult({
       operation,
@@ -1319,6 +1350,12 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     }
 
     return enqueue(async () => {
+      const result = await runMemoryPrioritiesOperation(args, operation, startedAt);
+      return applyNotFoundRetryPolicy(args, result);
+    });
+  }
+
+  async function runMemoryPrioritiesOperation(args, operation, startedAt) {
       await ensureMemoryUnlocked();
       await rolloverDailyIfNeeded();
       const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
@@ -1397,7 +1434,6 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       }
 
       return applyPriorityOperation(args, daily, beforePriorities, startedAt, resolveOpts);
-    });
   }
 
   async function loadValidatedBackupPriorities(backupId) {
@@ -1971,6 +2007,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         recentPriorityId = id;
       },
       clearPreviews: () => invalidatePreviews(),
+      clearNotFoundFingerprints: () => notFoundFingerprints.clear(),
     },
   };
 }
