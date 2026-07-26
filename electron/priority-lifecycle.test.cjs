@@ -882,10 +882,13 @@ test("text and voice share identical memory_priorities tool schema and handler",
   assert.match(schemaBlock, /Reorder example|by":"text","value":"call Cecilia"/);
   assert.match(schemaBlock, /complete targets an open priority/);
   assert.match(schemaBlock, /reopen targets a completed priority/);
+  assert.match(schemaBlock, /carry\/copy into another date defaults to copy/);
   assert.match(schemaBlock, /enum:\s*\["open",\s*"done",\s*"all"\]/);
   assert.match(main, /Do not retry identical or near-identical/);
   assert.match(main, /complete targets an open priority \(status open, blocked, or active\)/);
   assert.match(main, /reopen targets a completed priority \(status done\)/);
+  assert.match(main, /"carry" \/ "carry forward" \/ "copy" defaults to copy/);
+  assert.match(main, /Never call a copy operation a move/);
 });
 
 test("artifact contains canonical resulting list and confirmation is set", async () => {
@@ -1170,5 +1173,197 @@ test("identical and near-identical NOT_FOUND reopen retries are suppressed", asy
     });
     assert.equal(viaItem.code, "NOT_FOUND");
     assert.equal(viaItem.suppressedRetry, true);
+  });
+});
+
+test("omitted move defaults to copy and preserves today", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await store.memoryUpdateDaily({
+      summary: "Keep summary",
+      commitments: [{ text: "Keep commitment", status: "open" }],
+    });
+    await confirmReplace(store, [
+      { text: "Finish website homepage", status: "open" },
+      { text: "Call Cecilia", status: "open" },
+    ]);
+    const before = await store.loadAll();
+    const ceciliaId = before.daily.priorities[1].id;
+
+    const preview = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+    });
+    assert.equal(preview.code, "CONFIRMATION_REQUIRED");
+    assert.equal(preview.move, false);
+    assert.equal(preview.mode, "copy");
+    assert.match(preview.message, /copy/i);
+    assert.match(preview.message, /Today's priority will remain unchanged/i);
+    assert.doesNotMatch(preview.message, /removed from today's list/i);
+    assert.ok(preview.todayBefore);
+    assert.ok(preview.todayAfter);
+    assert.ok(preview.tomorrowBefore);
+    assert.ok(preview.tomorrowAfter);
+    assert.deepEqual(
+      preview.todayAfter.map((item) => item.text),
+      ["Finish website homepage", "Call Cecilia"],
+    );
+    assert.equal(preview.tomorrowAfter.some((item) => item.text === "Call Cecilia"), true);
+    assert.match(preview.artifact.content, /Today before/);
+    assert.match(preview.artifact.content, /Tomorrow after/);
+
+    const confirmed = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      confirmed: true,
+      previewToken: preview.previewToken,
+    });
+    assert.equal(confirmed.ok, true);
+    assert.equal(confirmed.mode, "copy");
+    assert.deepEqual(texts(confirmed), ["Finish website homepage", "Call Cecilia"]);
+    assert.equal(confirmed.priorities[1].id, ceciliaId);
+
+    const after = await store.loadAll();
+    assert.equal(after.daily.summary, "Keep summary");
+    assert.equal(after.daily.commitments[0].text, "Keep commitment");
+    const future = JSON.parse(await fsp.readFile(path.join(store.paths.future, "daily-2026-07-23.json"), "utf8"));
+    assert.equal(future.priorities.some((item) => item.text === "Call Cecilia" && item.id === ceciliaId), true);
+  });
+});
+
+test("move false copies and move true removes from today", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "Finish website homepage", status: "open" },
+      { text: "Call Cecilia", status: "open" },
+    ]);
+
+    const copy = await confirmOp(store, {
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      move: false,
+    });
+    assert.equal(copy.preview.mode, "copy");
+    assert.match(copy.preview.message, /\bcopy\b/i);
+    assert.deepEqual(texts(copy.confirmed), ["Finish website homepage", "Call Cecilia"]);
+
+    await confirmReplace(store, [
+      { text: "Finish website homepage", status: "open" },
+      { text: "Call Cecilia", status: "open" },
+    ]);
+    const move = await confirmOp(store, {
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      move: true,
+    });
+    assert.equal(move.preview.mode, "move");
+    assert.equal(move.preview.move, true);
+    assert.match(move.preview.message, /\bmove\b/i);
+    assert.match(move.preview.message, /removed from today's list/i);
+    assert.deepEqual(
+      move.preview.todayAfter.map((item) => item.text),
+      ["Finish website homepage"],
+    );
+    assert.deepEqual(texts(move.confirmed), ["Finish website homepage"]);
+    const future = JSON.parse(await fsp.readFile(path.join(store.paths.future, "daily-2026-07-23.json"), "utf8"));
+    assert.equal(future.priorities.some((item) => item.text === "Call Cecilia"), true);
+  });
+});
+
+test("carry confirmation rejects flipped move and target-date mismatch", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "Finish website homepage", status: "open" },
+      { text: "Call Cecilia", status: "open" },
+    ]);
+
+    const copyPreview = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+    });
+    const flipToMove = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      move: true,
+      confirmed: true,
+      previewToken: copyPreview.previewToken,
+    });
+    assert.equal(flipToMove.code, "STALE_PREVIEW");
+
+    const movePreview = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      move: true,
+    });
+    const flipToCopy = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      move: false,
+      confirmed: true,
+      previewToken: movePreview.previewToken,
+    });
+    assert.equal(flipToCopy.code, "STALE_PREVIEW");
+
+    const dateMismatch = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "2026-07-30",
+      confirmed: true,
+      previewToken: copyPreview.previewToken,
+    });
+    assert.equal(dateMismatch.code, "STALE_PREVIEW");
+  });
+});
+
+test("intervening write invalidates carry preview; pre-binding preview is stale", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await confirmReplace(store, [
+      { text: "Finish website homepage", status: "open" },
+      { text: "Call Cecilia", status: "open" },
+    ]);
+    const preview = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+    });
+    await store.memoryPriorities({ operation: "add", item: { text: "Intervening" } });
+    const stale = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      confirmed: true,
+      previewToken: preview.previewToken,
+    });
+    assert.equal(stale.code, "STALE_PREVIEW");
+
+    const fresh = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+    });
+    // Simulate a pre-correction preview entry missing carryBindingVersion.
+    const entry = store._test.getPreviewEntry(fresh.previewToken);
+    assert.ok(entry);
+    delete entry.meta.carryBindingVersion;
+    if (entry.meta.request) delete entry.meta.request.carryBindingVersion;
+    const oldBinding = await store.memoryPriorities({
+      operation: "carry",
+      reference: { by: "text", value: "Call Cecilia" },
+      targetDate: "tomorrow",
+      confirmed: true,
+      previewToken: fresh.previewToken,
+    });
+    assert.equal(oldBinding.code, "STALE_PREVIEW");
   });
 });

@@ -34,8 +34,9 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 - complete targets an open priority (status open, blocked, or active). reopen targets a completed priority (status done).
 - For add, insert, edit, complete, reopen, and simple reorder: call memory_priorities once and execute immediately. Do not preview these operations and do not ask Sarah to confirm them.
 - For insert: call memory_priorities in one tool call with operation "insert", the item text, and the exact 1-based atPosition. Priority N means atPosition N (array index N-1). Never ask Sarah to confirm an ordinary insertion.
-- For reorder (move one item): call once with operation "reorder", a text reference, and the 1-based atPosition. Example: move call Cecilia to priority one → {"operation":"reorder","reference":{"by":"text","value":"call Cecilia"},"atPosition":1}. Equivalent reference shapes such as {"text":"call Cecilia"} or item {"text":"call Cecilia"} are also accepted.
+- For reorder (move one item within today's list): call once with operation "reorder", a text reference, and the 1-based atPosition. Example: move call Cecilia to priority one → {"operation":"reorder","reference":{"by":"text","value":"call Cecilia"},"atPosition":1}. Equivalent reference shapes such as {"text":"call Cecilia"} or item {"text":"call Cecilia"} are also accepted.
 - On NOT_FOUND, report the failure once or ask one concise clarification. Do not retry identical or near-identical tool calls (same operation, same normalized reference, same destination/material arguments, same error) in the same turn.
+- Carry across dates: "carry" / "carry forward" / "copy" defaults to copy (omit move or move=false) — keep the item today and add it to the target date. Explicit "move … to tomorrow" sets move=true — remove from today and add to the target date. Never call a copy operation a move. Present the preview wording exactly (copy keeps today unchanged; move removes from today), then confirm with the matching previewToken.
 - For remove, replace, clear completed, carry, and restore backup only: present the preview, wait for explicit confirmation, then call again with confirmed=true and the matching previewToken.
 - After every successful priority write, briefly confirm and report the resulting ordered list.
 - Require confirmed=true before memory_clear and before full replacement of instructions.
@@ -305,7 +306,7 @@ const toolSpecs = [
     type: "function",
     name: "memory_priorities",
     description:
-      "Manage today's daily priorities with deterministic reference resolution. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, carry, restore_backup, preview. complete targets an open priority; reopen targets a completed priority. Execute add/insert/edit/complete/reopen/reorder directly in one call (insert requires exact 1-based atPosition). Reorder example: {\"operation\":\"reorder\",\"reference\":{\"by\":\"text\",\"value\":\"call Cecilia\"},\"atPosition\":1}. Only remove/replace/clear_completed/carry/restore_backup require preview then confirmed=true with previewToken. On NOT_FOUND, do not retry identical or near-identical arguments. Never ask the user for UUIDs.",
+      "Manage today's daily priorities with deterministic reference resolution. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, carry, restore_backup, preview. complete targets an open priority; reopen targets a completed priority. carry/copy into another date defaults to copy (omit move or move=false; today unchanged); explicit move to another date requires move=true (removes from today). Execute add/insert/edit/complete/reopen/reorder directly in one call (insert requires exact 1-based atPosition). Reorder example: {\"operation\":\"reorder\",\"reference\":{\"by\":\"text\",\"value\":\"call Cecilia\"},\"atPosition\":1}. Only remove/replace/clear_completed/carry/restore_backup require preview then confirmed=true with previewToken. On NOT_FOUND, do not retry identical or near-identical arguments. Never ask the user for UUIDs.",
     parameters: {
       type: "object",
       properties: {
@@ -349,7 +350,11 @@ const toolSpecs = [
         previewOperation: { type: "string" },
         listScope: { type: "string", enum: ["open", "done", "all"] },
         allowDuplicates: { type: "boolean" },
-        move: { type: "boolean" },
+        move: {
+          type: "boolean",
+          description:
+            "For carry only. Omit or false = copy (keep today). true = move (remove from today). Never set true for ordinary carry/copy wording.",
+        },
       },
       required: ["operation"],
       additionalProperties: false,
@@ -1194,6 +1199,7 @@ Here is what you can ask me to do.
 - Remember facts, correct stored items, and update today's projects, commitments, and follow-ups.
 - Manage daily priorities with natural language: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry to another day, and restore a backup.
 - complete targets an open priority; reopen targets a completed priority.
+- Carry/copy into tomorrow keeps today's item; move to tomorrow removes it from today.
 - Ordinary add, insert, edit, complete, reopen, and reorder run immediately without confirmation.
 - Removing, replacing, clearing completed priorities, carrying across dates, or restoring a backup requires an explicit confirmation after preview.
 - Clearing memory or fully replacing instructions requires explicit confirmation.

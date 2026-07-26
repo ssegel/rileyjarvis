@@ -1140,6 +1140,8 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     previewStore.clear();
   }
 
+  const CARRY_PREVIEW_BINDING_VERSION = 1;
+
   function buildPreviewRequestBinding(args = {}) {
     const items = Array.isArray(args.items) ? args.items : args.item ? [args.item] : [];
     return {
@@ -1154,17 +1156,113 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     };
   }
 
-  function confirmationConflictsWithPreview(args, entry) {
+  function resolveCarryTargetDateArg(targetDate, dailyDate) {
+    if (targetDate === "tomorrow" || targetDate == null || targetDate === "") {
+      return addDaysToDate(dailyDate, 1);
+    }
+    return String(targetDate);
+  }
+
+  function projectCarryOntoFuture(futurePriorities, carryItems) {
+    const next = clonePriorities(futurePriorities);
+    const seen = new Set(next.map((item) => item.id));
+    for (const item of carryItems) {
+      if (!seen.has(item.id)) {
+        next.push({ ...item, status: "open" });
+        seen.add(item.id);
+      }
+    }
+    return next;
+  }
+
+  function formatCarryPreviewMessage(carryItems, move, targetLabel) {
+    if (carryItems.length === 1) {
+      const name = String(carryItems[0].text || "").trim();
+      if (move) {
+        return `You're about to move "${name}" into ${targetLabel}'s daily priorities. It will be removed from today's list.`;
+      }
+      return `You're about to copy "${name}" into ${targetLabel}'s daily priorities. Today's priority will remain unchanged.`;
+    }
+    if (move) {
+      return `You're about to move ${carryItems.length} priorities into ${targetLabel}'s daily priorities. They will be removed from today's list.`;
+    }
+    return `You're about to copy ${carryItems.length} priorities into ${targetLabel}'s daily priorities. Today's priorities will remain unchanged.`;
+  }
+
+  function formatPriorityLines(priorities) {
+    const rows = canonicalizePriorities(priorities);
+    return rows.length
+      ? rows.map((row) => `${row.order}. ${row.text} — ${row.status}`).join("\n")
+      : "No priorities stored.";
+  }
+
+  function formatCarryPreviewArtifact({
+    mode,
+    targetDate,
+    targetLabel,
+    selected,
+    todayBefore,
+    todayAfter,
+    tomorrowBefore,
+    tomorrowAfter,
+  }) {
+    const selectedLines = selected.map((item) => `- ${item.text}`).join("\n");
+    return {
+      title: "Daily Priorities",
+      kind: "markdown",
+      content: [
+        `# Carry preview (${mode})`,
+        "",
+        `Target date: ${targetLabel} (${targetDate})`,
+        "",
+        "## Selected",
+        selectedLines || "- (none)",
+        "",
+        "## Today before",
+        formatPriorityLines(todayBefore),
+        "",
+        "## Today after",
+        formatPriorityLines(todayAfter),
+        "",
+        "## Tomorrow before",
+        formatPriorityLines(tomorrowBefore),
+        "",
+        "## Tomorrow after",
+        formatPriorityLines(tomorrowAfter),
+      ].join("\n"),
+    };
+  }
+
+  async function readFutureDaily(targetDate) {
+    await fsApi.mkdir(paths.future, { recursive: true });
+    const futurePath = path.join(paths.future, `daily-${targetDate}.json`);
+    if (await pathExists(futurePath)) {
+      return readJsonFile(futurePath, (raw) => normalizeDaily(raw, targetDate), () => defaultDaily(targetDate));
+    }
+    return defaultDaily(targetDate);
+  }
+
+  function confirmationConflictsWithPreview(args, entry, context = {}) {
     const bound = entry?.meta?.request;
     if (!bound) return null;
+
+    if (entry.operation === "carry") {
+      if (bound.carryBindingVersion !== CARRY_PREVIEW_BINDING_VERSION) {
+        return "Carry preview binding is stale or invalid.";
+      }
+    }
 
     if (args.atPosition != null && args.atPosition !== "" && bound.atPosition != null) {
       if (Number(args.atPosition) !== Number(bound.atPosition)) {
         return "Confirmation atPosition does not match the preview.";
       }
     }
-    if (args.targetDate != null && args.targetDate !== "" && bound.targetDate != null) {
-      if (String(args.targetDate) !== String(bound.targetDate)) {
+    if (args.targetDate != null && args.targetDate !== "") {
+      const resolvedConfirm = resolveCarryTargetDateArg(args.targetDate, context.dailyDate || "");
+      if (bound.resolvedTargetDate && String(resolvedConfirm) !== String(bound.resolvedTargetDate)) {
+        return "Confirmation targetDate does not match the preview.";
+      }
+      if (!bound.resolvedTargetDate && bound.targetDate != null && String(args.targetDate) !== String(bound.targetDate)) {
         return "Confirmation targetDate does not match the preview.";
       }
     }
@@ -1429,6 +1527,18 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
             priorities: canonicalizePriorities(daily.priorities),
             dailyUpdatedAt: daily.updatedAt,
             artifact: planned.artifact || formatPrioritiesArtifact(daily.priorities),
+            ...(planned.mode != null
+              ? {
+                  mode: planned.mode,
+                  move: planned.move === true,
+                  targetDate: planned.targetDate,
+                  selected: planned.selected,
+                  todayBefore: planned.todayBefore,
+                  todayAfter: planned.todayAfter,
+                  tomorrowBefore: planned.tomorrowBefore,
+                  tomorrowAfter: planned.tomorrowAfter,
+                }
+              : {}),
           };
         }
         const preview = readPreview(args.previewToken, operation, daily.updatedAt);
@@ -1527,6 +1637,70 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         dailyUpdatedAt: daily.updatedAt,
       });
     }
+
+    if (operation === "carry") {
+      const move = planned.meta?.move === true;
+      const mode = move ? "move" : "copy";
+      const targetDate = planned.meta.targetDate;
+      const carryItems = (planned.meta.carryItems || []).map((item) => ({ ...item }));
+      const futureDaily = await readFutureDaily(targetDate);
+      const tomorrowBefore = clonePriorities(futureDaily.priorities || []);
+      const tomorrowAfter = projectCarryOntoFuture(tomorrowBefore, carryItems);
+      const tomorrowLabel = targetDate === addDaysToDate(daily.date, 1) ? "tomorrow" : targetDate;
+      const message = formatCarryPreviewMessage(carryItems, move, tomorrowLabel);
+      const todayBefore = clonePriorities(beforePriorities);
+      const todayAfter = clonePriorities(planned.nextPriorities);
+      const request = {
+        ...buildPreviewRequestBinding(args),
+        move,
+        resolvedTargetDate: targetDate,
+        sourceIds: carryItems.map((item) => item.id),
+        normalizedReference: normalizePriorityReference(args.reference || args.item),
+        carryBindingVersion: CARRY_PREVIEW_BINDING_VERSION,
+        todayAfter: canonicalizePriorities(todayAfter),
+        tomorrowAfter: canonicalizePriorities(tomorrowAfter),
+      };
+      const token = storePreview(operation, beforePriorities, planned.nextPriorities, daily.updatedAt, {
+        ...planned.meta,
+        carryBindingVersion: CARRY_PREVIEW_BINDING_VERSION,
+        mode,
+        tomorrowBefore: clonePriorities(tomorrowBefore),
+        tomorrowAfter: clonePriorities(tomorrowAfter),
+        request,
+      });
+      const artifact = formatCarryPreviewArtifact({
+        mode,
+        targetDate,
+        targetLabel: tomorrowLabel,
+        selected: carryItems,
+        todayBefore,
+        todayAfter,
+        tomorrowBefore,
+        tomorrowAfter,
+      });
+      return {
+        ok: true,
+        operation: args._previewOnly ? operation : "preview",
+        previewOperation: operation,
+        message,
+        previewToken: token,
+        mode,
+        move,
+        targetDate,
+        selected: canonicalizePriorities(carryItems),
+        before: canonicalizePriorities(todayBefore),
+        after: canonicalizePriorities(todayAfter),
+        todayBefore: canonicalizePriorities(todayBefore),
+        todayAfter: canonicalizePriorities(todayAfter),
+        tomorrowBefore: canonicalizePriorities(tomorrowBefore),
+        tomorrowAfter: canonicalizePriorities(tomorrowAfter),
+        priorities: canonicalizePriorities(beforePriorities),
+        dailyUpdatedAt: daily.updatedAt,
+        artifact,
+        requiresConfirmation: true,
+      };
+    }
+
     const request = buildPreviewRequestBinding(args);
     const token = storePreview(operation, beforePriorities, planned.nextPriorities, daily.updatedAt, {
       ...planned.meta,
@@ -1823,7 +1997,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
           dailyUpdatedAt: daily.updatedAt,
         });
       }
-      const conflict = confirmationConflictsWithPreview(args, preview.entry);
+      const conflict = confirmationConflictsWithPreview(args, preview.entry, { dailyDate: daily.date });
       if (conflict) {
         return failPriorityResult(operation, "STALE_PREVIEW", conflict, startedAt, {
           priorities: canonicalizePriorities(daily.priorities),
@@ -1894,10 +2068,23 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       }
       if (operation === "carry") {
         const meta = preview.entry.meta || {};
+        if (meta.carryBindingVersion !== CARRY_PREVIEW_BINDING_VERSION) {
+          return failPriorityResult(operation, "STALE_PREVIEW", "Carry preview binding is stale or invalid.", startedAt, {
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
         const targetDate = meta.targetDate;
         const carryItems = meta.carryItems || [];
+        const tomorrowAfter = Array.isArray(meta.tomorrowAfter) ? meta.tomorrowAfter : null;
         if (!targetDate || !/^\d{4}-\d{2}-\d{2}$/.test(String(targetDate)) || targetDate === daily.date) {
           return failPriorityResult(operation, "VALIDATION_FAILED", "Carry preview has an invalid target date.", startedAt, {
+            priorities: canonicalizePriorities(daily.priorities),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+        if (!tomorrowAfter) {
+          return failPriorityResult(operation, "STALE_PREVIEW", "Carry preview is missing tomorrow-after plan.", startedAt, {
             priorities: canonicalizePriorities(daily.priorities),
             dailyUpdatedAt: daily.updatedAt,
           });
@@ -1908,14 +2095,15 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         if (await pathExists(futurePath)) {
           futureDaily = await readJsonFile(futurePath, (raw) => normalizeDaily(raw, targetDate), () => defaultDaily(targetDate));
         }
-        const seen = new Set((futureDaily.priorities || []).map((item) => item.id));
-        for (const item of carryItems) {
-          if (!seen.has(item.id)) {
-            futureDaily.priorities.push({ ...item, status: "open", updatedAt: isoNow() });
-            seen.add(item.id);
-          }
-        }
-        futureDaily.updatedAt = isoNow();
+        const nextFuturePriorities = clonePriorities(tomorrowAfter).map((item) => ({
+          ...item,
+          updatedAt: isoNow(),
+        }));
+        futureDaily = {
+          ...futureDaily,
+          priorities: nextFuturePriorities,
+          updatedAt: isoNow(),
+        };
         try {
           await createBackupSnapshot(`priorities-carry-future-${targetDate}`);
           await atomicWriteJson(futurePath, futureDaily);
@@ -1930,9 +2118,12 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         const nextDaily = { ...daily, priorities: clonePriorities(preview.entry.afterPriorities) };
         const result = await commitPriorityDaily(daily, nextDaily, operation, startedAt);
         if (result.ok) {
-          result.message = `Carried ${carryItems.length} open priorit${carryItems.length === 1 ? "y" : "ies"} to ${targetDate}.`;
+          const verb = meta.move === true ? "Moved" : "Copied";
+          result.message = `${verb} ${carryItems.length} open priorit${carryItems.length === 1 ? "y" : "ies"} to ${targetDate}.`;
           result.confirmation = result.message;
           result.targetDate = targetDate;
+          result.mode = meta.move === true ? "move" : "copy";
+          result.move = meta.move === true;
         }
         return result;
       }
@@ -2015,6 +2206,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       },
       clearPreviews: () => invalidatePreviews(),
       clearNotFoundFingerprints: () => notFoundFingerprints.clear(),
+      getPreviewEntry: (token) => previewStore.get(String(token || "")) || null,
     },
   };
 }
