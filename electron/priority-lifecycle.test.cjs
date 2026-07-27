@@ -776,10 +776,22 @@ test("stable IDs on edit, status change, and reorder; no unintended field change
     await store.ensureMemory();
     await store.memoryUpdateDaily({
       summary: "Keep summary",
-      commitments: [{ text: "Keep commitment", status: "open" }],
-      followUps: [{ text: "Keep follow-up", status: "open" }],
-      unresolved: [{ text: "Keep unresolved", status: "open" }],
       activeProjects: [{ name: "Keep project" }],
+    });
+    await store.workingContextItems({
+      operation: "add",
+      scope: "commitments",
+      item: { text: "Keep commitment", status: "open" },
+    });
+    await store.workingContextItems({
+      operation: "add",
+      scope: "follow_ups",
+      item: { text: "Keep follow-up", status: "open" },
+    });
+    await store.workingContextItems({
+      operation: "add",
+      scope: "unresolved_items",
+      item: { text: "Keep unresolved", status: "open" },
     });
     await store.memoryPriorities({
       operation: "add",
@@ -1186,7 +1198,11 @@ test("omitted move defaults to copy and preserves today", async () => {
     await store.ensureMemory();
     await store.memoryUpdateDaily({
       summary: "Keep summary",
-      commitments: [{ text: "Keep commitment", status: "open" }],
+    });
+    await store.workingContextItems({
+      operation: "add",
+      scope: "commitments",
+      item: { text: "Keep commitment", status: "open" },
     });
     await confirmReplace(store, [
       { text: "Finish website homepage", status: "open" },
