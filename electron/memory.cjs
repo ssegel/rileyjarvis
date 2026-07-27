@@ -19,6 +19,28 @@ const {
   addDaysToDate,
   logPrioritiesEvent,
 } = require("./priority-lifecycle.cjs");
+const {
+  normalizeScope,
+  scopeKey,
+  scopeTitle,
+  isFutureDeferred,
+  cloneItems,
+  canonicalizeItems,
+  formatListArtifact,
+  formatPreviewArtifact,
+  getListForScope,
+  setListForScope,
+  resolveListScope: resolveWcListScope,
+  normalizeWcReference,
+  planWorkingContextMutation,
+  requiresConfirmation,
+  validateWorkingContextDaily,
+  assertUnrelatedUnchanged,
+  logWorkingContextEvent,
+  DESTRUCTIVE_WC_OPERATIONS,
+  normalizeWorkingContextItem,
+  normalizeWcStatus,
+} = require("./working-context-lifecycle.cjs");
 
 const SCHEMA_VERSION = 1;
 const MAX_BACKUPS = 10;
@@ -43,6 +65,11 @@ function isOpenWorkStatus(status) {
   return status === "open" || status === "blocked";
 }
 
+/** Phase 13 open priorities also treat legacy `active` as open for injection/selection. */
+function isOpenPriorityStatus(status) {
+  return status === "open" || status === "blocked" || status === "active";
+}
+
 function isCommitmentDueNow(item, today) {
   const due = String(item?.due || "").trim();
   if (!due) return false;
@@ -60,12 +87,18 @@ function formatCommitmentLine(item) {
  * Preserves stored list order within each category.
  */
 function formatDailyWorkingContext(daily, today) {
-  const openPriorities = (daily.priorities || []).filter((item) => isOpenWorkStatus(item.status));
-  const openCommitments = (daily.commitments || []).filter((item) => isOpenWorkStatus(item.status));
+  const openPriorities = (daily.priorities || []).filter((item) => isOpenPriorityStatus(item.status));
+  const openCommitments = (daily.commitments || []).filter(
+    (item) => isOpenWorkStatus(item.status) && !isFutureDeferred(item, today),
+  );
   const dueNowCommitments = openCommitments.filter((item) => isCommitmentDueNow(item, today));
   const otherCommitments = openCommitments.filter((item) => !isCommitmentDueNow(item, today));
-  const openFollowUps = (daily.followUps || []).filter((item) => isOpenWorkStatus(item.status));
-  const openUnresolved = (daily.unresolved || []).filter((item) => isOpenWorkStatus(item.status));
+  const openFollowUps = (daily.followUps || []).filter(
+    (item) => isOpenWorkStatus(item.status) && !isFutureDeferred(item, today),
+  );
+  const openUnresolved = (daily.unresolved || []).filter(
+    (item) => isOpenWorkStatus(item.status) && !isFutureDeferred(item, today),
+  );
   const activeProjects = daily.activeProjects || [];
 
   const lines = [
@@ -186,8 +219,12 @@ function createMemoryStore(options = {}) {
   /** @type {Map<string, { expiresAt: number, operation: string, hash: string, afterPriorities: any[], beforePriorities: any[], dailyUpdatedAt: string, meta?: any }>} */
   const previewStore = new Map();
   let recentPriorityId = null;
+  /** @type {{ commitments: string|null, follow_ups: string|null, unresolved_items: string|null }} */
+  const recentWcIds = { commitments: null, follow_ups: null, unresolved_items: null };
   /** @type {Set<string>} */
   const notFoundFingerprints = new Set();
+  /** @type {Set<string>} */
+  const wcNotFoundFingerprints = new Set();
 
   function isoNow() {
     return now().toISOString();
@@ -356,17 +393,62 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   }
 
   function normalizeWorkItem(item = {}, fallbackStatus = "open") {
-    return {
+    const normalized = {
       id: typeof item.id === "string" && item.id ? item.id : randomUUID(),
       text: String(item.text || item.name || item.note || "").trim(),
       name: item.name ? String(item.name) : undefined,
       note: item.note ? String(item.note) : undefined,
-      due: item.due ? String(item.due) : undefined,
+      due: item.due != null && item.due !== "" ? String(item.due) : item.due === null ? null : undefined,
+      deferredUntil:
+        item.deferredUntil != null && item.deferredUntil !== ""
+          ? String(item.deferredUntil)
+          : item.deferredUntil === null
+            ? null
+            : undefined,
       status: normalizeStatus(item.status, fallbackStatus),
       updatedAt: item.updatedAt || isoNow(),
       source: item.source ? normalizeSource(item.source) : undefined,
       sensitivity: item.sensitivity ? normalizeSensitivity(item.sensitivity) : undefined,
     };
+    // Preserve lifecycle timestamps when present; never fabricate createdAt on read.
+    if (item.createdAt) normalized.createdAt = String(item.createdAt);
+    if (item.completedAt) normalized.completedAt = String(item.completedAt);
+    if (item.relatedPerson) normalized.relatedPerson = String(item.relatedPerson);
+    if (item.relatedProject) normalized.relatedProject = String(item.relatedProject);
+    if (item.linkedPriorityId) normalized.linkedPriorityId = String(item.linkedPriorityId);
+    if (item.originScope) normalized.originScope = String(item.originScope);
+    if (item.previousScope) normalized.previousScope = String(item.previousScope);
+    if (item.convertedAt) normalized.convertedAt = String(item.convertedAt);
+    if (item.sourceScope) normalized.sourceScope = String(item.sourceScope);
+    if (item.sourceId) normalized.sourceId = String(item.sourceId);
+    return normalized;
+  }
+
+  function mapWorkingContextItem(item = {}) {
+    const base = normalizeWorkItem(item);
+    const status = normalizeWcStatus(base.status, "open");
+    const mapped = {
+      id: base.id,
+      text: base.text,
+      status,
+      updatedAt: base.updatedAt,
+    };
+    if (base.note) mapped.note = base.note;
+    if (base.due != null) mapped.due = base.due;
+    else mapped.due = null;
+    if (base.deferredUntil != null) mapped.deferredUntil = base.deferredUntil;
+    else if (base.deferredUntil === null) mapped.deferredUntil = null;
+    if (base.createdAt) mapped.createdAt = base.createdAt;
+    if (status === "done" && base.completedAt) mapped.completedAt = base.completedAt;
+    if (base.source) mapped.source = base.source;
+    if (base.sensitivity) mapped.sensitivity = base.sensitivity;
+    if (base.relatedPerson) mapped.relatedPerson = base.relatedPerson;
+    if (base.relatedProject) mapped.relatedProject = base.relatedProject;
+    if (base.linkedPriorityId) mapped.linkedPriorityId = base.linkedPriorityId;
+    if (base.originScope) mapped.originScope = base.originScope;
+    if (base.previousScope) mapped.previousScope = base.previousScope;
+    if (base.convertedAt) mapped.convertedAt = base.convertedAt;
+    return mapped;
   }
 
   function normalizeDaily(raw, fallbackDate = todayDate()) {
@@ -376,7 +458,21 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       schemaVersion: SCHEMA_VERSION,
       date: typeof raw.date === "string" && raw.date ? raw.date : fallbackDate,
       summary: typeof raw.summary === "string" ? raw.summary : "",
-      priorities: Array.isArray(raw.priorities) ? raw.priorities.map((item) => normalizeWorkItem(item)) : [],
+      priorities: Array.isArray(raw.priorities)
+        ? raw.priorities.map((item) => {
+            const priority = normalizeWorkItem(item);
+            const mapped = {
+              id: priority.id,
+              text: priority.text,
+              status: priority.status,
+              updatedAt: priority.updatedAt,
+              source: priority.source,
+            };
+            if (priority.sourceScope) mapped.sourceScope = priority.sourceScope;
+            if (priority.sourceId) mapped.sourceId = priority.sourceId;
+            return mapped;
+          })
+        : [],
       activeProjects: Array.isArray(raw.activeProjects)
         ? raw.activeProjects.map((item) => {
             const project = normalizeWorkItem({ ...item, text: item.name || item.text });
@@ -390,20 +486,16 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         : [],
       commitments: Array.isArray(raw.commitments)
         ? raw.commitments.map((item) => {
-            const commitment = normalizeWorkItem(item);
+            const commitment = mapWorkingContextItem(item);
             return {
-              id: commitment.id,
-              text: commitment.text,
-              due: commitment.due || null,
-              status: ["open", "done", "blocked"].includes(commitment.status) ? commitment.status : "open",
-              updatedAt: commitment.updatedAt,
+              ...commitment,
               source: commitment.source || "user",
               sensitivity: commitment.sensitivity || "normal",
             };
           })
         : [],
-      followUps: Array.isArray(raw.followUps) ? raw.followUps.map((item) => normalizeWorkItem(item)) : [],
-      unresolved: Array.isArray(raw.unresolved) ? raw.unresolved.map((item) => normalizeWorkItem(item)) : [],
+      followUps: Array.isArray(raw.followUps) ? raw.followUps.map((item) => mapWorkingContextItem(item)) : [],
+      unresolved: Array.isArray(raw.unresolved) ? raw.unresolved.map((item) => mapWorkingContextItem(item)) : [],
       updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : isoNow(),
     };
   }
@@ -908,6 +1000,18 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
             "Use memory_priorities for daily-priority lifecycle changes. memory_update_daily no longer accepts priorities.",
         };
       }
+      if (
+        Object.prototype.hasOwnProperty.call(args, "commitments") ||
+        Object.prototype.hasOwnProperty.call(args, "followUps") ||
+        Object.prototype.hasOwnProperty.call(args, "unresolved")
+      ) {
+        return {
+          ok: false,
+          code: "USE_WORKING_CONTEXT_ITEMS",
+          error:
+            "Use working_context_items for commitments, follow-ups, and unresolved items. memory_update_daily no longer accepts those arrays.",
+        };
+      }
       await ensureMemoryUnlocked();
       await rolloverDailyIfNeeded();
       const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
@@ -923,22 +1027,6 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
           };
         });
       }
-      if (args.commitments) {
-        daily.commitments = upsertWorkList(daily.commitments, args.commitments, (item) => {
-          const commitment = normalizeWorkItem(item);
-          return {
-            id: commitment.id,
-            text: commitment.text,
-            due: commitment.due || null,
-            status: ["open", "done", "blocked"].includes(commitment.status) ? commitment.status : "open",
-            updatedAt: isoNow(),
-            source: commitment.source || "user",
-            sensitivity: commitment.sensitivity || "normal",
-          };
-        });
-      }
-      if (args.followUps) daily.followUps = upsertWorkList(daily.followUps, args.followUps, (item) => normalizeWorkItem(item));
-      if (args.unresolved) daily.unresolved = upsertWorkList(daily.unresolved, args.unresolved, (item) => normalizeWorkItem(item));
       daily.updatedAt = isoNow();
       await atomicWriteJson(paths.daily, daily);
       return { ok: true, message: "Daily context updated.", daily };
@@ -2194,6 +2282,688 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     return result;
   }
 
+  function fingerprintWcFailedArgs(args = {}, code = "NOT_FOUND") {
+    const operation = String(args.operation || "").trim().toLowerCase();
+    const scope = normalizeScope(args.scope);
+    const rawRef = args.reference != null ? args.reference : args.item;
+    const normalizedRef = normalizeWcReference(rawRef);
+    return JSON.stringify({
+      tool: "working_context_items",
+      operation,
+      scope,
+      reference: normalizedRef,
+      atPosition: args.atPosition ?? null,
+      order: args.order ?? null,
+      destinationScope: args.destinationScope ?? null,
+      listScope: resolveWcListScope(operation, args),
+      code: String(code || "NOT_FOUND"),
+    });
+  }
+
+  function applyWcFailedRetryPolicy(args, result) {
+    if (!result || (result.code !== "NOT_FOUND" && result.code !== "AMBIGUOUS_MATCH")) return result;
+    const fp = fingerprintWcFailedArgs(args, result.code);
+    if (wcNotFoundFingerprints.has(fp)) {
+      const message =
+        result.code === "AMBIGUOUS_MATCH"
+          ? "Multiple items matched. This identical request already failed; do not retry it with the same arguments. Ask one concise clarification."
+          : "No matching item was found. This identical request already failed; do not retry it with the same arguments. Report once or ask one concise clarification.";
+      return {
+        ...result,
+        suppressedRetry: true,
+        message,
+        error: message,
+      };
+    }
+    wcNotFoundFingerprints.add(fp);
+    return result;
+  }
+
+  function successWcResult(options) {
+    const { operation, scope, items, dailyUpdatedAt, message, backupId, startedAt, extra } = options;
+    logWorkingContextEvent({
+      scope,
+      operation,
+      ok: true,
+      itemCount: items.length,
+      backupId,
+      durationMs: Date.now() - startedAt,
+    });
+    const today = extra?.today || todayDate();
+    return {
+      ok: true,
+      message,
+      operation,
+      scope,
+      items: canonicalizeItems(items, today),
+      dailyUpdatedAt,
+      backupId,
+      artifact: formatListArtifact(scope, items, today),
+      confirmation: message,
+      ...extra,
+    };
+  }
+
+  function failWcResult(operation, code, message, startedAt, extra = {}) {
+    logWorkingContextEvent({
+      scope: extra.scope,
+      operation,
+      ok: false,
+      code,
+      itemCount: extra.items ? extra.items.length : undefined,
+      durationMs: Date.now() - startedAt,
+    });
+    return {
+      ok: false,
+      code,
+      error: message,
+      message,
+      operation,
+      ...extra,
+    };
+  }
+
+  async function commitWorkingContextDaily(beforeDaily, nextDaily, operation, scope, startedAt, allowedKeys) {
+    const unchanged = assertUnrelatedUnchanged(beforeDaily, nextDaily, { allowedKeys });
+    if (unchanged) {
+      return failWcResult(operation, "VALIDATION_FAILED", unchanged, startedAt, {
+        scope,
+        items: canonicalizeItems(getListForScope(beforeDaily, scope), beforeDaily.date),
+        dailyUpdatedAt: beforeDaily.updatedAt,
+      });
+    }
+    const shapeError = validateDailyShape(nextDaily);
+    if (shapeError) {
+      return failWcResult(operation, "VALIDATION_FAILED", shapeError, startedAt, {
+        scope,
+        items: canonicalizeItems(getListForScope(beforeDaily, scope), beforeDaily.date),
+        dailyUpdatedAt: beforeDaily.updatedAt,
+      });
+    }
+    const wcError = validateWorkingContextDaily(nextDaily);
+    if (wcError) {
+      return failWcResult(operation, "VALIDATION_FAILED", wcError, startedAt, {
+        scope,
+        items: canonicalizeItems(getListForScope(beforeDaily, scope), beforeDaily.date),
+        dailyUpdatedAt: beforeDaily.updatedAt,
+      });
+    }
+
+    let backupId = null;
+    try {
+      const snapshot = await createBackupSnapshot(`working-context-${operation}`);
+      backupId = snapshot.createdAt;
+    } catch (error) {
+      return failWcResult(
+        operation,
+        "BACKUP_FAILED",
+        error instanceof Error ? error.message : "Backup creation failed.",
+        startedAt,
+        {
+          scope,
+          items: canonicalizeItems(getListForScope(beforeDaily, scope), beforeDaily.date),
+          dailyUpdatedAt: beforeDaily.updatedAt,
+        },
+      );
+    }
+
+    nextDaily.updatedAt = isoNow();
+    try {
+      if (typeof options.failAtomicWrite === "function" && options.failAtomicWrite()) {
+        throw new Error("Simulated atomic write failure.");
+      }
+      await atomicWriteJson(paths.daily, nextDaily);
+    } catch (error) {
+      return failWcResult(
+        operation,
+        "WRITE_FAILED",
+        error instanceof Error ? error.message : "Atomic write failed.",
+        startedAt,
+        {
+          scope,
+          items: canonicalizeItems(getListForScope(beforeDaily, scope), beforeDaily.date),
+          dailyUpdatedAt: beforeDaily.updatedAt,
+          backupId,
+        },
+      );
+    }
+
+    let reread;
+    try {
+      if (typeof options.failReread === "function" && options.failReread()) {
+        throw new Error("Simulated reread failure.");
+      }
+      reread = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
+    } catch (error) {
+      return failWcResult(
+        operation,
+        "WRITE_FAILED",
+        error instanceof Error ? error.message : "Reread failed after write.",
+        startedAt,
+        {
+          scope,
+          items: canonicalizeItems(getListForScope(nextDaily, scope), nextDaily.date),
+          dailyUpdatedAt: nextDaily.updatedAt,
+          backupId,
+        },
+      );
+    }
+
+    invalidatePreviews();
+    wcNotFoundFingerprints.clear();
+
+    return successWcResult({
+      operation,
+      scope,
+      items: getListForScope(reread, scope),
+      dailyUpdatedAt: reread.updatedAt,
+      message: `${scopeTitle(scope)} ${operation.replace(/_/g, " ")} completed.`,
+      backupId,
+      startedAt,
+      extra: { daily: reread, today: reread.date },
+    });
+  }
+
+  function storeWcPreview(operation, scope, beforeList, afterList, dailyUpdatedAt, meta = {}) {
+    const token = createPreviewToken();
+    const payload = { operation, scope, beforeList, afterList, dailyUpdatedAt, meta };
+    previewStore.set(token, {
+      expiresAt: Date.now() + PREVIEW_TTL_MS,
+      operation,
+      hash: hashPreviewPayload(payload),
+      beforePriorities: [],
+      afterPriorities: [],
+      beforeList: cloneItems(beforeList),
+      afterList: cloneItems(afterList),
+      afterDaily: meta.afterDaily || null,
+      dailyUpdatedAt,
+      meta: { ...meta, scope, kind: "working_context" },
+    });
+    return token;
+  }
+
+  function readWcPreview(token, operation, dailyUpdatedAt, scope) {
+    const entry = previewStore.get(String(token || ""));
+    if (!entry) return { code: "STALE_PREVIEW" };
+    if (Date.now() > entry.expiresAt) {
+      previewStore.delete(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.operation !== operation) return { code: "STALE_PREVIEW" };
+    if (entry.dailyUpdatedAt !== dailyUpdatedAt) return { code: "STALE_PREVIEW" };
+    if (entry.meta?.kind !== "working_context") return { code: "STALE_PREVIEW" };
+    if (normalizeScope(entry.meta?.scope) !== normalizeScope(scope)) return { code: "STALE_PREVIEW" };
+    return { entry };
+  }
+
+  function buildWcPreviewRequestBinding(args = {}) {
+    const items = Array.isArray(args.items) ? args.items : args.item ? [args.item] : [];
+    return {
+      scope: normalizeScope(args.scope),
+      destinationScope: args.destinationScope != null ? normalizeScope(args.destinationScope) : null,
+      atPosition: args.atPosition != null && args.atPosition !== "" ? Number(args.atPosition) : null,
+      backupId: args.backupId != null && args.backupId !== "" ? String(args.backupId) : null,
+      reference: args.reference != null ? args.reference : null,
+      order: Array.isArray(args.order) ? args.order : null,
+      dueDate: args.dueDate != null ? String(args.dueDate) : args.due != null ? String(args.due) : null,
+      deferredUntil: args.deferredUntil != null ? String(args.deferredUntil) : null,
+      itemTexts: items.map((raw) => String(raw?.text || raw?.name || "").trim()).filter(Boolean),
+    };
+  }
+
+  async function loadValidatedBackupScope(backupId, scope) {
+    const key = scopeKey(scope);
+    const files = await listBackupFiles();
+    let file = null;
+    if (backupId) {
+      file = files.find(
+        (item) =>
+          item.name.includes(String(backupId)) ||
+          item.name === backupId ||
+          item.full.endsWith(String(backupId)),
+      );
+    } else {
+      file = files[0];
+    }
+    if (!file) {
+      return { error: { code: "RESTORE_FAILED", message: "No backup was found to restore." } };
+    }
+    let snapshot;
+    try {
+      snapshot = JSON.parse(await readText(file.full));
+    } catch (error) {
+      return {
+        error: {
+          code: "RESTORE_FAILED",
+          message: error instanceof Error ? error.message : "Backup could not be read.",
+        },
+      };
+    }
+    if (!snapshot || typeof snapshot !== "object" || !snapshot.daily || typeof snapshot.daily !== "object") {
+      return { error: { code: "RESTORE_FAILED", message: "Backup is missing a valid daily snapshot." } };
+    }
+    const restored = (Array.isArray(snapshot.daily[key]) ? snapshot.daily[key] : []).map((item) =>
+      mapWorkingContextItem(item),
+    );
+    const { validateWorkingContextArray } = require("./working-context-lifecycle.cjs");
+    const arrErr = validateWorkingContextArray(restored, scope);
+    if (arrErr) {
+      return {
+        error: {
+          code: "RESTORE_FAILED",
+          message: `Backup ${scope} failed validation: ${arrErr}`,
+        },
+      };
+    }
+    return { file, restored };
+  }
+
+  async function workingContextItems(args = {}) {
+    const startedAt = Date.now();
+    const operation = String(args.operation || "").trim().toLowerCase();
+    if (!operation) {
+      return failWcResult("unknown", "UNSUPPORTED_OPERATION", "operation is required.", startedAt);
+    }
+
+    return enqueue(async () => {
+      const result = await runWorkingContextOperation(args, operation, startedAt);
+      return applyWcFailedRetryPolicy(args, result);
+    });
+  }
+
+  async function runWorkingContextOperation(args, operation, startedAt) {
+    await ensureMemoryUnlocked();
+    await rolloverDailyIfNeeded();
+    const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
+    const scope = normalizeScope(args.scope);
+    if (!scope && operation !== "preview") {
+      return failWcResult(operation, "INVALID_SCOPE", "scope must be commitments, follow_ups, or unresolved_items.", startedAt);
+    }
+
+    if (args.expectedUpdatedAt && args.expectedUpdatedAt !== daily.updatedAt) {
+      return failWcResult(operation, "STALE_WRITE", "Daily context changed since the last read.", startedAt, {
+        scope,
+        items: canonicalizeItems(getListForScope(daily, scope || "commitments"), daily.date),
+        dailyUpdatedAt: daily.updatedAt,
+        artifact: formatListArtifact(scope || "commitments", getListForScope(daily, scope || "commitments"), daily.date),
+      });
+    }
+
+    const helpers = {
+      randomUUID,
+      nowIso: isoNow,
+      recentIds: recentWcIds,
+    };
+
+    if (operation === "list") {
+      const planned = planWorkingContextMutation(args, daily, helpers);
+      if (planned.error) {
+        return failWcResult(operation, planned.error.code, planned.error.message, startedAt, {
+          scope,
+          candidates: planned.error.candidates,
+          items: canonicalizeItems(getListForScope(daily, scope), daily.date),
+          dailyUpdatedAt: daily.updatedAt,
+        });
+      }
+      logWorkingContextEvent({
+        scope,
+        operation,
+        ok: true,
+        itemCount: planned.listed.length,
+        durationMs: Date.now() - startedAt,
+      });
+      return {
+        ok: true,
+        operation,
+        scope,
+        message: `Current ${scopeTitle(scope).toLowerCase()}.`,
+        items: canonicalizeItems(planned.listed, daily.date),
+        dailyUpdatedAt: daily.updatedAt,
+        artifact: formatListArtifact(scope, planned.listed, daily.date),
+        confirmation: `Listed ${scopeTitle(scope).toLowerCase()}.`,
+        filter: resolveWcListScope(operation, args),
+      };
+    }
+
+    if (operation === "preview") {
+      const nestedOp = String(args.previewOperation || args.targetOperation || "").trim().toLowerCase();
+      if (!nestedOp) {
+        return failWcResult(operation, "UNSUPPORTED_OPERATION", "preview requires previewOperation.", startedAt, {
+          scope,
+        });
+      }
+      return workingContextPreviewPlan(
+        { ...args, operation: nestedOp, confirmed: false, _previewOnly: true },
+        daily,
+        startedAt,
+        helpers,
+      );
+    }
+
+    const plannedForGate = planWorkingContextMutation(args, daily, helpers);
+    const needsConfirm =
+      DESTRUCTIVE_WC_OPERATIONS.has(operation) ||
+      (operation === "promote_to_priority" && plannedForGate.meta?.bulk === true);
+
+    if (plannedForGate.error && !needsConfirm) {
+      return failWcResult(operation, plannedForGate.error.code, plannedForGate.error.message, startedAt, {
+        scope,
+        candidates: plannedForGate.error.candidates,
+        items: canonicalizeItems(getListForScope(daily, scope), daily.date),
+        dailyUpdatedAt: daily.updatedAt,
+      });
+    }
+
+    if (needsConfirm) {
+      if (args.confirmed !== true || !args.previewToken) {
+        const planned = await workingContextPreviewPlan(
+          { ...args, _previewOnly: true },
+          daily,
+          startedAt,
+          helpers,
+        );
+        if (planned.ok === false && planned.code !== "CONFIRMATION_REQUIRED") return planned;
+        return {
+          ok: false,
+          code: "CONFIRMATION_REQUIRED",
+          requiresConfirmation: true,
+          message: planned.message || `Confirmation required before ${operation.replace(/_/g, " ")}.`,
+          operation,
+          scope,
+          previewToken: planned.previewToken,
+          before: planned.before,
+          after: planned.after,
+          items: canonicalizeItems(getListForScope(daily, scope), daily.date),
+          dailyUpdatedAt: daily.updatedAt,
+          artifact: planned.artifact,
+          destinationScope: planned.destinationScope,
+          selected: planned.selected,
+        };
+      }
+
+      if (args.confirmed === true && args.previewToken) {
+        const preview = readWcPreview(args.previewToken, operation, daily.updatedAt, scope);
+        if (preview.code) {
+          return failWcResult(operation, "STALE_PREVIEW", "Working-context preview is stale or invalid.", startedAt, {
+            scope,
+            items: canonicalizeItems(getListForScope(daily, scope), daily.date),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+        const conflict = confirmationConflictsWithWcPreview(args, preview.entry);
+        if (conflict) {
+          return failWcResult(operation, "STALE_PREVIEW", conflict, startedAt, {
+            scope,
+            items: canonicalizeItems(getListForScope(daily, scope), daily.date),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+        const afterDaily = preview.entry.afterDaily || preview.entry.meta?.afterDaily;
+        if (!afterDaily) {
+          return failWcResult(operation, "STALE_PREVIEW", "Preview is missing a stored plan.", startedAt, {
+            scope,
+            items: canonicalizeItems(getListForScope(daily, scope), daily.date),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+        const allowedKeys = preview.entry.meta?.allowedKeys || [scopeKey(scope)];
+        const result = await commitWorkingContextDaily(
+          daily,
+          afterDaily,
+          operation,
+          scope,
+          startedAt,
+          allowedKeys,
+        );
+        if (result.ok) {
+          if (preview.entry.meta?.touchedIds?.[0]) {
+            recentWcIds[scope] = preview.entry.meta.touchedIds[0];
+          }
+          if (operation === "promote_to_priority" && preview.entry.meta?.promoted?.[0]?.priority?.id) {
+            recentPriorityId = preview.entry.meta.promoted[0].priority.id;
+            result.priorities = canonicalizePriorities(afterDaily.priorities || []);
+            result.linked = preview.entry.meta.promoted.map((row) => ({
+              sourceId: row.source.id,
+              priorityId: row.priority.id,
+            }));
+          }
+          if (operation === "convert") {
+            const destinationScope =
+              preview.entry.meta?.destinationScope || preview.entry.destinationScope || null;
+            if (destinationScope) {
+              result.destinationScope = destinationScope;
+              result.destinationItems = canonicalizeItems(
+                getListForScope(result.daily || afterDaily, destinationScope),
+                daily.date,
+              );
+            }
+          }
+        }
+        return result;
+      }
+    }
+
+    return applyWorkingContextOperation(args, daily, startedAt, helpers);
+  }
+
+  function confirmationConflictsWithWcPreview(args, entry) {
+    const bound = entry?.meta?.request;
+    if (!bound) return null;
+    if (normalizeScope(args.scope) !== normalizeScope(bound.scope)) {
+      return "Confirmation scope does not match the preview.";
+    }
+    if (args.destinationScope != null && bound.destinationScope != null) {
+      if (normalizeScope(args.destinationScope) !== normalizeScope(bound.destinationScope)) {
+        return "Confirmation destinationScope does not match the preview.";
+      }
+    }
+    if (args.dueDate != null && bound.dueDate != null && String(args.dueDate) !== String(bound.dueDate)) {
+      return "Confirmation dueDate does not match the preview.";
+    }
+    if (
+      args.deferredUntil != null &&
+      bound.deferredUntil != null &&
+      String(args.deferredUntil) !== String(bound.deferredUntil)
+    ) {
+      return "Confirmation deferredUntil does not match the preview.";
+    }
+    if (args.backupId != null && args.backupId !== "" && bound.backupId != null) {
+      if (String(args.backupId) !== String(bound.backupId)) {
+        return "Confirmation backupId does not match the preview.";
+      }
+    }
+    if (args.reference != null && bound.reference != null) {
+      if (JSON.stringify(args.reference) !== JSON.stringify(bound.reference)) {
+        return "Confirmation reference does not match the preview.";
+      }
+    }
+    if (Array.isArray(args.order) && Array.isArray(bound.order)) {
+      if (JSON.stringify(args.order) !== JSON.stringify(bound.order)) {
+        return "Confirmation order does not match the preview.";
+      }
+    }
+    if (Array.isArray(bound.itemTexts) && bound.itemTexts.length) {
+      const items = Array.isArray(args.items) ? args.items : args.item ? [args.item] : [];
+      const confirmTexts = items.map((raw) => String(raw?.text || raw?.name || "").trim()).filter(Boolean);
+      if (JSON.stringify(confirmTexts) !== JSON.stringify(bound.itemTexts)) {
+        return "Confirmation items do not match the preview.";
+      }
+    }
+    if (entry.meta?.conversion && args.destinationScope != null) {
+      const expected = `${normalizeScope(args.scope)}->${normalizeScope(args.destinationScope)}`;
+      if (String(entry.meta.conversion) !== expected) {
+        return "Confirmation conversion does not match the preview.";
+      }
+    }
+    return null;
+  }
+
+  async function workingContextPreviewPlan(args, daily, startedAt, helpers) {
+    const operation = String(args.operation || "").trim().toLowerCase();
+    const scope = normalizeScope(args.scope);
+    if (!scope) {
+      return failWcResult(operation, "INVALID_SCOPE", "scope must be commitments, follow_ups, or unresolved_items.", startedAt);
+    }
+
+    if (operation === "restore_backup") {
+      const loaded = await loadValidatedBackupScope(args.backupId, scope);
+      if (loaded.error) {
+        return failWcResult(operation, loaded.error.code, loaded.error.message, startedAt, {
+          scope,
+          items: canonicalizeItems(getListForScope(daily, scope), daily.date),
+          dailyUpdatedAt: daily.updatedAt,
+        });
+      }
+      const beforeList = cloneItems(getListForScope(daily, scope));
+      const afterList = loaded.restored;
+      const afterDaily = setListForScope(daily, scope, afterList);
+      const request = buildWcPreviewRequestBinding(args);
+      const token = storeWcPreview(operation, scope, beforeList, afterList, daily.updatedAt, {
+        allowedKeys: [scopeKey(scope)],
+        afterDaily,
+        backupFile: loaded.file.name,
+        request,
+      });
+      return {
+        ok: true,
+        operation: "preview",
+        previewOperation: operation,
+        scope,
+        message: `Preview ready for restore of ${scopeTitle(scope).toLowerCase()} from ${loaded.file.name}. Confirm to apply.`,
+        previewToken: token,
+        before: canonicalizeItems(beforeList, daily.date),
+        after: canonicalizeItems(afterList, daily.date),
+        items: canonicalizeItems(beforeList, daily.date),
+        dailyUpdatedAt: daily.updatedAt,
+        artifact: formatPreviewArtifact({
+          scope,
+          operation,
+          before: beforeList,
+          after: afterList,
+          today: daily.date,
+        }),
+        requiresConfirmation: true,
+      };
+    }
+
+    const planned = planWorkingContextMutation(args, daily, helpers);
+    if (planned.error) {
+      return failWcResult(operation, planned.error.code, planned.error.message, startedAt, {
+        scope,
+        candidates: planned.error.candidates,
+        items: canonicalizeItems(getListForScope(daily, scope), daily.date),
+        dailyUpdatedAt: daily.updatedAt,
+      });
+    }
+
+    const beforeList = planned.beforeList || cloneItems(getListForScope(daily, scope));
+    const afterList = planned.afterList || cloneItems(getListForScope(planned.nextDaily, scope));
+    const request = buildWcPreviewRequestBinding(args);
+    const token = storeWcPreview(operation, scope, beforeList, afterList, daily.updatedAt, {
+      ...planned.meta,
+      afterDaily: planned.nextDaily,
+      destinationScope: planned.destinationScope,
+      request,
+    });
+    const destructive = requiresConfirmation(operation, planned);
+    return {
+      ok: true,
+      operation: args._previewOnly ? operation : "preview",
+      previewOperation: operation,
+      scope,
+      destinationScope: planned.destinationScope,
+      message: destructive
+        ? `Preview ready for ${operation.replace(/_/g, " ")}. Confirm to apply.`
+        : `Dry-run only for ${operation.replace(/_/g, " ")}.`,
+      previewToken: token,
+      before: canonicalizeItems(beforeList, daily.date),
+      after: canonicalizeItems(afterList, daily.date),
+      selected: (planned.meta?.selected || []).map((item) => ({
+        id: item.id,
+        text: item.text,
+        status: item.status,
+      })),
+      items: canonicalizeItems(beforeList, daily.date),
+      dailyUpdatedAt: daily.updatedAt,
+      artifact: formatPreviewArtifact({
+        scope,
+        operation,
+        before: beforeList,
+        after: afterList,
+        destinationScope: planned.destinationScope,
+        selected: planned.meta?.selected,
+        today: daily.date,
+      }),
+      requiresConfirmation: destructive,
+    };
+  }
+
+  async function applyWorkingContextOperation(args, daily, startedAt, helpers) {
+    const operation = String(args.operation || "").trim().toLowerCase();
+    const scope = normalizeScope(args.scope);
+
+    const planned = planWorkingContextMutation(args, daily, helpers);
+    if (planned.error) {
+      return failWcResult(operation, planned.error.code, planned.error.message, startedAt, {
+        scope,
+        candidates: planned.error.candidates,
+        items: canonicalizeItems(getListForScope(daily, scope), daily.date),
+        dailyUpdatedAt: daily.updatedAt,
+      });
+    }
+
+    if (planned.meta?.noop) {
+      return successWcResult({
+        operation,
+        scope,
+        items: getListForScope(daily, scope),
+        dailyUpdatedAt: daily.updatedAt,
+        message: `${scopeTitle(scope)} already ${operation === "complete" ? "completed" : "updated"}.`,
+        backupId: null,
+        startedAt,
+        extra: { today: daily.date, noop: true },
+      });
+    }
+
+    if (planned.meta?.restore) {
+      return failWcResult(operation, "CONFIRMATION_REQUIRED", "Confirmation required before restore.", startedAt, {
+        scope,
+      });
+    }
+
+    const result = await commitWorkingContextDaily(
+      daily,
+      planned.nextDaily,
+      operation,
+      scope,
+      startedAt,
+      planned.meta?.allowedKeys || [scopeKey(scope)],
+    );
+    if (result.ok) {
+      if (planned.meta?.touchedIds?.[0]) recentWcIds[scope] = planned.meta.touchedIds[0];
+      else if (operation === "add" || operation === "insert") {
+        const items = result.items || [];
+        recentWcIds[scope] = items[items.length - 1]?.id || recentWcIds[scope];
+      }
+      if (operation === "promote_to_priority" && planned.meta?.promoted?.[0]?.priority?.id) {
+        recentPriorityId = planned.meta.promoted[0].priority.id;
+        result.priorities = canonicalizePriorities(planned.nextDaily.priorities);
+        result.linked = planned.meta.promoted.map((row) => ({
+          sourceId: row.source.id,
+          priorityId: row.priority.id,
+        }));
+      }
+      if (operation === "convert" && planned.destinationScope) {
+        result.destinationScope = planned.destinationScope;
+        result.destinationItems = canonicalizeItems(
+          getListForScope(result.daily || planned.nextDaily, planned.destinationScope),
+          daily.date,
+        );
+      }
+    }
+    return result;
+  }
+
   return {
     SCHEMA_VERSION,
     PERSONAL_CONTEXT_SOFT_CAP,
@@ -2211,6 +2981,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     memoryCorrect,
     memoryUpdateDaily,
     memoryPriorities,
+    workingContextItems,
     memorySetPreference,
     memorySetInstructions,
     memoryClear,
@@ -2234,8 +3005,16 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       setRecentPriorityId: (id) => {
         recentPriorityId = id;
       },
+      getRecentWcId: (scope) => recentWcIds[normalizeScope(scope)] || null,
+      setRecentWcId: (scope, id) => {
+        const key = normalizeScope(scope);
+        if (key) recentWcIds[key] = id;
+      },
       clearPreviews: () => invalidatePreviews(),
-      clearNotFoundFingerprints: () => notFoundFingerprints.clear(),
+      clearNotFoundFingerprints: () => {
+        notFoundFingerprints.clear();
+        wcNotFoundFingerprints.clear();
+      },
       getPreviewEntry: (token) => previewStore.get(String(token || "")) || null,
     },
   };
@@ -2252,4 +3031,5 @@ module.exports = {
   planBroadPriorityAnswer,
   createMemoryStore,
   priorityLifecycle: require("./priority-lifecycle.cjs"),
+  workingContextLifecycle: require("./working-context-lifecycle.cjs"),
 };
