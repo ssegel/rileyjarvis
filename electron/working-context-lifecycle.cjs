@@ -321,6 +321,8 @@ function setListForScope(daily, scope, list) {
 function defaultListScopeForOperation(operation) {
   const op = String(operation || "").trim().toLowerCase();
   if (op === "reopen") return "done";
+  if (op === "clear_defer") return "deferred";
+  if (op === "promote_to_priority") return "open_including_deferred";
   if (op === "complete") return "open";
   return "open";
 }
@@ -331,6 +333,7 @@ function resolveListScope(operation, args = {}) {
     requested === "all" ||
     requested === "done" ||
     requested === "open" ||
+    requested === "open_including_deferred" ||
     requested === "overdue" ||
     requested === "due_today" ||
     requested === "due_tomorrow" ||
@@ -354,6 +357,8 @@ function matchesFilter(item, filter, today) {
       return isDoneWcStatus(item.status);
     case "open":
       return isOpenWcStatus(item.status) && !deferred;
+    case "open_including_deferred":
+      return isOpenWcStatus(item.status);
     case "deferred":
       return deferred;
     case "overdue":
@@ -591,7 +596,61 @@ function resolveWorkingContextReference(items, reference, options = {}) {
     }
   }
 
+  // Significant-token overlap: shared meaningful tokens across multiple items → ambiguous
+  // (e.g. "Phase 14 item" vs two "Phase 14 …" commitments). Generic words like "item" are ignored.
+  const tokenMatches = matchBySignificantTokens(pool, needle);
+  if (tokenMatches.length === 1) return tokenMatches[0];
+  if (tokenMatches.length > 1) {
+    return {
+      code: "AMBIGUOUS_MATCH",
+      candidates: tokenMatches.map(({ item, fullIndex }) => candidatePayload(item, fullIndex, today)),
+    };
+  }
+
   return { code: "NOT_FOUND", candidates: [] };
+}
+
+const WC_REFERENCE_STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "at",
+  "by",
+  "for",
+  "from",
+  "in",
+  "into",
+  "item",
+  "items",
+  "my",
+  "of",
+  "on",
+  "or",
+  "the",
+  "this",
+  "that",
+  "these",
+  "those",
+  "to",
+  "with",
+  "your",
+]);
+
+function significantReferenceTokens(text) {
+  const raw = String(text || "")
+    .toLowerCase()
+    .match(/[a-z0-9]+/g);
+  if (!raw || !raw.length) return [];
+  return raw.filter((token) => token.length > 0 && !WC_REFERENCE_STOPWORDS.has(token));
+}
+
+function matchBySignificantTokens(pool, needle) {
+  const queryTokens = significantReferenceTokens(needle);
+  if (!queryTokens.length) return [];
+  return pool.filter(({ item }) => {
+    const itemTokens = new Set(significantReferenceTokens(item.text));
+    return queryTokens.every((token) => itemTokens.has(token));
+  });
 }
 
 function validateWorkingContextArray(items, label) {

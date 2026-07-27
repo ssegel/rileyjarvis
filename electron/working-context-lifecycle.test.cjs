@@ -436,6 +436,89 @@ test("conversions preserve id and require confirmation", async () => {
   });
 });
 
+test("clear_defer and promote resolve deferred commitments without explicit listScope", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    const added = await store.workingContextItems({
+      operation: "add",
+      scope: "commitments",
+      item: { text: "Archive the Phase 14 validation notes" },
+    });
+    assert.equal(added.ok, true);
+    const commitmentId = added.items[0].id;
+
+    const deferred = await store.workingContextItems({
+      operation: "defer",
+      scope: "commitments",
+      reference: { by: "text", value: "Archive the Phase 14 validation notes" },
+      deferredUntil: "2026-07-28",
+    });
+    assert.equal(deferred.ok, true);
+    assert.equal(deferred.items.find((item) => item.id === commitmentId)?.deferredUntil, "2026-07-28");
+
+    const openAfterDefer = await store.workingContextItems({
+      operation: "list",
+      scope: "commitments",
+    });
+    assert.equal(texts(openAfterDefer).includes("Archive the Phase 14 validation notes"), false);
+
+    const cleared = await store.workingContextItems({
+      operation: "clear_defer",
+      scope: "commitments",
+      reference: { by: "text", value: "Archive the Phase 14 validation notes" },
+    });
+    assert.equal(cleared.ok, true);
+    assert.equal(cleared.code, undefined);
+    const clearedItem = cleared.items.find((item) => item.id === commitmentId);
+    assert.ok(clearedItem);
+    assert.equal(clearedItem.deferredUntil, null);
+
+    const afterClear = await store.loadAll();
+    const persistedCleared = afterClear.daily.commitments.find((item) => item.id === commitmentId);
+    assert.ok(persistedCleared);
+    assert.equal(persistedCleared.deferredUntil == null, true);
+
+    const deferredAgain = await store.workingContextItems({
+      operation: "defer",
+      scope: "commitments",
+      reference: { by: "text", value: "Archive the Phase 14 validation notes" },
+      deferredUntil: "2026-07-29",
+    });
+    assert.equal(deferredAgain.ok, true);
+    assert.equal(
+      deferredAgain.items.find((item) => item.id === commitmentId)?.deferredUntil,
+      "2026-07-29",
+    );
+
+    const promoted = await store.workingContextItems({
+      operation: "promote_to_priority",
+      scope: "commitments",
+      reference: { by: "text", value: "Archive the Phase 14 validation notes" },
+    });
+    assert.equal(promoted.ok, true);
+    assert.equal(promoted.code, undefined);
+    const promotedSource = promoted.items.find((item) => item.id === commitmentId);
+    assert.ok(promotedSource);
+    assert.equal(promotedSource.status, "open");
+    assert.equal(promotedSource.deferredUntil, "2026-07-29");
+    assert.ok(promotedSource.linkedPriorityId);
+    assert.ok(promoted.linked?.[0]?.priorityId);
+    assert.equal(promoted.linked[0].priorityId, promotedSource.linkedPriorityId);
+
+    const daily = await store.loadAll();
+    const persistedSource = daily.daily.commitments.find((item) => item.id === commitmentId);
+    assert.ok(persistedSource);
+    assert.equal(persistedSource.linkedPriorityId, promotedSource.linkedPriorityId);
+    assert.equal(persistedSource.deferredUntil, "2026-07-29");
+    const priority = daily.daily.priorities.find((item) => item.id === promotedSource.linkedPriorityId);
+    assert.ok(priority);
+    assert.equal(priority.text, "Archive the Phase 14 validation notes");
+    assert.equal(priority.status, "open");
+    assert.equal(priority.sourceScope, "commitments");
+    assert.equal(priority.sourceId, commitmentId);
+  });
+});
+
 test("promote_to_priority linkage and no auto-complete either side", async () => {
   await withStore(async (store) => {
     await store.ensureMemory();
@@ -730,6 +813,107 @@ test("memory_update_daily lifecycle arrays rejected", async () => {
   });
 });
 
+test("shared Phase 14 phrase is AMBIGUOUS_MATCH; specific summary phrase completes only summary", async () => {
+  await withStore(async (store) => {
+    await store.ensureMemory();
+    await store.workingContextItems({
+      operation: "add",
+      scope: "commitments",
+      items: [
+        { text: "Archive the Phase 14 validation notes" },
+        { text: "Send the Phase 14 validation summary", due: "2026-07-31" },
+      ],
+    });
+
+    const promoted = await store.workingContextItems({
+      operation: "promote_to_priority",
+      scope: "commitments",
+      reference: { by: "text", value: "validation notes" },
+    });
+    assert.equal(promoted.ok, true);
+    const archiveId = promoted.items.find((item) => /validation notes/.test(item.text)).id;
+    const linkedPriorityId = promoted.items.find((item) => item.id === archiveId).linkedPriorityId;
+    assert.ok(linkedPriorityId);
+
+    const before = await store.loadAll();
+    const beforeArchive = before.daily.commitments.find((item) => item.id === archiveId);
+    const beforeSummary = before.daily.commitments.find((item) => /validation summary/.test(item.text));
+    assert.equal(beforeArchive.status, "open");
+    assert.equal(beforeArchive.linkedPriorityId, linkedPriorityId);
+    assert.equal(beforeSummary.status, "open");
+    const beforeUpdatedAt = before.daily.updatedAt;
+
+    const ambiguousPhrase = await store.workingContextItems({
+      operation: "complete",
+      scope: "commitments",
+      reference: { by: "text", value: "Phase 14" },
+    });
+    assert.equal(ambiguousPhrase.ok, false);
+    assert.equal(ambiguousPhrase.code, "AMBIGUOUS_MATCH");
+    assert.equal(ambiguousPhrase.candidates.length, 2);
+    assert.deepEqual(
+      ambiguousPhrase.candidates.map((row) => row.text).sort(),
+      ["Archive the Phase 14 validation notes", "Send the Phase 14 validation summary"].sort(),
+    );
+
+    const afterAmbiguous = await store.loadAll();
+    assert.equal(afterAmbiguous.daily.updatedAt, beforeUpdatedAt);
+    assert.equal(
+      afterAmbiguous.daily.commitments.find((item) => item.id === archiveId).status,
+      "open",
+    );
+    assert.equal(
+      afterAmbiguous.daily.commitments.find((item) => item.id === beforeSummary.id).status,
+      "open",
+    );
+
+    const ambiguousItem = await store.workingContextItems({
+      operation: "complete",
+      scope: "commitments",
+      reference: { by: "text", value: "Phase 14 item" },
+    });
+    assert.equal(ambiguousItem.ok, false);
+    assert.equal(ambiguousItem.code, "AMBIGUOUS_MATCH");
+    assert.equal(ambiguousItem.candidates.length, 2);
+    assert.ok(
+      ambiguousItem.candidates.some((row) => row.text === "Archive the Phase 14 validation notes"),
+    );
+    assert.ok(
+      ambiguousItem.candidates.some((row) => row.text === "Send the Phase 14 validation summary"),
+    );
+
+    const afterItemPhrase = await store.loadAll();
+    assert.equal(afterItemPhrase.daily.updatedAt, beforeUpdatedAt);
+    assert.equal(afterItemPhrase.daily.commitments.find((item) => item.id === archiveId).status, "open");
+    assert.equal(
+      afterItemPhrase.daily.commitments.find((item) => item.id === beforeSummary.id).status,
+      "open",
+    );
+    assert.equal(
+      afterItemPhrase.daily.commitments.find((item) => item.id === archiveId).linkedPriorityId,
+      linkedPriorityId,
+    );
+    assert.deepEqual(
+      afterItemPhrase.daily.commitments.find((item) => item.id === archiveId),
+      beforeArchive,
+    );
+
+    const completed = await store.workingContextItems({
+      operation: "complete",
+      scope: "commitments",
+      reference: { by: "text", value: "validation summary" },
+    });
+    assert.equal(completed.ok, true);
+    const summaryAfter = completed.items.find((item) => item.id === beforeSummary.id);
+    const archiveAfter = completed.items.find((item) => item.id === archiveId);
+    assert.equal(summaryAfter.status, "done");
+    assert.ok(summaryAfter.completedAt);
+    assert.equal(archiveAfter.status, "open");
+    assert.equal(archiveAfter.linkedPriorityId, linkedPriorityId);
+    assert.equal(archiveAfter.text, "Archive the Phase 14 validation notes");
+  });
+});
+
 test("text and voice share identical working_context_items schema and handler", () => {
   const main = fs.readFileSync(path.join(root, "electron/main.cjs"), "utf8");
   const textSession = fs.readFileSync(path.join(root, "electron/text-session.cjs"), "utf8");
@@ -741,6 +925,8 @@ test("text and voice share identical working_context_items schema and handler", 
   assert.match(textSession, /mapToolsForResponses\(toolSpecs\)|getToolSpecs/);
   assert.match(main, /Use working_context_items for every commitment/);
   assert.match(main, /List overdue commitments/);
+  assert.match(main, /Never invent or expand Sarah's reference wording/);
+  assert.match(main, /Never claim a working-context or priority mutation succeeded unless the tool result has ok:true/);
 });
 
 test("legacy items without createdAt remain valid on read", async () => {

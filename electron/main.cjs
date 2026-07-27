@@ -30,9 +30,11 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 - Use memory_priorities for every daily-priority lifecycle request: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry, restore backup, and preview.
 - Use working_context_items for every commitment, follow-up, and unresolved-item lifecycle request: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, defer, clear defer, set/clear due date, convert, promote to priority, restore backup, and preview.
 - Never ask Sarah for internal IDs. Resolve by ordinal, exact wording, distinctive phrase, person/project/due qualifier, or the recently changed item.
+- Never invent or expand Sarah's reference wording to force a unique match. Pass the phrase she actually supplied (or its shared meaningful tokens). If several open items share that phrase, the tool returns AMBIGUOUS_MATCH — ask one concise clarification and do not write. Do not pick one candidate by guessing a narrower phrase.
 - Never use memory_update_daily.priorities for add, edit, complete, reopen, remove, reorder, replace, clear, carry, or restore.
 - Never use memory_update_daily.commitments, followUps, or unresolved — use working_context_items instead.
 - On AMBIGUOUS_MATCH, ask one concise clarification and do not write.
+- Never claim a working-context or priority mutation succeeded unless the tool result has ok:true for that write.
 - complete targets an open priority (status open, blocked, or active). reopen targets a completed priority (status done).
 - For working_context_items: complete prefers open/blocked; reopen prefers done. Default open lists exclude future-deferred items.
 - For add, insert, edit, complete, reopen, simple reorder, defer, clear_defer, set_due_date, clear_due_date, and single promote_to_priority: call working_context_items once and execute immediately.
@@ -325,7 +327,7 @@ const toolSpecs = [
     type: "function",
     name: "working_context_items",
     description:
-      "Manage commitments, follow-ups, and unresolved items with deterministic reference resolution. Required scope: commitments | follow_ups | unresolved_items. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, defer, clear_defer, set_due_date, clear_due_date, convert, promote_to_priority, restore_backup, preview. Never ask for UUIDs. Execute add/insert/edit/complete/reopen/reorder/defer/clear_defer/set_due_date/clear_due_date/single promote directly. Require preview then confirmed=true+previewToken for remove/replace/clear_completed/convert/restore_backup/bulk promote. Convert is a same-ID move. Promote creates a linked daily priority and keeps the source. On NOT_FOUND/AMBIGUOUS_MATCH do not retry identical arguments.",
+      "Manage commitments, follow-ups, and unresolved items with deterministic reference resolution. Required scope: commitments | follow_ups | unresolved_items. Operations: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear_completed, defer, clear_defer, set_due_date, clear_due_date, convert, promote_to_priority, restore_backup, preview. Never ask for UUIDs. Pass Sarah's reference phrase as supplied — do not invent a narrower phrase to force a unique match. Execute add/insert/edit/complete/reopen/reorder/defer/clear_defer/set_due_date/clear_due_date/single promote directly. Require preview then confirmed=true+previewToken for remove/replace/clear_completed/convert/restore_backup/bulk promote. Convert is a same-ID move. Promote creates a linked daily priority and keeps the source. On NOT_FOUND/AMBIGUOUS_MATCH do not retry identical arguments; on AMBIGUOUS_MATCH ask one clarification and do not write. Only report success when ok:true.",
     parameters: {
       type: "object",
       properties: {
