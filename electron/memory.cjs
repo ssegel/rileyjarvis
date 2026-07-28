@@ -52,6 +52,14 @@ const {
   planActiveProjectsMutation,
   logActiveProjectsEvent,
 } = require("./active-projects-lifecycle.cjs");
+const {
+  composeDayBriefing,
+  buildBriefingArtifact,
+  resolveBriefTarget,
+  parseArchiveFilenameDate,
+  sortArchiveDatesDescending,
+  logDayBriefingEvent,
+} = require("./day-briefing.cjs");
 
 const SCHEMA_VERSION = 1;
 const MAX_BACKUPS = 10;
@@ -3353,6 +3361,210 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     return result;
   }
 
+  function failDayBriefingResult(operation, code, message, startedAt, extra = {}) {
+    logDayBriefingEvent({
+      operation,
+      ok: false,
+      code,
+      targetDate: extra.targetDate,
+      source: extra.source,
+      durationMs: Date.now() - startedAt,
+    });
+    return {
+      ok: false,
+      operation,
+      code,
+      message,
+      error: message,
+      ...extra,
+    };
+  }
+
+  async function listValidArchiveDates() {
+    let names;
+    try {
+      names = await fsApi.readdir(paths.archive);
+    } catch {
+      return [];
+    }
+    const dates = [];
+    for (const name of names) {
+      const date = parseArchiveFilenameDate(name);
+      if (!date) continue;
+      const full = path.join(paths.archive, name);
+      try {
+        const raw = JSON.parse(await readText(full));
+        const daily = normalizeDaily(raw, date);
+        if (daily.date !== date) continue;
+        dates.push(date);
+      } catch {
+        // Malformed archive: omit from list; do not fail the whole list.
+      }
+    }
+    return sortArchiveDatesDescending(dates);
+  }
+
+  async function readArchiveDailyForBrief(resolvedDate) {
+    const archivePath = path.join(paths.archive, `daily-${resolvedDate}.json`);
+    if (!(await pathExists(archivePath))) {
+      return {
+        error: {
+          code: "ARCHIVE_NOT_FOUND",
+          message: `No archive found for ${resolvedDate}.`,
+        },
+      };
+    }
+    let raw;
+    try {
+      raw = JSON.parse(await readText(archivePath));
+    } catch {
+      return {
+        error: {
+          code: "ARCHIVE_MALFORMED",
+          message: `Archive for ${resolvedDate} is unreadable or invalid.`,
+        },
+      };
+    }
+    const daily = normalizeDaily(raw, resolvedDate);
+    if (daily.date !== resolvedDate) {
+      return {
+        error: {
+          code: "ARCHIVE_MALFORMED",
+          message: `Archive for ${resolvedDate} has a mismatched date field.`,
+        },
+      };
+    }
+    return { daily };
+  }
+
+  async function memoryDayBriefing(args = {}) {
+    const startedAt = Date.now();
+    const operation = String(args.operation || "").trim().toLowerCase();
+    if (!operation) {
+      return failDayBriefingResult(
+        "unknown",
+        "UNSUPPORTED_OPERATION",
+        "operation is required.",
+        startedAt,
+      );
+    }
+    if (operation !== "brief" && operation !== "list_archives") {
+      return failDayBriefingResult(
+        operation,
+        "UNSUPPORTED_OPERATION",
+        `Unsupported operation: ${operation}.`,
+        startedAt,
+      );
+    }
+
+    return enqueue(async () => {
+      await ensureMemoryUnlocked();
+      await rolloverDailyIfNeeded();
+      const calendarToday = todayDate();
+
+      if (operation === "list_archives") {
+        const dates = await listValidArchiveDates();
+        const message =
+          dates.length === 0 ? "No archived days found." : `Found ${dates.length} archived day(s).`;
+        const artifact =
+          dates.length === 0
+            ? {
+                title: "Archived days",
+                kind: "text",
+                content: "# Archived days\n\nNo archived days found.",
+              }
+            : {
+                title: "Archived days",
+                kind: "text",
+                content: `# Archived days\n\n${dates.map((d) => `- ${d}`).join("\n")}`,
+              };
+        logDayBriefingEvent({
+          operation,
+          ok: true,
+          count: dates.length,
+          durationMs: Date.now() - startedAt,
+        });
+        return {
+          ok: true,
+          operation,
+          dates,
+          count: dates.length,
+          message,
+          artifact,
+        };
+      }
+
+      // operation === "brief"
+      const resolved = resolveBriefTarget(args.targetDate, calendarToday);
+      if (!resolved.ok) {
+        return failDayBriefingResult(operation, resolved.code, resolved.message, startedAt, {
+          targetDate: args.targetDate != null ? String(args.targetDate) : undefined,
+        });
+      }
+
+      let daily;
+      let source = resolved.source;
+      if (source === "today") {
+        try {
+          daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
+        } catch {
+          return failDayBriefingResult(
+            operation,
+            "READ_FAILED",
+            "Failed to read today's daily memory.",
+            startedAt,
+            { targetDate: resolved.resolvedDate, source },
+          );
+        }
+        if (daily.date !== calendarToday) {
+          return failDayBriefingResult(
+            operation,
+            "READ_FAILED",
+            "Today's daily memory date did not match the calendar after ensure/rollover.",
+            startedAt,
+            { targetDate: resolved.resolvedDate, source },
+          );
+        }
+      } else {
+        const loaded = await readArchiveDailyForBrief(resolved.resolvedDate);
+        if (loaded.error) {
+          return failDayBriefingResult(operation, loaded.error.code, loaded.error.message, startedAt, {
+            targetDate: resolved.resolvedDate,
+            source,
+          });
+        }
+        daily = loaded.daily;
+      }
+
+      const composed = composeDayBriefing(daily);
+      const artifact = buildBriefingArtifact(composed.dailyDate, source, composed);
+      const message =
+        source === "today"
+          ? `Day briefing for today (${composed.dailyDate}).`
+          : `Day briefing for archived day ${composed.dailyDate}.`;
+
+      logDayBriefingEvent({
+        operation,
+        ok: true,
+        targetDate: resolved.resolvedDate,
+        source,
+        counts: composed.counts,
+        durationMs: Date.now() - startedAt,
+      });
+
+      return {
+        ok: true,
+        operation,
+        targetDate: resolved.resolvedDate,
+        source,
+        dailyDate: composed.dailyDate,
+        counts: composed.counts,
+        message,
+        artifact,
+      };
+    });
+  }
+
   async function memoryActiveProjects(args = {}) {
     const startedAt = Date.now();
     const operation = String(args.operation || "").trim().toLowerCase();
@@ -3629,6 +3841,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     memoryPriorities,
     workingContextItems,
     memoryActiveProjects,
+    memoryDayBriefing,
     memorySetPreference,
     memorySetInstructions,
     memoryClear,
@@ -3684,4 +3897,5 @@ module.exports = {
   priorityLifecycle: require("./priority-lifecycle.cjs"),
   workingContextLifecycle: require("./working-context-lifecycle.cjs"),
   activeProjectsLifecycle: require("./active-projects-lifecycle.cjs"),
+  dayBriefing: require("./day-briefing.cjs"),
 };

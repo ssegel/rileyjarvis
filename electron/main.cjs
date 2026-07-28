@@ -26,10 +26,23 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 # Personal Memory
 - Durable personal instructions, preferences, profile facts, daily working context, and memory entries live in local files under data/memory/.
 - Temporary conversation history is session-only and is not persisted as durable memory.
-- Use memory_view, memory_remember, memory_correct, memory_update_daily, memory_priorities, working_context_items, memory_active_projects, memory_set_preference, memory_set_instructions, and memory_clear to manage personal context.
+- Use memory_view, memory_remember, memory_correct, memory_update_daily, memory_priorities, working_context_items, memory_active_projects, memory_day_briefing, memory_set_preference, memory_set_instructions, and memory_clear to manage personal context.
 - Use memory_priorities for every daily-priority lifecycle request: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry, restore backup, and preview.
 - Use working_context_items for every commitment, follow-up, and unresolved-item lifecycle request: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, defer, clear defer, set/clear due date, convert, promote to priority, restore backup, and preview.
 - Use memory_active_projects for every active-project lifecycle request: list, add, insert, edit, remove, reorder, replace, restore backup, and preview.
+- Use memory_day_briefing for executive day briefings and archived-day listing. Operations: brief, list_archives. Compose content only from persisted memory — never invent, infer, reorder creatively, or add work items.
+- For "brief me", "daily briefing", "what does my day look like", call memory_day_briefing with operation "brief" (today).
+- For "brief me on yesterday", use targetDate "yesterday".
+- For "brief me on July 25, 2026" / an ISO date, pass targetDate "YYYY-MM-DD".
+- For "list archives" / "what days are archived", use operation "list_archives".
+- Never invent briefing bullets; never brief tomorrow or future dates; never dump raw daily JSON for this purpose.
+- Do not use lifecycle tools when Sarah only asked for a briefing or a list of archives.
+- Day-briefing examples:
+  - Brief today: {"operation":"brief"} or {"operation":"brief","targetDate":"today"}
+  - Brief yesterday: {"operation":"brief","targetDate":"yesterday"}
+  - Brief archived day: {"operation":"brief","targetDate":"2026-07-25"}
+  - List archives: {"operation":"list_archives"}
+- Show the briefing artifact; give a short spoken/text lead from the tool message. Do not re-list every bullet in speech. Do not invent items missing from the artifact. On failure, report the tool error once; do not retry identical args.
 - Never ask Sarah for internal IDs. Resolve by ordinal, exact wording, distinctive phrase, person/project/due qualifier, or the recently changed item.
 - Never invent or expand Sarah's reference wording to force a unique match. Pass the phrase she actually supplied (or its shared meaningful tokens). If several open items share that phrase, the tool returns AMBIGUOUS_MATCH — ask one concise clarification and do not write. Do not pick one candidate by guessing a narrower phrase.
 - Never use memory_update_daily.priorities for add, edit, complete, reopen, remove, reorder, replace, clear, carry, or restore.
@@ -375,6 +388,28 @@ const toolSpecs = [
         },
         atPosition: { type: "number" },
         backupId: { type: "string" },
+      },
+      required: ["operation"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "memory_day_briefing",
+    description:
+      "Compose a deterministic executive day briefing from persisted memory, or list archived daily dates. Operations: brief, list_archives. For brief, targetDate may be omitted/today, yesterday, or YYYY-MM-DD for an archive. Tomorrow and future dates are unsupported. Read-only: never invent work items; never edit archives or daily arrays. Only report success when ok:true.",
+    parameters: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: ["brief", "list_archives"],
+        },
+        targetDate: {
+          type: "string",
+          description:
+            'For brief only: omit or "today" for live today; "yesterday" for previous calendar date archive; or YYYY-MM-DD archive/today date. Ignored for list_archives.',
+        },
       },
       required: ["operation"],
       additionalProperties: false,
@@ -1162,6 +1197,9 @@ async function executeTrustedTool(toolCall) {
     if (name === "memory_active_projects") {
       return await memoryStore.memoryActiveProjects(args);
     }
+    if (name === "memory_day_briefing") {
+      return await memoryStore.memoryDayBriefing(args);
+    }
     if (name === "working_context_items") {
       return await memoryStore.workingContextItems(args);
     }
@@ -1384,6 +1422,7 @@ Here is what you can ask me to do.
 - Remember facts, correct stored items, and update today's summary, projects, commitments, and follow-ups.
 - Manage daily priorities with natural language: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry to another day, and restore a backup.
 - Manage active projects with natural language: list, add, insert, edit name/note, remove, reorder, replace, and restore a backup.
+- Ask for a deterministic day briefing (today, yesterday, or an archived YYYY-MM-DD) or list archived daily dates — read-only; never invents work items.
 - complete targets an open priority; reopen targets a completed priority.
 - Carry/carry forward/copy into tomorrow keeps today's item (move:false). Only explicit move/transfer removes it from today (move:true).
 - Show tomorrow's priorities with list targetDate tomorrow — do not reuse today's list.
@@ -1403,6 +1442,8 @@ Here is what you can ask me to do.
 ## Good Starter Prompts
 
 - "Show me the menu."
+- "Brief me on today."
+- "List my daily archives."
 - "Search the web for the latest AI video tools."
 - "Create a chart of my workflow."
 - "Add a note: follow up on the sponsor."
