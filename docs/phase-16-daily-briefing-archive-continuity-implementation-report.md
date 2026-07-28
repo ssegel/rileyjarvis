@@ -1,8 +1,8 @@
 # Phase 16 implementation report: Daily Executive Briefing and Archive Continuity
 
-**Status:** Implementation complete on branch `phase-16`. Automated tests passed. Live validation **not** performed (explicitly deferred per implementation request). Not committed or pushed. Pre-commit review completed; test coverage tightened (no production-logic defects found).
-**Authority:** `docs/phase-16-daily-briefing-archive-continuity-audit.md`, repository code on `phase-16`, and automated test matrix §15.
-**Scope of this document:** Report only after code + automated validation + pre-commit review. No live Jarvis run; no commit/push in this step.
+**Status:** **Complete** on branch `phase-16` (implementation `1589add` + live-path presentation corrections in working tree). Text-path live validation passed. Realtime smoke skipped (permitted). Not committed/pushed in this finalize step.
+**Authority:** `docs/phase-16-daily-briefing-archive-continuity-audit.md`, repository code on `phase-16`, live diagnosis, automated tests, and successful final live retest.
+**Scope of this document:** Implementation, live-failure corrections, regression coverage, and live-validation closeout. No commit/push in this finalize step.
 
 ---
 
@@ -12,11 +12,12 @@
 |---|---|
 | Branch | `phase-16` |
 | Baseline HEAD (pre-implementation) | `dd1c016` — *Add Phase 16 daily-briefing and archive-continuity design* |
-| Working tree at start | Clean; local synchronized with `origin/phase-16` |
-| Jarvis / `npm run dev` | Not started |
-| Live validation | **Not performed** (by request) |
-| Commit / push | **Not performed** (by request) |
-| Live `data/memory` | **Not modified** |
+| Implementation commit | `1589add` — *Implement Phase 16 daily executive briefing and archive continuity* |
+| Live-path corrections | Working tree (artifact selection + app panel activation); not yet committed |
+| Jarvis / `npm run dev` | Stopped after successful live validation |
+| Live validation | **Passed** (text path; Realtime smoke skipped) |
+| Commit / push (finalize) | **Not performed** (by request) |
+| Live `data/memory` | **Not modified** by Phase 16 tooling beyond normal ensure/rollover side effects during live use |
 | Pre-commit review | Completed against audit + this report |
 
 ---
@@ -28,7 +29,19 @@
 | `electron/day-briefing.cjs` | **Added** — pure compose, empty-state constants, date resolve, archive filename helpers, logging |
 | `electron/day-briefing.test.cjs` | **Added** — automated matrix T01–T22 (+ archive classification-date, date-resolve matrix, empty-list, invent/routing assertions) |
 | `electron/memory.cjs` | `memoryDayBriefing` orchestration; archive list/read (read-only normalize); export wiring |
-| `electron/main.cjs` | `toolSpecs` entry; `executeTrustedTool` route; `JARVIS_INSTRUCTIONS` + menu copy |
+| `electron/main.cjs` | `toolSpecs` entry; `executeTrustedTool` route; `JARVIS_INSTRUCTIONS` + menu copy (+ panel-narration guard instruction) |
+| `electron/artifact-selection.cjs` | **Added (live fix #1/#2)** — `selectTurnArtifacts` / mode-switch detection / `buildTurnArtifactDelivery` metadata |
+| `electron/artifact-selection.test.cjs` | **Added** — briefing+`set_mode` clobber regression + mode-only + delivery metadata |
+| `electron/text-panel-activation.cjs` | **Added (live fix #2)** — App panel activation planner + unsupported panel-claim guard |
+| `electron/text-panel-activation.test.cjs` | **Added (live fix #2)** — live-path briefing panel regression (incl. incomplete meta shape) |
+| `electron/text-session.cjs` | Apply selection + emit `toolNames` / `artifactCount` / `selectedArtifact` / `hasSubstantiveArtifact` |
+| `electron/response-log-panel.test.cjs` | Assert App uses `planTextPanelActivation` |
+| `src/lib/artifactSelection.ts` | Renderer mirror of selection + delivery metadata |
+| `src/lib/textPanelActivation.ts` | Renderer mirror of panel activation + narration guard |
+| `src/lib/textClient.ts` | Deliver selected artifacts; preserve turn metadata; guard unsupported panel claims |
+| `src/App.tsx` | Panel activation via `planTextPanelActivation` (not raw `artifacts.length`) |
+| `src/lib/realtime.ts` | Defer mode-switch artifacts when a substantive tool artifact already ran in the batch |
+| `src/vite-env.d.ts` | Optional turn delivery metadata fields on `JarvisTextTurnResult` |
 | `docs/phase-16-daily-briefing-archive-continuity-implementation-report.md` | **This report** |
 
 ---
@@ -49,6 +62,8 @@ Voice turn → Realtime DC  → tools:execute IPC → executeTrustedTool
                          composeDayBriefing (pure, code-owned)
                                               ↓
                          artifact markdown (7 locked sections)
+                                              ↓
+         selectTurnArtifacts + turn metadata → App planTextPanelActivation
 ```
 
 | Concern | Behavior |
@@ -160,16 +175,16 @@ Automated T19 asserts `daily.json` + archive bytes unchanged across brief/list w
 
 ## 10. Automated tests and exact results
 
-### Focused Phase 16 suite
+### Focused Phase 16 + live-path presentation suites
 
 ```text
-node --test electron/day-briefing.test.cjs
-ℹ tests 26
-ℹ pass 26
+node --test electron/day-briefing.test.cjs \
+  electron/artifact-selection.test.cjs electron/text-panel-activation.test.cjs \
+  electron/response-log-panel.test.cjs
+ℹ tests 48
+ℹ pass 48
 ℹ fail 0
 ```
-
-Covers audit matrix T01–T22 plus archive classification-date, expanded date-resolve matrix, empty-list, invent/routing assertions, and missing-yesterday cases.
 
 ### Regression suites (requested)
 
@@ -183,6 +198,14 @@ node --test electron/day-briefing.test.cjs electron/memory.test.cjs \
 ```
 
 Includes Phase 13 priority lifecycle + selection, Phase 14 working-context, Phase 15 active-projects, and memory tests.
+
+### Frontend / TypeScript
+
+```text
+npm run typecheck
+> tsc --noEmit
+(exit 0)
+```
 
 ---
 
@@ -198,14 +221,23 @@ Includes Phase 13 priority lifecycle + selection, Phase 14 working-context, Phas
 ## 12. git status --short result
 
 ```text
+ M docs/phase-16-daily-briefing-archive-continuity-implementation-report.md
  M electron/main.cjs
- M electron/memory.cjs
-?? electron/day-briefing.cjs
-?? electron/day-briefing.test.cjs
-?? docs/phase-16-daily-briefing-archive-continuity-implementation-report.md
+ M electron/response-log-panel.test.cjs
+ M electron/text-session.cjs
+ M src/App.tsx
+ M src/lib/realtime.ts
+ M src/lib/textClient.ts
+ M src/vite-env.d.ts
+?? electron/artifact-selection.cjs
+?? electron/artifact-selection.test.cjs
+?? electron/text-panel-activation.cjs
+?? electron/text-panel-activation.test.cjs
+?? src/lib/artifactSelection.ts
+?? src/lib/textPanelActivation.ts
 ```
 
-No `data/memory`, `.env`, `node_modules`, or unrelated paths changed.
+No `data/memory`, `.env`, `node_modules`, temporary, or unrelated paths in the working tree.
 
 ---
 
@@ -227,51 +259,117 @@ No `data/memory`, `.env`, `node_modules`, or unrelated paths changed.
 | No tomorrow/future briefing; no archive mutation/dump | Satisfied |
 | Failure has no artifact; success has no raw daily dump | Satisfied |
 | No Phase 15 polish / rate-limit / voice refresh / packaging | Satisfied |
-| Automated matrix | Satisfied (26/26 focused; 129/129 combined) |
-| Live checklist §16 | **Not run** |
+| Automated matrix | Satisfied |
+| Live checklist §16 | **Passed** (text path); Realtime smoke **skipped** as permitted |
 
 ### Pre-commit review corrections
 
-No production-logic defects found in `day-briefing.cjs`, `memory.cjs`, or `main.cjs`. Test/report tightening only:
-
-1. Added archive classification-date test (due-now vs other vs deferred against snapshot date, not calendar today).
-2. Expanded pure `resolveBriefTarget` matrix (empty/whitespace/`today`/ISO today/past/future/non-string).
-3. Strengthened heading-order assertion and T21 invent/shared-routing checks.
-4. Removed stale T03 defer-fallback comment.
-5. Updated this report’s test counts and review status.
+No production-logic defects found in `day-briefing.cjs`, `memory.cjs`, or `main.cjs` at implementation time. Later live presentation defects were fixed in selection + App panel activation (documented in §15).
 
 ---
 
-## 14. Remaining risks
+## 14. Remaining risks / optional follow-ups
 
-1. **Live routing unproven** — text/Realtime smoke not run; schema/instructions are wired and unit-asserted only.
+1. **Realtime smoke not run** — text path proved tool + artifact panel end-to-end; Realtime shares `executeTrustedTool` and has mode-defer wiring, but voice-path panel behavior was not live-smoked (skipped to minimize API use; audit permits skip).
 2. **Inherited FU/unresolved sensitivity gap** — briefing matches injection/`memory_view` (raw text); cross-cutting privacy pass remains out of Phase 16.
-3. **Ensure/rollover side effect** — briefing can trigger normal calendar rollover writes; not a Phase 16-specific write, but operators should know list/brief may archive a stale day.
-4. **Process-local only** — no persistence changes; preview/recent restart debt remains Phase 15 follow-up territory.
+3. **Ensure/rollover side effect** — briefing/list can trigger normal calendar rollover writes; not a Phase 16-specific mutation API, but operators should know list/brief may archive a stale day.
+4. **Uncommitted live-path corrections** — selection + panel-activation files remain in the working tree until an explicit commit is requested.
+5. **Process-local / packaging debt** — preview/recent restart and packaging items remain Phase 15 follow-up territory, not Phase 16 scope.
 
 ---
 
 ## 15. Live-validation status
 
-**Not performed.** Per implementation instructions: do not start Jarvis, do not perform live validation, do not modify live `data/memory`.
+**Passed** (text path). Realtime smoke skipped.
 
-Recommended live checklist (when ready) remains audit §16: today brief → list archives → yesterday/archived brief → spot-check files → optional Realtime smoke if not rate-limited.
+### Live failure #1 — substantive artifact selection (`set_mode` clobber)
+
+| Finding | Detail |
+|---|---|
+| Tool call | `memory_day_briefing` **did run** (`ok:true`, today, non-empty counts) |
+| Tool artifact | Success path always returns `Day briefing — YYYY-MM-DD` |
+| Panel shown | **Jarvis Mode** / “Mode switched to display mode.” (`set_mode` progress artifact) |
+| Live Log | No tool events — **expected for text** |
+| Root cause | Same-turn **last-artifact wins**; `set_mode` clobbered the briefing artifact |
+| Layer | Artifact **selection** |
+
+### Live failure #2 — app-level panel activation / artifact-delivery metadata
+
+| Finding | Detail |
+|---|---|
+| Tool call | `memory_day_briefing` **ran again** after selection fix (`ok:true`; `toolCalls:2`) |
+| Tool artifact | Day briefing present on the tool result |
+| Spoken/text reply | Priority paraphrase + unsupported “Full details are in the artifact panel.” |
+| Panel shown | **Running Response Log** (not Day briefing, not Jarvis Mode) |
+| Root cause | App treated the turn as having no tool artifacts (raw `artifacts.length` / incomplete visibility metadata) and activated Running Response Log |
+| Layer | App **panel activation** + missing centralized delivery metadata |
+
+### Root-cause distinction
+
+| Concern | Responsibility |
+|---|---|
+| Substantive artifact selection | Prefer Day briefing (and other non-mode artifacts) over trailing `set_mode` / Jarvis Mode in the same turn |
+| App panel activation + delivery metadata | Carry `toolNames` / `artifactCount` / `selectedArtifact` / `hasSubstantiveArtifact`; open/preserve Artifacts from returned or already-delivered substantive artifacts; never let Running Response Log win merely because Live Log omitted tool events |
+
+Both layers are required.
+
+### Final centralized corrections
+
+1. **`selectTurnArtifacts` / `isModeSwitchArtifact`** — drop mode-switch artifacts when any substantive artifact exists; keep mode-only turns.
+2. **`buildTurnArtifactDelivery`** — emit `toolNames`, `artifactCount`, `selectedArtifact`, `hasSubstantiveArtifact` from text-session (and usage logs).
+3. **`planTextPanelActivation`** — App activates/preserves substantive (or mode-only) artifacts; text-only still uses Running Response Log.
+4. **Narration guard** — instructions + client strip of unsupported “details in the artifact panel” claims when no substantive artifact was delivered.
+5. **Realtime** — defer mode-switch `onArtifact` when a substantive tool artifact already ran in the batch (not live-smoked).
+
+Wired at: `electron/text-session.cjs`, `src/lib/textClient.ts`, `src/App.tsx`, `src/lib/realtime.ts`, mirrors in `artifactSelection` / `textPanelActivation`.
+
+### Regression coverage added
+
+- `electron/artifact-selection.test.cjs` — selection + delivery metadata + briefing/`set_mode` text turn + mode-only
+- `electron/text-panel-activation.test.cjs` — live-path “Brief me on today” + seven-section artifact + `set_mode` → panel stays Day briefing; incomplete-meta + onArtifact briefing; text-only response log; mode-only; narration guard; App source wiring
+- `electron/response-log-panel.test.cjs` — App uses `planTextPanelActivation`
+
+### Successful final live results
+
+| Check | Result |
+|---|---|
+| Today briefing | Correct **seven-section** artifact displayed (`Day briefing — 2026-07-28`) |
+| Archive list | Available dates displayed in **descending** order |
+| Archived-day briefing | `2026-07-27` archive artifact displayed correctly |
+| Panel stability | Substantive artifacts remained selected; **not** replaced by Running Response Log or Jarvis Mode |
+| Realtime smoke | **Skipped** — text-path validation passed; minimize API usage (audit permits) |
+
+### Finalize automated results
+
+```text
+Focused (day-briefing + artifact-selection + text-panel-activation + response-log-panel): 48/48 pass
+Regression (day-briefing + memory + priority/WC/projects lifecycles): 129/129 pass
+npm run typecheck → exit 0
+git diff --check → exit 0
+Ports 5173 and 5174 free; Jarvis stopped
+```
 
 ---
 
-## 16. Recommended next step
+## 16. Phase 16 completion conclusion
 
-1. Commit implementation + this report on request (recommended message below).
-2. Run the thrifty live checklist §16.
-3. After live pass: optional merge to `main`; keep Phase 15 polish / rate-limit / voice freshness as separate follow-ups.
+Phase 16 is **complete** for the audited scope:
+
+- Dedicated `memory_day_briefing` with `brief` / `list_archives`, code-owned seven-section composition, archive continuity, shared text+Realtime tool routing, and automated matrix coverage shipped in `1589add`.
+- Two live presentation failures were diagnosed and fixed: (1) substantive artifact selection vs `set_mode` clobber; (2) App panel activation vs Running Response Log with centralized delivery metadata.
+- Final text-path live validation passed for today briefing, archive list, and archived-day briefing; substantive artifacts stayed selected.
+- Optional Realtime smoke was skipped as permitted after text-path success.
+
+**Recommended next step (separate request):** commit the live-path presentation corrections + this report on `phase-16`, then optionally merge. Do not begin another phase until asked.
 
 ### Recommended commit message
 
 ```text
-Implement Phase 16 daily executive briefing and archive continuity.
+Fix Phase 16 day-briefing panel activation and mode-artifact clobber.
 
-Add memory_day_briefing (brief + list_archives) with code-owned seven-section
-artifacts, read-only archive access, and shared text/Realtime tool routing.
+Keep substantive briefing artifacts over set_mode progress, carry turn
+artifact metadata to the app, and stop Running Response Log from winning
+when a briefing was delivered.
 ```
 
 ---

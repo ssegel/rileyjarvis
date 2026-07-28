@@ -5,6 +5,8 @@
  * Realtime voice (WebRTC / client_secrets) is a separate transport —
  * text turns do not mint Realtime secrets or open data channels.
  */
+const { buildTurnArtifactDelivery } = require("./artifact-selection.cjs");
+
 const DEFAULT_TEXT_MODEL = "gpt-4.1";
 const DEFAULT_TIMEOUT_MS = 90_000;
 const MAX_TOOL_LOOP_ITERATIONS = 8;
@@ -148,7 +150,8 @@ function createTextSessionController(deps) {
           }
           const durationMs = now() - startedAt;
           const visibleText = String(assistantText || "").trim();
-          const hasVisibleOutput = Boolean(visibleText) || artifacts.length > 0;
+          const delivery = buildTurnArtifactDelivery(artifacts, toolTrace);
+          const hasVisibleOutput = Boolean(visibleText) || delivery.artifactCount > 0;
           if (!hasVisibleOutput) {
             logTextUsage({
               clientTurnId,
@@ -157,12 +160,19 @@ function createTextSessionController(deps) {
               outcome: "error",
               usage,
               toolCalls: toolTrace.length,
+              toolNames: delivery.toolNames,
+              artifactCount: delivery.artifactCount,
+              hasSubstantiveArtifact: delivery.hasSubstantiveArtifact,
             });
             return {
               ok: false,
               clientTurnId,
               assistantText: "",
-              artifacts,
+              artifacts: delivery.artifacts,
+              toolNames: delivery.toolNames,
+              artifactCount: delivery.artifactCount,
+              selectedArtifact: delivery.selectedArtifact,
+              hasSubstantiveArtifact: delivery.hasSubstantiveArtifact,
               toolTrace,
               usage,
               durationMs,
@@ -182,13 +192,21 @@ function createTextSessionController(deps) {
             outcome: "completed",
             usage,
             toolCalls: toolTrace.length,
+            toolNames: delivery.toolNames,
+            artifactCount: delivery.artifactCount,
+            hasSubstantiveArtifact: delivery.hasSubstantiveArtifact,
+            selectedArtifactTitle: delivery.selectedArtifact?.title,
             assistantTextLen: visibleText.length,
           });
           return {
             ok: true,
             clientTurnId,
             assistantText: visibleText || assistantText || "",
-            artifacts,
+            artifacts: delivery.artifacts,
+            toolNames: delivery.toolNames,
+            artifactCount: delivery.artifactCount,
+            selectedArtifact: delivery.selectedArtifact,
+            hasSubstantiveArtifact: delivery.hasSubstantiveArtifact,
             toolTrace,
             usage,
             durationMs,
@@ -283,26 +301,30 @@ function createTextSessionController(deps) {
         apiErrorCode: classified.apiErrorCode,
         apiErrorParam: classified.apiErrorParam,
       });
-      return {
-        ok: false,
-        clientTurnId,
-        assistantText: "",
-        artifacts: [],
-        toolTrace,
-        usage,
-        durationMs,
-        outcome: "error",
-        cancelled: false,
-        error: {
-          code: classified.code,
-          message: classified.userMessage,
-          httpStatus: classified.httpStatus,
-          retryable: classified.retryable,
-          apiErrorType: classified.apiErrorType,
-          apiErrorCode: classified.apiErrorCode,
-          apiErrorParam: classified.apiErrorParam,
-        },
-      };
+    return {
+      ok: false,
+      clientTurnId,
+      assistantText: "",
+      artifacts: [],
+      toolNames: [],
+      artifactCount: 0,
+      selectedArtifact: null,
+      hasSubstantiveArtifact: false,
+      toolTrace,
+      usage,
+      durationMs,
+      outcome: "error",
+      cancelled: false,
+      error: {
+        code: classified.code,
+        message: classified.userMessage,
+        httpStatus: classified.httpStatus,
+        retryable: classified.retryable,
+        apiErrorType: classified.apiErrorType,
+        apiErrorCode: classified.apiErrorCode,
+        apiErrorParam: classified.apiErrorParam,
+      },
+    };
     } finally {
       clearTimeout(timeout);
       activeTurns.delete(clientTurnId);
@@ -336,6 +358,10 @@ function abortedOutcome(options) {
       clientTurnId: options.clientTurnId,
       assistantText: "",
       artifacts: [],
+      toolNames: [],
+      artifactCount: 0,
+      selectedArtifact: null,
+      hasSubstantiveArtifact: false,
       toolTrace: options.toolTrace,
       usage: options.usage,
       durationMs,
@@ -705,11 +731,16 @@ function classifyThrown(error, classifyHttpFailure) {
 
 function failResult(code, message, startedAt, nowFn, extra = {}) {
   const durationMs = Math.max(0, nowFn() - startedAt);
+  const delivery = buildTurnArtifactDelivery(extra.artifacts || [], extra.toolTrace || []);
   return {
     ok: false,
     clientTurnId: extra.clientTurnId || "",
     assistantText: "",
-    artifacts: extra.artifacts || [],
+    artifacts: delivery.artifacts,
+    toolNames: delivery.toolNames,
+    artifactCount: delivery.artifactCount,
+    selectedArtifact: delivery.selectedArtifact,
+    hasSubstantiveArtifact: delivery.hasSubstantiveArtifact,
     toolTrace: extra.toolTrace || [],
     usage: extra.usage || { inputTokens: 0, outputTokens: 0, model: DEFAULT_TEXT_MODEL },
     durationMs,
@@ -725,6 +756,7 @@ function failResult(code, message, startedAt, nowFn, extra = {}) {
 
 function cancelledResult(startedAt, usage, toolTrace, clientTurnId, model, nowFn = () => Date.now()) {
   const durationMs = Math.max(0, nowFn() - startedAt);
+  const delivery = buildTurnArtifactDelivery([], toolTrace);
   logTextUsage({
     clientTurnId,
     model,
@@ -732,12 +764,19 @@ function cancelledResult(startedAt, usage, toolTrace, clientTurnId, model, nowFn
     outcome: "cancelled",
     usage,
     toolCalls: toolTrace.length,
+    toolNames: delivery.toolNames,
+    artifactCount: delivery.artifactCount,
+    hasSubstantiveArtifact: delivery.hasSubstantiveArtifact,
   });
   return {
     ok: false,
     clientTurnId,
     assistantText: "",
-    artifacts: [],
+    artifacts: delivery.artifacts,
+    toolNames: delivery.toolNames,
+    artifactCount: delivery.artifactCount,
+    selectedArtifact: delivery.selectedArtifact,
+    hasSubstantiveArtifact: delivery.hasSubstantiveArtifact,
     toolTrace,
     usage,
     durationMs,
@@ -762,6 +801,12 @@ function logTextUsage(details) {
       inputTokens: details.usage?.inputTokens || 0,
       outputTokens: details.usage?.outputTokens || 0,
       toolCalls: details.toolCalls || 0,
+      toolNames: Array.isArray(details.toolNames) ? details.toolNames : undefined,
+      artifactCount: typeof details.artifactCount === "number" ? details.artifactCount : undefined,
+      hasSubstantiveArtifact:
+        typeof details.hasSubstantiveArtifact === "boolean" ? details.hasSubstantiveArtifact : undefined,
+      // Title only — never log artifact body content.
+      selectedArtifactTitle: details.selectedArtifactTitle || undefined,
       // Length only — never log assistant response content.
       assistantTextLen:
         typeof details.assistantTextLen === "number" ? details.assistantTextLen : undefined,

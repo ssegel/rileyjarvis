@@ -193,4 +193,5 @@ test("text-only delivery keeps keyboard open when response log cannot activate",
   assert.match(app, /reply could not be shown/);
   assert.match(app, /responseLogActive/);
   assert.match(app, /!responseLogActive && !hasArtifact/);
+  assert.match(app, /planTextPanelActivation/);
 });

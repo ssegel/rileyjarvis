@@ -77,6 +77,10 @@ export type JarvisTextTurnResult = {
   clientTurnId: string;
   assistantText: string;
   artifacts: RickyArtifact[];
+  toolNames?: string[];
+  artifactCount?: number;
+  selectedArtifact?: RickyArtifact | null;
+  hasSubstantiveArtifact?: boolean;
   toolTrace: JarvisTextToolTraceItem[];
   usage: JarvisTextUsage;
   durationMs: number;

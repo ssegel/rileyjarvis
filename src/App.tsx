@@ -22,6 +22,7 @@ import {
 import { buildTextHistoryFromTranscript } from "./lib/textHistory";
 import { deliveryDiagMessage, readAssistantText } from "./lib/textDelivery";
 import { TextClient, type TextTurnState } from "./lib/textClient";
+import { planTextPanelActivation } from "./lib/textPanelActivation";
 import type { RickyArtifact } from "./vite-env";
 
 type RickyMode = "display" | "computer";
@@ -294,7 +295,6 @@ export default function App() {
     try {
       const result = await textClientRef.current?.submit(trimmed, history);
       const assistantText = readAssistantText(result);
-      const hasArtifact = (result?.artifacts?.length ?? 0) > 0;
 
       // Append successful assistant text BEFORE closing the field / releasing ownership.
       let appended = false;
@@ -302,11 +302,24 @@ export default function App() {
         appended = appendAssistantToLog(assistantText, result.clientTurnId);
       }
 
-      // Text-only replies must switch the artifacts panel from Ready → Running Response Log.
-      // Tool artifacts already activate the panel via onArtifact; do not clobber them.
+      // Panel activation uses returned/selected artifact metadata (and any tool artifact
+      // already delivered via onArtifact). Do not open Running Response Log merely because
+      // visible tool-event metadata is incomplete.
+      const panelPlan = planTextPanelActivation({
+        result,
+        currentArtifact: artifactRef.current,
+        appended,
+      });
+      const hasArtifact = panelPlan.hasToolArtifact;
       let responseLogActive = isRunningResponseLogArtifact(artifactRef.current);
-      if (appended && !hasArtifact) {
+      if (panelPlan.activateResponseLog) {
         responseLogActive = activateRunningResponseLog(transcriptRef.current);
+      } else if (panelPlan.selectedArtifact && !isRunningResponseLogArtifact(panelPlan.selectedArtifact)) {
+        artifactRef.current = panelPlan.selectedArtifact;
+        setArtifact(panelPlan.selectedArtifact);
+        setArtifactVisible(true);
+        if (panelPlan.selectedArtifact.fullscreen) setArtifactFullscreen(true);
+        responseLogActive = false;
       }
 
       diagnosticsRef.current.record({
@@ -317,13 +330,7 @@ export default function App() {
           appAppended: appended,
           appTextLen: assistantText.length,
           transcriptCount: transcriptRef.current.length,
-          panelMode: hasArtifact
-            ? "toolArtifact"
-            : responseLogActive
-              ? "responseLog"
-              : artifactRef.current
-                ? "other"
-                : "ready",
+          panelMode: panelPlan.panelMode,
           responseLogActive,
         }),
       });
