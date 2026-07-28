@@ -1,4 +1,5 @@
 import type { RickyArtifact, RickyToolCall, RickyToolResult, RickyToolSpec } from "../vite-env";
+import { isModeSwitchArtifact } from "./artifactSelection";
 import {
   assertSingleRealtimePath,
   countRealtimeResources,
@@ -863,6 +864,8 @@ export class RickyRealtimeClient {
     this.callbacks.onMood("working");
     this.emitSessionUiState("thinking");
     let shouldCreateResponse = false;
+    let hadSubstantiveArtifact = false;
+    let pendingModeArtifact: RickyArtifact | null = null;
 
     for (const item of items) {
       const callId = item.call_id;
@@ -904,10 +907,22 @@ export class RickyRealtimeClient {
       if (result.mode === "display" || result.mode === "computer") {
         this.callbacks.onMode(result.mode);
       }
-      if (result.artifact) this.callbacks.onArtifact(result.artifact);
+      if (result.artifact) {
+        if (isModeSwitchArtifact(result.artifact)) {
+          pendingModeArtifact = result.artifact;
+        } else {
+          hadSubstantiveArtifact = true;
+          pendingModeArtifact = null;
+          this.callbacks.onArtifact(result.artifact);
+        }
+      }
       if (result.thumbnailReady === true) this.callbacks.onThumbnailReady();
       if (result.silent !== true) shouldCreateResponse = true;
       await this.returnToolOutput(callId, result);
+    }
+
+    if (!hadSubstantiveArtifact && pendingModeArtifact) {
+      this.callbacks.onArtifact(pendingModeArtifact);
     }
 
     if (shouldCreateResponse) {

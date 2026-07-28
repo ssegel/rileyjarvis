@@ -4,6 +4,8 @@ import {
   planTextResultDelivery,
   readAssistantText,
 } from "./textDelivery";
+import { buildTurnArtifactDelivery, selectTurnArtifacts } from "./artifactSelection";
+import { guardArtifactPanelNarration } from "./textPanelActivation";
 import type {
   JarvisTextHistoryItem,
   JarvisTextTurnResult,
@@ -78,6 +80,10 @@ export class TextClient {
         clientTurnId: "",
         assistantText: "",
         artifacts: [],
+        toolNames: [],
+        artifactCount: 0,
+        selectedArtifact: null,
+        hasSubstantiveArtifact: false,
         toolTrace: [],
         usage: { inputTokens: 0, outputTokens: 0, model: "" },
         durationMs: 0,
@@ -125,6 +131,10 @@ export class TextClient {
           clientTurnId,
           assistantText: "",
           artifacts: [],
+          toolNames: [],
+          artifactCount: 0,
+          selectedArtifact: null,
+          hasSubstantiveArtifact: false,
           toolTrace: result?.toolTrace || [],
           usage: result?.usage || { inputTokens: 0, outputTokens: 0, model: "" },
           durationMs: result?.durationMs || 0,
@@ -179,13 +189,20 @@ export class TextClient {
         this.setState("tool-running");
       }
 
-      for (const artifact of result!.artifacts || []) {
+      const delivery = buildTurnArtifactDelivery(result!.artifacts || [], result!.toolTrace || []);
+      const selectedArtifacts = selectTurnArtifacts(result!.artifacts || []);
+      for (const artifact of selectedArtifacts) {
         this.callbacks.onArtifact(artifact);
       }
 
+      const guardedText = guardArtifactPanelNarration(
+        plan.assistantText,
+        delivery.hasSubstantiveArtifact || Boolean(result!.hasSubstantiveArtifact),
+      );
+
       let clientDelivered = false;
-      if (plan.assistantText) {
-        this.callbacks.onAssistantText(plan.assistantText, clientTurnId);
+      if (guardedText) {
+        this.callbacks.onAssistantText(guardedText, clientTurnId);
         clientDelivered = true;
       }
 
@@ -193,8 +210,8 @@ export class TextClient {
         "info",
         "text.delivery.client",
         deliveryDiagMessage({
-          mainHasText: Boolean(plan.assistantTextLen),
-          mainTextLen: plan.assistantTextLen,
+          mainHasText: Boolean(guardedText.length),
+          mainTextLen: guardedText.length,
           clientDelivered,
         }),
         clientTurnId,
@@ -206,7 +223,16 @@ export class TextClient {
       // Preserve nonempty assistantText on the returned result for App verification.
       return {
         ...result!,
-        assistantText: plan.assistantText || result!.assistantText || "",
+        assistantText: guardedText || result!.assistantText || "",
+        artifacts: selectedArtifacts,
+        toolNames: result!.toolNames?.length ? result!.toolNames : delivery.toolNames,
+        artifactCount:
+          typeof result!.artifactCount === "number" ? result!.artifactCount : delivery.artifactCount,
+        selectedArtifact: result!.selectedArtifact ?? delivery.selectedArtifact,
+        hasSubstantiveArtifact:
+          typeof result!.hasSubstantiveArtifact === "boolean"
+            ? result!.hasSubstantiveArtifact
+            : delivery.hasSubstantiveArtifact,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "The text request failed. Try again.";
