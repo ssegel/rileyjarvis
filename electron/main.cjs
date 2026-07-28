@@ -1,10 +1,13 @@
 const { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, nativeImage, screen, shell } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs/promises");
+const fsSync = require("node:fs");
 const crypto = require("node:crypto");
+const { execFileSync } = require("node:child_process");
 const dotenv = require("dotenv");
 const { createDesktopControl } = require("./platform/index.cjs");
 const { createMemoryStore } = require("./memory.cjs");
+const { createSingleInstanceController } = require("./single-instance.cjs");
 
 dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 
@@ -16,6 +19,53 @@ let currentMode = "display";
 let mainWindow = null;
 let normalWindowBounds = null;
 let dbWriteQueue = Promise.resolve();
+
+const singleInstance = createSingleInstanceController({
+  requestSingleInstanceLock: () => app.requestSingleInstanceLock(),
+  quit: () => app.quit(),
+  getMainWindow: () => mainWindow,
+});
+if (!singleInstance.gotLock) {
+  // Second instance: focus is handled by the first process; print then quit.
+  console.info("Jarvis is already running");
+} else {
+  app.on("second-instance", () => {
+    singleInstance.focusExisting();
+  });
+}
+
+function getBuildInfo() {
+  let version = "1.0.0";
+  try {
+    const pkg = JSON.parse(fsSync.readFileSync(path.join(process.cwd(), "package.json"), "utf8"));
+    if (pkg && typeof pkg.version === "string" && pkg.version.trim()) version = pkg.version.trim();
+  } catch {
+    // ignore
+  }
+  let gitSha = null;
+  let branch = null;
+  try {
+    gitSha = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    gitSha = null;
+  }
+  try {
+    branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    branch = null;
+  }
+  return { version, gitSha, branch };
+}
+
+const RESTART_POLICY_NOTE = "Pending confirmations do not survive restart.";
 
 const JARVIS_INSTRUCTIONS = `# Role and Objective
 You are Jarvis, Sarah's personal desktop AI operator. You speak through realtime voice and can use local computer tools when authorized.
@@ -980,8 +1030,66 @@ const textSession = createTextSessionController({
   sanitizeDiagnosticText: realtimeErrors.sanitizeDiagnosticText,
 });
 
-ipcMain.handle("text:run", async (_event, request) => textSession.runTextTurn(request || {}));
+ipcMain.handle("text:run", async (_event, request) => {
+  const payload = request && typeof request === "object" ? { ...request } : {};
+  const internalPending =
+    typeof memoryStore.getPendingConfirmationInternal === "function"
+      ? memoryStore.getPendingConfirmationInternal()
+      : null;
+  if (internalPending && internalPending.previewToken) {
+    payload.pendingConfirmation = {
+      toolName: internalPending.toolName,
+      operation: internalPending.operation,
+      scope: internalPending.scope ?? null,
+      previewToken: internalPending.previewToken,
+      expiresAt: internalPending.expiresAt,
+      redactedSummary: internalPending.redactedSummary,
+      dailyUpdatedAt: internalPending.dailyUpdatedAt,
+    };
+  }
+  return textSession.runTextTurn(payload);
+});
 ipcMain.handle("text:cancel", async (_event, clientTurnId) => textSession.cancelTextTurn(clientTurnId));
+
+ipcMain.handle("app:get-build-info", () => getBuildInfo());
+
+ipcMain.handle("continuity:get", () => {
+  const pending =
+    typeof memoryStore.getPendingConfirmation === "function" ? memoryStore.getPendingConfirmation() : null;
+  const recentSnapshot =
+    typeof memoryStore.getRecentContinuitySnapshot === "function"
+      ? memoryStore.getRecentContinuitySnapshot()
+      : {
+          recent: {
+            priorityId: null,
+            activeProjectId: null,
+            workingContext: { commitments: null, follow_ups: null, unresolved_items: null },
+          },
+        };
+  return {
+    recent: recentSnapshot.recent,
+    pendingConfirmation: pending,
+    buildInfo: getBuildInfo(),
+    restartPolicyNote: RESTART_POLICY_NOTE,
+  };
+});
+
+ipcMain.handle("continuity:dismiss-pending", () => {
+  if (typeof memoryStore.dismissPendingConfirmation === "function") {
+    memoryStore.dismissPendingConfirmation();
+  }
+  return { ok: true };
+});
+
+app.on("before-quit", () => {
+  try {
+    if (textSession && typeof textSession.cancelAllActiveTurns === "function") {
+      textSession.cancelAllActiveTurns();
+    }
+  } catch {
+    // ignore
+  }
+});
 
 ipcMain.handle("realtime:create-token", async () => {
   const {
@@ -2012,14 +2120,19 @@ function fallbackMermaidDiagram(title) {
   return `flowchart TD\n  A["${safeTitle}"] --> B["Chart request received"]\n  B --> C["Jarvis will show a safe fallback if syntax fails"]`;
 }
 
-app.whenReady().then(createWindow);
-
-app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
-});
-
-app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
+if (singleInstance.gotLock) {
+  app.whenReady().then(() => {
+    console.info("[jarvis-launch] ready", JSON.stringify(getBuildInfo()));
     void createWindow();
-  }
-});
+  });
+
+  app.on("window-all-closed", () => {
+    if (process.platform !== "darwin") app.quit();
+  });
+
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      void createWindow();
+    }
+  });
+}

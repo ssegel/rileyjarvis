@@ -58,12 +58,86 @@ export const RETRY_BACKOFF_MS = [1000, 2000, 4000] as const;
 export const RETRY_AFTER_CAP_MS = 30_000;
 export const RETRY_JITTER_MS = 250;
 
+/** Text cooldown honors Retry-After up to 60s (Realtime connect remains 30s). */
+export const TEXT_RETRY_AFTER_CAP_MS = 60_000;
+export const TEXT_COOLDOWN_FALLBACK_MS = [1000, 2000, 4000, 8000] as const;
+export const TEXT_REPEATED_429_FLOOR_MS = 30_000;
+export const TEXT_REPEATED_429_MESSAGE_AFTER = 3;
+export const TEXT_AUTO_NETWORK_RETRY_DELAY_MS = 750;
+const RETRY_AFTER_PARSE_SANITY_MS = 86_400_000;
+
 export function userMessageForCode(code: RealtimeErrorCode): string {
   return USER_MESSAGES[code];
 }
 
 export function isRetryableCode(code: RealtimeErrorCode): boolean {
   return !NON_RETRYABLE.has(code);
+}
+
+/** Manual Retry allowed after cooldown for these text failure codes. */
+export function isTextManualRetryAllowed(code: string | undefined | null): boolean {
+  if (!code) return false;
+  if (
+    code === "quota.exhausted" ||
+    code === "config.missing_api_key" ||
+    code === "config.invalid_api_key"
+  ) {
+    return false;
+  }
+  if (isRealtimeErrorCode(code)) return isRetryableCode(code);
+  return code !== "session.error";
+}
+
+/** Countdown UI is never shown for quota or other non-manual-retry codes. */
+export function showsTextRetryCountdown(code: string | undefined | null): boolean {
+  return isTextManualRetryAllowed(code);
+}
+
+/**
+ * Text cooldown policy (Phase 17 §3).
+ */
+export function computeTextCooldownMs(
+  attemptIndex: number,
+  retryAfterMs?: number,
+  consecutiveRateLimited = 0,
+): number {
+  let computed: number;
+  if (typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs >= 0) {
+    computed = Math.min(retryAfterMs, TEXT_RETRY_AFTER_CAP_MS);
+  } else {
+    const idx = Math.min(Math.max(0, attemptIndex | 0), TEXT_COOLDOWN_FALLBACK_MS.length - 1);
+    computed = TEXT_COOLDOWN_FALLBACK_MS[idx] ?? 8000;
+  }
+  if (consecutiveRateLimited >= TEXT_REPEATED_429_MESSAGE_AFTER) {
+    computed = Math.max(computed, TEXT_REPEATED_429_FLOOR_MS);
+  }
+  return computed;
+}
+
+export function textCooldownUserMessage(
+  code: RealtimeErrorCode | string,
+  cooldownMs: number,
+  consecutiveRateLimited = 0,
+): string {
+  const base = isRealtimeErrorCode(code) ? userMessageForCode(code) : USER_MESSAGES.unknown;
+  if (!showsTextRetryCountdown(code)) {
+    return base;
+  }
+  const seconds = Math.max(1, Math.ceil(Number(cooldownMs || 0) / 1000));
+  let message = `${base} You can retry in ${seconds}s.`;
+  if (code === "rate_limited" && consecutiveRateLimited >= TEXT_REPEATED_429_MESSAGE_AFTER) {
+    message = `${base} Wait longer / try later. You can retry in ${seconds}s.`;
+  }
+  return message;
+}
+
+export function formatRetryAvailableAt(cooldownUntilMs: number, nowMs = Date.now()): string | null {
+  if (!Number.isFinite(cooldownUntilMs) || cooldownUntilMs <= nowMs) return null;
+  try {
+    return new Date(cooldownUntilMs).toLocaleTimeString();
+  } catch {
+    return null;
+  }
 }
 
 export function looksLikeHtml(text: string): boolean {
@@ -95,19 +169,32 @@ export function sanitizeDiagnosticText(raw: string, maxLength = 160): string {
   return text;
 }
 
-export function parseRetryAfterMs(headerValue: string | null | undefined): number | undefined {
+/**
+ * Parse Retry-After. Optional capMs defaults to Realtime 30s for backward compatibility.
+ * Pass null for uncapped (sanity-bounded) parse used by classification.
+ */
+export function parseRetryAfterMs(
+  headerValue: string | null | undefined,
+  capMs: number | null | undefined = RETRY_AFTER_CAP_MS,
+): number | undefined {
   if (!headerValue) return undefined;
   const trimmed = headerValue.trim();
   if (!trimmed) return undefined;
+  let ms: number;
   const asSeconds = Number(trimmed);
   if (Number.isFinite(asSeconds) && asSeconds >= 0) {
-    return Math.min(Math.round(asSeconds * 1000), RETRY_AFTER_CAP_MS);
+    ms = Math.round(asSeconds * 1000);
+  } else {
+    const asDate = Date.parse(trimmed);
+    if (!Number.isNaN(asDate)) {
+      ms = Math.max(0, asDate - Date.now());
+    } else {
+      return undefined;
+    }
   }
-  const asDate = Date.parse(trimmed);
-  if (!Number.isNaN(asDate)) {
-    return Math.min(Math.max(0, asDate - Date.now()), RETRY_AFTER_CAP_MS);
-  }
-  return undefined;
+  ms = Math.min(ms, RETRY_AFTER_PARSE_SANITY_MS);
+  if (capMs == null || !Number.isFinite(capMs)) return ms;
+  return Math.min(ms, capMs);
 }
 
 export function classifyHttpFailure(options: {
@@ -117,7 +204,8 @@ export function classifyHttpFailure(options: {
 }): ClassifiedRealtimeError {
   const { httpStatus, bodyText = "", retryAfterHeader } = options;
   const lower = bodyText.toLowerCase();
-  const retryAfterMs = parseRetryAfterMs(retryAfterHeader);
+  // Store uncapped (sanity-bounded) Retry-After; Realtime/text policies apply their own caps.
+  const retryAfterMs = parseRetryAfterMs(retryAfterHeader, null);
 
   if (httpStatus === 401 || httpStatus === 403) {
     return buildError("config.invalid_api_key", { httpStatus });

@@ -60,6 +60,12 @@ const {
   sortArchiveDatesDescending,
   logDayBriefingEvent,
 } = require("./day-briefing.cjs");
+const {
+  loadSessionContinuity,
+  saveSessionContinuity,
+  coerceId,
+  CONTINUITY_FILENAME,
+} = require("./session-continuity.cjs");
 
 const SCHEMA_VERSION = 1;
 const MAX_BACKUPS = 10;
@@ -233,6 +239,7 @@ function createMemoryStore(options = {}) {
     archive: path.join(rootDir, "archive"),
     backups: path.join(rootDir, "backups"),
     future: path.join(rootDir, "future"),
+    sessionContinuity: path.join(rootDir, CONTINUITY_FILENAME),
   };
 
   /** @type {Map<string, { expiresAt: number, operation: string, hash: string, afterPriorities: any[], beforePriorities: any[], dailyUpdatedAt: string, meta?: any }>} */
@@ -241,6 +248,19 @@ function createMemoryStore(options = {}) {
   let recentActiveProjectId = null;
   /** @type {{ commitments: string|null, follow_ups: string|null, unresolved_items: string|null }} */
   const recentWcIds = { commitments: null, follow_ups: null, unresolved_items: null };
+  /** @type {null | {
+   *   toolName: "memory_priorities" | "working_context_items" | "memory_active_projects",
+   *   operation: string,
+   *   scope?: string | null,
+   *   previewToken: string,
+   *   expiresAt: number,
+   *   redactedSummary: string,
+   *   dailyUpdatedAt?: string,
+   *   createdAt: number,
+   *   bindingKey: string,
+   * }} */
+  let pendingConfirmation = null;
+  let sessionContinuityHydrated = false;
   /** @type {Set<string>} */
   const notFoundFingerprints = new Set();
   /** @type {Set<string>} */
@@ -248,6 +268,231 @@ function createMemoryStore(options = {}) {
 
   function isoNow() {
     return now().toISOString();
+  }
+
+  function clearPendingConfirmation() {
+    pendingConfirmation = null;
+  }
+
+  function setPendingConfirmation({
+    toolName,
+    operation,
+    scope = null,
+    previewToken,
+    expiresAt,
+    redactedSummary,
+    dailyUpdatedAt,
+    bindingKey,
+  }) {
+    pendingConfirmation = {
+      toolName,
+      operation: String(operation || ""),
+      scope: scope == null ? null : String(scope),
+      previewToken: String(previewToken || ""),
+      expiresAt: Number(expiresAt) || 0,
+      redactedSummary: String(redactedSummary || ""),
+      dailyUpdatedAt: dailyUpdatedAt != null ? String(dailyUpdatedAt) : undefined,
+      createdAt: Date.now(),
+      bindingKey: String(bindingKey || ""),
+    };
+  }
+
+  function refreshPendingFromStore() {
+    if (!pendingConfirmation) return;
+    const entry = previewStore.get(pendingConfirmation.previewToken);
+    if (!entry || Date.now() > entry.expiresAt) {
+      clearPendingConfirmation();
+    }
+  }
+
+  function getPendingConfirmationPublic() {
+    refreshPendingFromStore();
+    if (!pendingConfirmation) return null;
+    return {
+      toolName: pendingConfirmation.toolName,
+      operation: pendingConfirmation.operation,
+      scope: pendingConfirmation.scope ?? null,
+      expiresAt: pendingConfirmation.expiresAt,
+      redactedSummary: pendingConfirmation.redactedSummary,
+      dailyUpdatedAt: pendingConfirmation.dailyUpdatedAt,
+      createdAt: pendingConfirmation.createdAt,
+    };
+  }
+
+  function getPendingConfirmationInternal() {
+    refreshPendingFromStore();
+    return pendingConfirmation ? { ...pendingConfirmation } : null;
+  }
+
+  function dismissPendingConfirmation() {
+    clearPendingConfirmation();
+  }
+
+  function buildBindingKey(toolName, operation, scope, requestObj) {
+    return JSON.stringify({
+      toolName: String(toolName || ""),
+      operation: String(operation || ""),
+      scope: scope == null || scope === "" ? null : String(scope),
+      request: requestObj == null ? null : requestObj,
+    });
+  }
+
+  function tryReusePendingPreview(toolName, operation, scope, bindingKey, dailyUpdatedAt) {
+    refreshPendingFromStore();
+    if (!pendingConfirmation) return null;
+    if (pendingConfirmation.toolName !== toolName) return null;
+    if (pendingConfirmation.operation !== String(operation || "")) return null;
+    const normalizedScope = scope == null || scope === "" ? null : String(scope);
+    if ((pendingConfirmation.scope ?? null) !== normalizedScope) return null;
+    if (pendingConfirmation.bindingKey !== bindingKey) return null;
+    if (
+      dailyUpdatedAt != null &&
+      pendingConfirmation.dailyUpdatedAt != null &&
+      pendingConfirmation.dailyUpdatedAt !== dailyUpdatedAt
+    ) {
+      clearPendingConfirmation();
+      return null;
+    }
+    const entry = previewStore.get(pendingConfirmation.previewToken);
+    if (!entry || Date.now() > entry.expiresAt) {
+      clearPendingConfirmation();
+      return null;
+    }
+    return pendingConfirmation.previewToken;
+  }
+
+  function redactConfirmationSummary(message, operation, itemCount) {
+    const opLabel = String(operation || "operation").replace(/_/g, " ");
+    let base =
+      typeof message === "string" && message.trim()
+        ? message.trim()
+        : itemCount != null && Number.isFinite(Number(itemCount))
+          ? `Confirmation required: ${opLabel} (${Number(itemCount)} item${Number(itemCount) === 1 ? "" : "s"})`
+          : `Confirmation required: ${opLabel}`;
+    base = base
+      .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
+      .replace(/\b(?:preview[_-]?token|api[_-]?key|token)\s*[:=]\s*\S+/gi, "[redacted]")
+      .replace(/\bBearer\s+[A-Za-z0-9._\-]+/gi, "[redacted]");
+    if (base.length > 240) base = `${base.slice(0, 237)}...`;
+    return base;
+  }
+
+  function clearPendingIfMatchingToken(token) {
+    if (pendingConfirmation && pendingConfirmation.previewToken === String(token || "")) {
+      clearPendingConfirmation();
+    }
+  }
+
+  function ensurePendingFromPreviewToken({
+    toolName,
+    operation,
+    scope = null,
+    previewToken,
+    message,
+    itemCount,
+    dailyUpdatedAt,
+    bindingKey,
+  }) {
+    if (!previewToken) return;
+    refreshPendingFromStore();
+    if (pendingConfirmation && pendingConfirmation.previewToken === String(previewToken)) {
+      if (message) {
+        pendingConfirmation.redactedSummary = redactConfirmationSummary(message, operation, itemCount);
+      }
+      return;
+    }
+    const entry = previewStore.get(String(previewToken));
+    if (!entry) return;
+    setPendingConfirmation({
+      toolName,
+      operation,
+      scope,
+      previewToken,
+      expiresAt: entry.expiresAt,
+      redactedSummary: redactConfirmationSummary(message, operation, itemCount),
+      dailyUpdatedAt: dailyUpdatedAt != null ? dailyUpdatedAt : entry.dailyUpdatedAt,
+      bindingKey: bindingKey || entry.meta?.bindingKey || "",
+    });
+  }
+
+  let continuityDirty = false;
+
+  async function persistRecentContinuity() {
+    await saveSessionContinuity({
+      memoryRootDir: paths.root,
+      recent: {
+        priorityId: recentPriorityId,
+        activeProjectId: recentActiveProjectId,
+        workingContext: {
+          commitments: recentWcIds.commitments,
+          follow_ups: recentWcIds.follow_ups,
+          unresolved_items: recentWcIds.unresolved_items,
+        },
+      },
+      atomicWriteJson,
+      nowIso: isoNow(),
+    });
+    continuityDirty = false;
+  }
+
+  function schedulePersistRecentContinuity() {
+    continuityDirty = true;
+  }
+
+  async function flushContinuityIfDirty() {
+    if (!continuityDirty) return;
+    try {
+      await persistRecentContinuity();
+    } catch {
+      // Keep continuityDirty so a later flush retries after transient IO failures.
+      console.warn("[jarvis] session-continuity.save_failed");
+    }
+  }
+
+  function clearStaleRecentIfNeeded(kind, args = {}) {
+    if (kind === "priority") {
+      const rawRef = args.reference != null ? args.reference : args.item;
+      const ref = normalizePriorityReference(rawRef);
+      if (ref && ref.by === "recent") {
+        recentPriorityId = null;
+        schedulePersistRecentContinuity();
+      }
+      return;
+    }
+    if (kind === "wc") {
+      const rawRef = args.reference != null ? args.reference : args.item;
+      const ref = normalizeWcReference(rawRef);
+      if (ref && ref.by === "recent") {
+        const scope = normalizeScope(args.scope);
+        if (scope && Object.prototype.hasOwnProperty.call(recentWcIds, scope)) {
+          recentWcIds[scope] = null;
+          schedulePersistRecentContinuity();
+        }
+      }
+      return;
+    }
+    if (kind === "active_project") {
+      const rawRef = args.reference != null ? args.reference : args.item;
+      const ref = normalizeActiveProjectReference(rawRef);
+      if (ref && ref.by === "recent") {
+        recentActiveProjectId = null;
+        schedulePersistRecentContinuity();
+      }
+    }
+  }
+
+  function getRecentContinuitySnapshot() {
+    return {
+      recent: {
+        priorityId: recentPriorityId,
+        activeProjectId: recentActiveProjectId,
+        workingContext: {
+          commitments: recentWcIds.commitments,
+          follow_ups: recentWcIds.follow_ups,
+          unresolved_items: recentWcIds.unresolved_items,
+        },
+      },
+    };
   }
 
   function fingerprintFailedArgs(args = {}, code = "NOT_FOUND") {
@@ -266,6 +511,7 @@ function createMemoryStore(options = {}) {
 
   function applyFailedRetryPolicy(args, result) {
     if (!result || (result.code !== "NOT_FOUND" && result.code !== "AMBIGUOUS_MATCH")) return result;
+    if (result.code === "NOT_FOUND") clearStaleRecentIfNeeded("priority", args);
     const fp = fingerprintFailedArgs(args, result.code);
     if (notFoundFingerprints.has(fp)) {
       const message =
@@ -776,6 +1022,25 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     }
 
     const rollover = await rolloverDailyIfNeeded();
+
+    if (!sessionContinuityHydrated) {
+      const loaded = await loadSessionContinuity({
+        memoryRootDir: paths.root,
+        fsApi,
+        pathExists,
+        readText: async (p) => readText(p),
+      });
+      const recent = loaded?.doc?.recent;
+      if (recent) {
+        recentPriorityId = coerceId(recent.priorityId);
+        recentActiveProjectId = coerceId(recent.activeProjectId);
+        recentWcIds.commitments = coerceId(recent.workingContext?.commitments);
+        recentWcIds.follow_ups = coerceId(recent.workingContext?.follow_ups);
+        recentWcIds.unresolved_items = coerceId(recent.workingContext?.unresolved_items);
+      }
+      sessionContinuityHydrated = true;
+    }
+
     return {
       ok: true,
       rootDir: paths.root,
@@ -1243,6 +1508,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
 
   function invalidatePreviews() {
     previewStore.clear();
+    clearPendingConfirmation();
   }
 
   const CARRY_PREVIEW_BINDING_VERSION = 1;
@@ -1399,29 +1665,67 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   }
 
   function storePreview(operation, beforePriorities, afterPriorities, dailyUpdatedAt, meta = {}) {
+    const toolName = "memory_priorities";
+    const scope = null;
+    const requestObj = meta.request || {};
+    const bindingKey = buildBindingKey(toolName, operation, scope, requestObj);
+    const shouldPending = DESTRUCTIVE_OPERATIONS.has(operation);
+    if (shouldPending) {
+      const reused = tryReusePendingPreview(toolName, operation, scope, bindingKey, dailyUpdatedAt);
+      if (reused) return reused;
+    }
+
     const token = createPreviewToken();
+    const expiresAt = Date.now() + PREVIEW_TTL_MS;
     const payload = { operation, beforePriorities, afterPriorities, dailyUpdatedAt, meta };
     previewStore.set(token, {
-      expiresAt: Date.now() + PREVIEW_TTL_MS,
+      expiresAt,
       operation,
       hash: hashPreviewPayload(payload),
       beforePriorities: clonePriorities(beforePriorities),
       afterPriorities: clonePriorities(afterPriorities),
       dailyUpdatedAt,
-      meta,
+      meta: { ...meta, bindingKey },
     });
+
+    if (shouldPending) {
+      setPendingConfirmation({
+        toolName,
+        operation,
+        scope,
+        previewToken: token,
+        expiresAt,
+        redactedSummary: redactConfirmationSummary(
+          meta.message,
+          operation,
+          Array.isArray(afterPriorities) ? afterPriorities.length : undefined,
+        ),
+        dailyUpdatedAt,
+        bindingKey,
+      });
+    }
     return token;
   }
 
   function readPreview(token, operation, dailyUpdatedAt) {
     const entry = previewStore.get(String(token || ""));
-    if (!entry) return { code: "STALE_PREVIEW" };
-    if (Date.now() > entry.expiresAt) {
-      previewStore.delete(token);
+    if (!entry) {
+      clearPendingIfMatchingToken(token);
       return { code: "STALE_PREVIEW" };
     }
-    if (entry.operation !== operation) return { code: "STALE_PREVIEW" };
-    if (entry.dailyUpdatedAt !== dailyUpdatedAt) return { code: "STALE_PREVIEW" };
+    if (Date.now() > entry.expiresAt) {
+      previewStore.delete(token);
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.operation !== operation) {
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.dailyUpdatedAt !== dailyUpdatedAt) {
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
     return { entry };
   }
 
@@ -1561,7 +1865,9 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
 
     return enqueue(async () => {
       const result = await runMemoryPrioritiesOperation(args, operation, startedAt);
-      return applyFailedRetryPolicy(args, result);
+      const out = applyFailedRetryPolicy(args, result);
+      await flushContinuityIfDirty();
+      return out;
     });
   }
 
@@ -1650,6 +1956,15 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
             resolveOpts,
           );
           if (planned.ok === false && planned.code !== "CONFIRMATION_REQUIRED") return planned;
+          ensurePendingFromPreviewToken({
+            toolName: "memory_priorities",
+            operation,
+            scope: null,
+            previewToken: planned.previewToken,
+            message: planned.message || `Confirmation required before ${operation.replace(/_/g, " ")}.`,
+            itemCount: Array.isArray(planned.after) ? planned.after.length : undefined,
+            dailyUpdatedAt: planned.dailyUpdatedAt || daily.updatedAt,
+          });
           return {
             ok: false,
             code: "CONFIRMATION_REQUIRED",
@@ -2120,6 +2435,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         const beforeIds = new Set(beforePriorities.map((item) => item.id));
         const inserted = result.priorities.find((item) => !beforeIds.has(item.id));
         recentPriorityId = inserted?.id || recentPriorityId;
+        schedulePersistRecentContinuity();
       }
       return result;
     }
@@ -2198,7 +2514,10 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         }
         const nextDaily = { ...daily, priorities: restoredPriorities };
         const result = await commitPriorityDaily(daily, nextDaily, operation, startedAt);
-        if (result.ok) recentPriorityId = result.priorities[0]?.id || recentPriorityId;
+        if (result.ok) {
+          recentPriorityId = result.priorities[0]?.id || recentPriorityId;
+          schedulePersistRecentContinuity();
+        }
         return result;
       }
       if (operation === "carry") {
@@ -2270,6 +2589,9 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       if (result.ok && preview.entry.meta?.removedId) {
         recentPriorityId = result.priorities[0]?.id || null;
       }
+      if (result.ok && (preview.entry.meta?.touchedId || preview.entry.meta?.removedId)) {
+        schedulePersistRecentContinuity();
+      }
       return result;
     }
 
@@ -2295,6 +2617,9 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       else if (operation === "add" || operation === "insert") {
         recentPriorityId = result.priorities[result.priorities.length - 1]?.id || recentPriorityId;
       }
+      if (planned.meta?.touchedId || operation === "add" || operation === "insert") {
+        schedulePersistRecentContinuity();
+      }
     }
     return result;
   }
@@ -2319,6 +2644,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
 
   function applyWcFailedRetryPolicy(args, result) {
     if (!result || (result.code !== "NOT_FOUND" && result.code !== "AMBIGUOUS_MATCH")) return result;
+    if (result.code === "NOT_FOUND") clearStaleRecentIfNeeded("wc", args);
     const fp = fingerprintWcFailedArgs(args, result.code);
     if (wcNotFoundFingerprints.has(fp)) {
       const message =
@@ -2482,10 +2808,28 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   }
 
   function storeWcPreview(operation, scope, beforeList, afterList, dailyUpdatedAt, meta = {}) {
+    const toolName = "working_context_items";
+    const normalizedScope = normalizeScope(scope);
+    const requestObj = meta.request || {};
+    const bindingKey = buildBindingKey(toolName, operation, normalizedScope, requestObj);
+    const shouldPending =
+      meta.setPending === true || DESTRUCTIVE_WC_OPERATIONS.has(operation);
+    if (shouldPending) {
+      const reused = tryReusePendingPreview(
+        toolName,
+        operation,
+        normalizedScope,
+        bindingKey,
+        dailyUpdatedAt,
+      );
+      if (reused) return reused;
+    }
+
     const token = createPreviewToken();
+    const expiresAt = Date.now() + PREVIEW_TTL_MS;
     const payload = { operation, scope, beforeList, afterList, dailyUpdatedAt, meta };
     previewStore.set(token, {
-      expiresAt: Date.now() + PREVIEW_TTL_MS,
+      expiresAt,
       operation,
       hash: hashPreviewPayload(payload),
       beforePriorities: [],
@@ -2494,22 +2838,55 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       afterList: cloneItems(afterList),
       afterDaily: meta.afterDaily || null,
       dailyUpdatedAt,
-      meta: { ...meta, scope, kind: "working_context" },
+      meta: { ...meta, scope, kind: "working_context", bindingKey },
     });
+
+    if (shouldPending) {
+      setPendingConfirmation({
+        toolName,
+        operation,
+        scope: normalizedScope,
+        previewToken: token,
+        expiresAt,
+        redactedSummary: redactConfirmationSummary(
+          meta.message,
+          operation,
+          Array.isArray(afterList) ? afterList.length : undefined,
+        ),
+        dailyUpdatedAt,
+        bindingKey,
+      });
+    }
     return token;
   }
 
   function readWcPreview(token, operation, dailyUpdatedAt, scope) {
     const entry = previewStore.get(String(token || ""));
-    if (!entry) return { code: "STALE_PREVIEW" };
-    if (Date.now() > entry.expiresAt) {
-      previewStore.delete(token);
+    if (!entry) {
+      clearPendingIfMatchingToken(token);
       return { code: "STALE_PREVIEW" };
     }
-    if (entry.operation !== operation) return { code: "STALE_PREVIEW" };
-    if (entry.dailyUpdatedAt !== dailyUpdatedAt) return { code: "STALE_PREVIEW" };
-    if (entry.meta?.kind !== "working_context") return { code: "STALE_PREVIEW" };
-    if (normalizeScope(entry.meta?.scope) !== normalizeScope(scope)) return { code: "STALE_PREVIEW" };
+    if (Date.now() > entry.expiresAt) {
+      previewStore.delete(token);
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.operation !== operation) {
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.dailyUpdatedAt !== dailyUpdatedAt) {
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.meta?.kind !== "working_context") {
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (normalizeScope(entry.meta?.scope) !== normalizeScope(scope)) {
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
     return { entry };
   }
 
@@ -2584,7 +2961,9 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
 
     return enqueue(async () => {
       const result = await runWorkingContextOperation(args, operation, startedAt);
-      return applyWcFailedRetryPolicy(args, result);
+      const out = applyWcFailedRetryPolicy(args, result);
+      await flushContinuityIfDirty();
+      return out;
     });
   }
 
@@ -2680,6 +3059,15 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
           helpers,
         );
         if (planned.ok === false && planned.code !== "CONFIRMATION_REQUIRED") return planned;
+        ensurePendingFromPreviewToken({
+          toolName: "working_context_items",
+          operation,
+          scope,
+          previewToken: planned.previewToken,
+          message: planned.message || `Confirmation required before ${operation.replace(/_/g, " ")}.`,
+          itemCount: Array.isArray(planned.after) ? planned.after.length : undefined,
+          dailyUpdatedAt: planned.dailyUpdatedAt || daily.updatedAt,
+        });
         return {
           ok: false,
           code: "CONFIRMATION_REQUIRED",
@@ -2754,6 +3142,12 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
                 daily.date,
               );
             }
+          }
+          if (
+            preview.entry.meta?.touchedIds?.[0] ||
+            (operation === "promote_to_priority" && preview.entry.meta?.promoted?.[0]?.priority?.id)
+          ) {
+            schedulePersistRecentContinuity();
           }
         }
         return result;
@@ -2840,6 +3234,8 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         afterDaily,
         backupFile: loaded.file.name,
         request,
+        setPending: true,
+        message: `Preview ready for restore of ${scopeTitle(scope).toLowerCase()} from ${loaded.file.name}. Confirm to apply.`,
       });
       return {
         ok: true,
@@ -2876,13 +3272,17 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     const beforeList = planned.beforeList || cloneItems(getListForScope(daily, scope));
     const afterList = planned.afterList || cloneItems(getListForScope(planned.nextDaily, scope));
     const request = buildWcPreviewRequestBinding(args);
+    const destructive = requiresConfirmation(operation, planned);
     const token = storeWcPreview(operation, scope, beforeList, afterList, daily.updatedAt, {
       ...planned.meta,
       afterDaily: planned.nextDaily,
       destinationScope: planned.destinationScope,
       request,
+      setPending: destructive,
+      message: destructive
+        ? `Preview ready for ${operation.replace(/_/g, " ")}. Confirm to apply.`
+        : `Dry-run only for ${operation.replace(/_/g, " ")}.`,
     });
-    const destructive = requiresConfirmation(operation, planned);
     return {
       ok: true,
       operation: args._previewOnly ? operation : "preview",
@@ -2957,13 +3357,18 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       planned.meta?.allowedKeys || [scopeKey(scope)],
     );
     if (result.ok) {
-      if (planned.meta?.touchedIds?.[0]) recentWcIds[scope] = planned.meta.touchedIds[0];
-      else if (operation === "add" || operation === "insert") {
+      let recentChanged = false;
+      if (planned.meta?.touchedIds?.[0]) {
+        recentWcIds[scope] = planned.meta.touchedIds[0];
+        recentChanged = true;
+      } else if (operation === "add" || operation === "insert") {
         const items = result.items || [];
         recentWcIds[scope] = items[items.length - 1]?.id || recentWcIds[scope];
+        recentChanged = true;
       }
       if (operation === "promote_to_priority" && planned.meta?.promoted?.[0]?.priority?.id) {
         recentPriorityId = planned.meta.promoted[0].priority.id;
+        recentChanged = true;
         result.priorities = canonicalizePriorities(planned.nextDaily.priorities);
         result.linked = planned.meta.promoted.map((row) => ({
           sourceId: row.source.id,
@@ -2977,6 +3382,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
           daily.date,
         );
       }
+      if (recentChanged) schedulePersistRecentContinuity();
     }
     return result;
   }
@@ -3023,18 +3429,23 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
 
   function updateRecentActiveProjectId(operation, meta, nextProjects) {
     const mode = meta?.recentMode;
+    let changed = false;
     if (mode === "last_new" || mode === "touched") {
       const ids = meta.touchedIds || [];
-      if (ids.length) recentActiveProjectId = ids[ids.length - 1];
-      return;
-    }
-    if (mode === "remove") {
-      if (meta.removedId && recentActiveProjectId === meta.removedId) recentActiveProjectId = null;
-      return;
-    }
-    if (mode === "replace") {
+      if (ids.length) {
+        recentActiveProjectId = ids[ids.length - 1];
+        changed = true;
+      }
+    } else if (mode === "remove") {
+      if (meta.removedId && recentActiveProjectId === meta.removedId) {
+        recentActiveProjectId = null;
+        changed = true;
+      }
+    } else if (mode === "replace") {
       recentActiveProjectId = nextProjects?.[0]?.id || null;
+      changed = true;
     }
+    if (changed) schedulePersistRecentContinuity();
   }
 
   async function commitActiveProjectsDaily(beforeDaily, nextDaily, operation, startedAt, allowedKeys) {
@@ -3132,10 +3543,18 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   }
 
   function storeActiveProjectsPreview(operation, beforeList, afterList, dailyUpdatedAt, meta = {}) {
+    const toolName = "memory_active_projects";
+    const scope = null;
+    const requestObj = meta.request || {};
+    const bindingKey = buildBindingKey(toolName, operation, scope, requestObj);
+    const reused = tryReusePendingPreview(toolName, operation, scope, bindingKey, dailyUpdatedAt);
+    if (reused) return reused;
+
     const token = createPreviewToken();
+    const expiresAt = Date.now() + PREVIEW_TTL_MS;
     const payload = { operation, beforeList, afterList, dailyUpdatedAt, meta };
     previewStore.set(token, {
-      expiresAt: Date.now() + PREVIEW_TTL_MS,
+      expiresAt,
       operation,
       hash: hashPreviewPayload(payload),
       beforePriorities: [],
@@ -3144,21 +3563,49 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       afterList: cloneProjects(afterList),
       afterDaily: meta.afterDaily || null,
       dailyUpdatedAt,
-      meta: { ...meta, kind: "active_projects" },
+      meta: { ...meta, kind: "active_projects", bindingKey },
+    });
+
+    setPendingConfirmation({
+      toolName,
+      operation,
+      scope,
+      previewToken: token,
+      expiresAt,
+      redactedSummary: redactConfirmationSummary(
+        meta.message,
+        operation,
+        Array.isArray(afterList) ? afterList.length : undefined,
+      ),
+      dailyUpdatedAt,
+      bindingKey,
     });
     return token;
   }
 
   function readActiveProjectsPreview(token, operation, dailyUpdatedAt) {
     const entry = previewStore.get(String(token || ""));
-    if (!entry) return { code: "STALE_PREVIEW" };
-    if (Date.now() > entry.expiresAt) {
-      previewStore.delete(token);
+    if (!entry) {
+      clearPendingIfMatchingToken(token);
       return { code: "STALE_PREVIEW" };
     }
-    if (entry.operation !== operation) return { code: "STALE_PREVIEW" };
-    if (entry.dailyUpdatedAt !== dailyUpdatedAt) return { code: "STALE_PREVIEW" };
-    if (entry.meta?.kind !== "active_projects") return { code: "STALE_PREVIEW" };
+    if (Date.now() > entry.expiresAt) {
+      previewStore.delete(token);
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.operation !== operation) {
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.dailyUpdatedAt !== dailyUpdatedAt) {
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.meta?.kind !== "active_projects") {
+      clearPendingIfMatchingToken(token);
+      return { code: "STALE_PREVIEW" };
+    }
     return { entry };
   }
 
@@ -3279,6 +3726,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         allowedKeys: ["activeProjects"],
         recentMode: "replace",
         request: buildActiveProjectsPreviewRequestBinding(args),
+        message: `Preview ready for restore from ${loaded.file.name}. Confirm to apply.`,
       });
       return {
         ok: true,
@@ -3314,6 +3762,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
           touchedIds: planned.meta?.touchedIds,
           removedId: planned.meta?.removedId,
           request: buildActiveProjectsPreviewRequestBinding(args),
+          message: `Preview ready for ${operation.replace(/_/g, " ")}. Confirm to apply.`,
         })
       : null;
 
@@ -3573,6 +4022,14 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     }
 
     return enqueue(async () => {
+      const result = await runMemoryActiveProjectsOperation(args, operation, startedAt);
+      if (result && result.code === "NOT_FOUND") clearStaleRecentIfNeeded("active_project", args);
+      await flushContinuityIfDirty();
+      return result;
+    });
+  }
+
+  async function runMemoryActiveProjectsOperation(args, operation, startedAt) {
       await ensureMemoryUnlocked();
       await rolloverDailyIfNeeded();
       const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
@@ -3655,6 +4112,15 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
             helpers,
           );
           if (planned.ok === false && planned.code !== "CONFIRMATION_REQUIRED") return planned;
+          ensurePendingFromPreviewToken({
+            toolName: "memory_active_projects",
+            operation,
+            scope: null,
+            previewToken: planned.previewToken,
+            message: planned.message || `Confirmation required before ${operation.replace(/_/g, " ")}.`,
+            itemCount: Array.isArray(planned.after) ? planned.after.length : undefined,
+            dailyUpdatedAt: planned.dailyUpdatedAt || daily.updatedAt,
+          });
           return {
             ok: false,
             code: "CONFIRMATION_REQUIRED",
@@ -3690,7 +4156,6 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
             dailyUpdatedAt: daily.updatedAt,
           });
         }
-
         if (operation === "restore_backup") {
           const backupFile = preview.entry.meta?.backupFile;
           if (!backupFile) {
@@ -3784,11 +4249,20 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
               },
             );
           }
-          const nextDaily = { ...daily, activeProjects: cloneProjects(restored) };
-          const result = await commitActiveProjectsDaily(daily, nextDaily, operation, startedAt, [
-            "activeProjects",
-          ]);
-          if (result.ok) updateRecentActiveProjectId(operation, { recentMode: "replace" }, restored);
+          const afterDaily = {
+            ...daily,
+            activeProjects: cloneProjects(restored),
+          };
+          const result = await commitActiveProjectsDaily(
+            daily,
+            afterDaily,
+            operation,
+            startedAt,
+            preview.entry.meta?.allowedKeys || ["activeProjects"],
+          );
+          if (result.ok) {
+            updateRecentActiveProjectId(operation, preview.entry.meta, afterDaily.activeProjects || []);
+          }
           return result;
         }
 
@@ -3819,7 +4293,6 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       }
 
       return applyActiveProjectsOperation(args, daily, startedAt, helpers);
-    });
   }
 
   return {
@@ -3859,6 +4332,11 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     atomicWriteJson,
     atomicWriteText,
     todayDate,
+    getPendingConfirmation: () => getPendingConfirmationPublic(),
+    getPendingConfirmationInternal: () => getPendingConfirmationInternal(),
+    dismissPendingConfirmation,
+    getRecentContinuitySnapshot,
+    persistRecentContinuity,
     // test helpers
     _test: {
       getRecentPriorityId: () => recentPriorityId,
@@ -3880,6 +4358,15 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         wcNotFoundFingerprints.clear();
       },
       getPreviewEntry: (token) => previewStore.get(String(token || "")) || null,
+      getPendingConfirmation: () => getPendingConfirmationPublic(),
+      getPendingConfirmationInternal: () => getPendingConfirmationInternal(),
+      setPendingConfirmation: (entry) => setPendingConfirmation(entry),
+      clearPending: () => clearPendingConfirmation(),
+      getPreviewStoreSize: () => previewStore.size,
+      forcePersistContinuity: () =>
+        enqueue(async () => {
+          await persistRecentContinuity();
+        }),
     },
   };
 }

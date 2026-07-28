@@ -276,7 +276,7 @@ test("App and TextClient source enforce delivery before clear", () => {
   assert.match(viteEnv, /runTextTurn:\s*\(request: JarvisTextTurnRequest\)\s*=>\s*Promise<JarvisTextTurnResult>/);
   assert.match(preload, /runTextTurn:\s*\(request\)\s*=>\s*ipcRenderer\.invoke\("text:run"/);
 
-  assert.match(textClient, /onAssistantText\(plan\.assistantText,\s*clientTurnId\)/);
+  assert.match(textClient, /onAssistantText\(guardedText,\s*clientTurnId\)/);
   assert.match(textClient, /planTextResultDelivery/);
   assert.match(textClient, /text\.delivery\.main/);
   assert.match(textClient, /text\.delivery\.client/);

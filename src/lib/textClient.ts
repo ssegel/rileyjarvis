@@ -6,8 +6,16 @@ import {
 } from "./textDelivery";
 import { buildTurnArtifactDelivery, selectTurnArtifacts } from "./artifactSelection";
 import { guardArtifactPanelNarration } from "./textPanelActivation";
+import {
+  TEXT_AUTO_NETWORK_RETRY_DELAY_MS,
+  computeTextCooldownMs,
+  isTextManualRetryAllowed,
+  textCooldownUserMessage,
+} from "./realtimeErrors";
 import type {
+  JarvisPendingConfirmationHint,
   JarvisTextHistoryItem,
+  JarvisTextTurnError,
   JarvisTextTurnResult,
   RickyArtifact,
 } from "../vite-env";
@@ -21,13 +29,24 @@ export type TextTurnState =
   | "cancelled"
   | "error";
 
+export type TextClientErrorDetails = {
+  code?: string;
+  message: string;
+  retryable?: boolean;
+  httpStatus?: number;
+  retryAfterMs?: number;
+  cooldownMs?: number;
+  safeForAutoNetworkRetry?: boolean;
+  consecutiveRateLimited?: number;
+};
+
 export type TextClientCallbacks = {
   onState: (state: TextTurnState) => void;
   onStatus: (message: string) => void;
   onUserText: (text: string) => void;
   onAssistantText: (text: string, clientTurnId: string) => void;
   onArtifact: (artifact: RickyArtifact) => void;
-  onError: (message: string, code?: string) => void;
+  onError: (message: string, code?: string, details?: TextClientErrorDetails) => void;
 };
 
 export class TextClient {
@@ -36,10 +55,22 @@ export class TextClient {
   private generation = 0;
   private callbacks: TextClientCallbacks;
   private diagnostics: RealtimeDiagnosticsBuffer;
+  private autoNetworkRetriesUsed = 0;
+  private consecutiveRateLimited = 0;
+  private cooldownAttemptIndex = 0;
+  private buildInfo: { version?: string; gitSha?: string; branch?: string } = { version: "1.0.0" };
 
   constructor(callbacks: TextClientCallbacks, diagnostics?: RealtimeDiagnosticsBuffer) {
     this.callbacks = callbacks;
     this.diagnostics = diagnostics || new RealtimeDiagnosticsBuffer();
+  }
+
+  setBuildInfo(info: { version?: string; gitSha?: string | null; branch?: string | null } | null | undefined): void {
+    this.buildInfo = {
+      version: info?.version || "1.0.0",
+      gitSha: info?.gitSha || undefined,
+      branch: info?.branch || undefined,
+    };
   }
 
   getState(): TextTurnState {
@@ -61,20 +92,71 @@ export class TextClient {
     );
   }
 
-  getDiagnosticReport(lastErrorCode?: string): string {
-    return this.diagnostics.buildCopyableReport({
-      appVersion: "1.0.0",
+  resetCooldownCounters(): void {
+    this.autoNetworkRetriesUsed = 0;
+    this.consecutiveRateLimited = 0;
+    this.cooldownAttemptIndex = 0;
+  }
+
+  getDiagnosticReport(
+    lastErrorCode?: string,
+    extras?: {
+      connectionState?: string;
+      cooldownUntilMs?: number | null;
+      pending?: { toolName?: string; operation?: string; scope?: string | null; expiresAt?: number } | null;
+      composerChars?: number;
+    },
+  ): string {
+    const base = this.diagnostics.buildCopyableReport({
+      appVersion: this.buildInfo.version || "1.0.0",
+      branch: this.buildInfo.branch || this.buildInfo.gitSha || "unknown",
       platform: typeof navigator !== "undefined" ? navigator.platform : "unknown",
       userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
       lastErrorCode,
     });
+    const continuityLines = [
+      "",
+      "Daily-use status:",
+      JSON.stringify(
+        {
+          connectionState: extras?.connectionState || null,
+          gitSha: this.buildInfo.gitSha || null,
+          cooldownUntilMs: extras?.cooldownUntilMs ?? null,
+          pendingOperation: extras?.pending
+            ? {
+                toolName: extras.pending.toolName || null,
+                operation: extras.pending.operation || null,
+                scope: extras.pending.scope ?? null,
+                expiresAt: extras.pending.expiresAt ?? null,
+              }
+            : null,
+          composerChars: typeof extras?.composerChars === "number" ? extras.composerChars : undefined,
+          restartPolicyNote: "Pending confirmations do not survive restart.",
+        },
+        null,
+        2,
+      ),
+    ];
+    return `${base}\n${continuityLines.join("\n")}`;
   }
 
-  async submit(text: string, history: JarvisTextHistoryItem[] = []): Promise<JarvisTextTurnResult | null> {
+  async submit(
+    text: string,
+    history: JarvisTextHistoryItem[] = [],
+    options: {
+      pendingConfirmation?: JarvisPendingConfirmationHint | null;
+      isAutoNetworkRetry?: boolean;
+    } = {},
+  ): Promise<JarvisTextTurnResult | null> {
     const trimmed = text.trim();
     if (!trimmed) return null;
     if (this.isActive()) {
-      this.callbacks.onError("Jarvis is busy with another text turn.", "session.error");
+      this.callbacks.onError("Jarvis is busy with another text turn.", "session.error", {
+        code: "session.error",
+        message: "Jarvis is busy with another text turn.",
+        retryable: false,
+        safeForAutoNetworkRetry: false,
+      });
       return {
         ok: false,
         clientTurnId: "",
@@ -89,15 +171,21 @@ export class TextClient {
         durationMs: 0,
         outcome: "rejected",
         cancelled: false,
-        error: { code: "session.error", message: "Jarvis is busy with another text turn." },
+        error: { code: "session.error", message: "Jarvis is busy with another text turn.", retryable: false },
       };
+    }
+
+    if (!options.isAutoNetworkRetry) {
+      this.autoNetworkRetriesUsed = 0;
     }
 
     const clientTurnId = crypto.randomUUID();
     const generation = ++this.generation;
     this.activeTurnId = clientTurnId;
     this.setState("sending");
-    this.callbacks.onUserText(trimmed);
+    if (!options.isAutoNetworkRetry) {
+      this.callbacks.onUserText(trimmed);
+    }
     this.diag("info", "text.turn.start", "Text turn started", clientTurnId);
 
     try {
@@ -106,6 +194,7 @@ export class TextClient {
         clientTurnId,
         text: trimmed,
         history,
+        pendingConfirmation: options.pendingConfirmation || undefined,
       });
 
       const mainText = readAssistantText(result);
@@ -140,7 +229,7 @@ export class TextClient {
           durationMs: result?.durationMs || 0,
           outcome: "cancelled",
           cancelled: true,
-          error: { code: "session.error", message: "Text request cancelled." },
+          error: { code: "session.error", message: "Text request cancelled.", retryable: false },
         };
       }
 
@@ -152,11 +241,7 @@ export class TextClient {
       }
 
       if (plan.action === "reject" && (plan.reason === "error" || plan.reason === "missing")) {
-        this.setState("error");
-        const message = result?.error?.message || "The text request failed. Try again.";
-        this.callbacks.onError(message, result?.error?.code);
-        this.diag("error", "text.turn.error", message, clientTurnId, result);
-        return result;
+        return await this.handleTurnFailure(result, clientTurnId, trimmed, history, options);
       }
 
       if (plan.action === "empty_error") {
@@ -170,17 +255,20 @@ export class TextClient {
             code: "api.bad_response",
             message: "Jarvis returned no visible response.",
             retryable: true,
+            safeForAutoNetworkRetry: false,
           },
         };
-        this.setState("error");
-        this.callbacks.onError(emptyResult.error!.message, emptyResult.error!.code);
-        this.diag("error", "text.turn.empty", emptyResult.error!.message, clientTurnId, emptyResult);
-        return emptyResult;
+        return await this.handleTurnFailure(emptyResult, clientTurnId, trimmed, history, options);
       }
 
       if (plan.action !== "deliver") {
         this.setState("error");
-        this.callbacks.onError("The text request failed. Try again.", "unknown");
+        this.emitFailure({
+          code: "unknown",
+          message: "The text request failed. Try again.",
+          retryable: true,
+          safeForAutoNetworkRetry: false,
+        });
         return result;
       }
 
@@ -219,6 +307,7 @@ export class TextClient {
       );
 
       this.setState("completed");
+      this.resetCooldownCounters();
       this.diag("info", "text.turn.completed", "Text turn completed", clientTurnId, result);
       // Preserve nonempty assistantText on the returned result for App verification.
       return {
@@ -237,7 +326,12 @@ export class TextClient {
     } catch (error) {
       const message = error instanceof Error ? error.message : "The text request failed. Try again.";
       this.setState("error");
-      this.callbacks.onError(message, "unknown");
+      this.emitFailure({
+        code: "unknown",
+        message,
+        retryable: true,
+        safeForAutoNetworkRetry: false,
+      });
       this.diag("error", "text.turn.exception", message, clientTurnId);
       return null;
     } finally {
@@ -261,6 +355,84 @@ export class TextClient {
       }
       this.setState("cancelled");
     }
+  }
+
+  private async handleTurnFailure(
+    result: JarvisTextTurnResult | null | undefined,
+    clientTurnId: string,
+    trimmed: string,
+    history: JarvisTextHistoryItem[],
+    options: {
+      pendingConfirmation?: JarvisPendingConfirmationHint | null;
+      isAutoNetworkRetry?: boolean;
+    },
+  ): Promise<JarvisTextTurnResult | null> {
+    const raw = result?.error;
+    const canAuto =
+      raw?.safeForAutoNetworkRetry === true &&
+      raw?.code === "network.offline" &&
+      this.autoNetworkRetriesUsed < 1 &&
+      !options.isAutoNetworkRetry;
+
+    if (canAuto) {
+      this.autoNetworkRetriesUsed += 1;
+      this.diag("warn", "text.turn.auto_network_retry", "One safe network auto-retry", clientTurnId, result);
+      this.activeTurnId = null;
+      await sleep(TEXT_AUTO_NETWORK_RETRY_DELAY_MS);
+      return this.submit(trimmed, history, {
+        pendingConfirmation: options.pendingConfirmation,
+        isAutoNetworkRetry: true,
+      });
+    }
+
+    if (raw?.code === "rate_limited") {
+      this.consecutiveRateLimited += 1;
+    } else {
+      this.consecutiveRateLimited = 0;
+    }
+    const error = enrichTextError(raw, this.cooldownAttemptIndex, this.consecutiveRateLimited);
+    this.cooldownAttemptIndex += 1;
+
+    this.setState("error");
+    this.emitFailure(error);
+    this.diag("error", "text.turn.error", error.message, clientTurnId, result);
+    return result
+      ? {
+          ...result,
+          error: {
+            ...result.error,
+            ...error,
+          },
+        }
+      : null;
+  }
+
+  private emitFailure(error: JarvisTextTurnError & TextClientErrorDetails): void {
+    const cooldownMs =
+      typeof error.cooldownMs === "number"
+        ? error.cooldownMs
+        : isTextManualRetryAllowed(error.code)
+          ? computeTextCooldownMs(
+              Math.max(0, this.cooldownAttemptIndex - 1),
+              error.retryAfterMs,
+              error.code === "rate_limited" ? this.consecutiveRateLimited : 0,
+            )
+          : undefined;
+    const message =
+      cooldownMs != null && isTextManualRetryAllowed(error.code)
+        ? textCooldownUserMessage(
+            error.code || "unknown",
+            cooldownMs,
+            error.code === "rate_limited" ? this.consecutiveRateLimited : 0,
+          )
+        : error.message || "The text request failed. Try again.";
+    this.callbacks.onError(message, error.code, {
+      ...error,
+      message,
+      cooldownMs,
+      consecutiveRateLimited:
+        error.code === "rate_limited" ? this.consecutiveRateLimited : undefined,
+    });
   }
 
   private setState(state: TextTurnState): void {
@@ -296,6 +468,10 @@ export class TextClient {
         result?.usage ? `inputTokens=${result.usage.inputTokens}` : null,
         result?.usage ? `outputTokens=${result.usage.outputTokens}` : null,
         result?.error?.httpStatus != null ? `httpStatus=${result.error.httpStatus}` : null,
+        result?.error?.retryAfterMs != null ? `retryAfterMs=${result.error.retryAfterMs}` : null,
+        result?.error?.safeForAutoNetworkRetry != null
+          ? `safeForAutoNetworkRetry=${result.error.safeForAutoNetworkRetry}`
+          : null,
         result?.error?.apiErrorType ? `apiErrorType=${result.error.apiErrorType}` : null,
         result?.error?.apiErrorCode ? `apiErrorCode=${result.error.apiErrorCode}` : null,
         result?.error?.apiErrorParam ? `apiErrorParam=${result.error.apiErrorParam}` : null,
@@ -305,6 +481,37 @@ export class TextClient {
       errorCode: result?.error?.code,
     });
   }
+}
+
+export function enrichTextError(
+  error: JarvisTextTurnError | undefined,
+  attemptIndex: number,
+  consecutiveRateLimited: number,
+): JarvisTextTurnError & TextClientErrorDetails {
+  const code = error?.code || "unknown";
+  const retryAfterMs = error?.retryAfterMs;
+  const retryable =
+    typeof error?.retryable === "boolean" ? error.retryable : isTextManualRetryAllowed(code);
+  const cooldownMs = isTextManualRetryAllowed(code)
+    ? computeTextCooldownMs(attemptIndex, retryAfterMs, consecutiveRateLimited)
+    : undefined;
+  return {
+    code,
+    message: error?.message || "The text request failed. Try again.",
+    httpStatus: error?.httpStatus,
+    retryable,
+    retryAfterMs,
+    cooldownMs,
+    safeForAutoNetworkRetry: error?.safeForAutoNetworkRetry === true,
+    consecutiveRateLimited: code === "rate_limited" ? consecutiveRateLimited : undefined,
+    apiErrorType: error?.apiErrorType,
+    apiErrorCode: error?.apiErrorCode,
+    apiErrorParam: error?.apiErrorParam,
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export {

@@ -27,6 +27,14 @@ const NON_RETRYABLE = new Set([
 ]);
 
 const RETRY_AFTER_CAP_MS = 30_000;
+/** Text cooldown honors Retry-After up to 60s (Realtime connect remains 30s). */
+const TEXT_RETRY_AFTER_CAP_MS = 60_000;
+const TEXT_COOLDOWN_FALLBACK_MS = Object.freeze([1000, 2000, 4000, 8000]);
+const TEXT_REPEATED_429_FLOOR_MS = 30_000;
+const TEXT_REPEATED_429_MESSAGE_AFTER = 3;
+const TEXT_AUTO_NETWORK_RETRY_DELAY_MS = 750;
+/** Sanity bound when parsing Retry-After before policy caps apply. */
+const RETRY_AFTER_PARSE_SANITY_MS = 86_400_000;
 
 function userMessageForCode(code) {
   return USER_MESSAGES[code] || USER_MESSAGES.unknown;
@@ -34,6 +42,67 @@ function userMessageForCode(code) {
 
 function isRetryableCode(code) {
   return !NON_RETRYABLE.has(code);
+}
+
+/** Manual Retry allowed after cooldown for these text failure codes. */
+function isTextManualRetryAllowed(code) {
+  if (!code) return false;
+  if (
+    code === "quota.exhausted" ||
+    code === "config.missing_api_key" ||
+    code === "config.invalid_api_key"
+  ) {
+    return false;
+  }
+  return isRetryableCode(code);
+}
+
+/** Countdown UI is never shown for quota or other non-manual-retry codes. */
+function showsTextRetryCountdown(code) {
+  return isTextManualRetryAllowed(code);
+}
+
+/**
+ * Text cooldown policy (§3).
+ * @param {number} attemptIndex zero-based fallback index for this cooldown chain
+ * @param {number|undefined} retryAfterMs parsed Retry-After (may be uncapped)
+ * @param {number} [consecutiveRateLimited=0] consecutive user-facing rate_limited count
+ */
+function computeTextCooldownMs(attemptIndex, retryAfterMs, consecutiveRateLimited = 0) {
+  let computed;
+  if (typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs >= 0) {
+    computed = Math.min(retryAfterMs, TEXT_RETRY_AFTER_CAP_MS);
+  } else {
+    const idx = Math.min(Math.max(0, Number(attemptIndex) || 0), TEXT_COOLDOWN_FALLBACK_MS.length - 1);
+    computed = TEXT_COOLDOWN_FALLBACK_MS[idx];
+  }
+  if (Number(consecutiveRateLimited) >= TEXT_REPEATED_429_MESSAGE_AFTER) {
+    computed = Math.max(computed, TEXT_REPEATED_429_FLOOR_MS);
+  }
+  return computed;
+}
+
+function textCooldownUserMessage(code, cooldownMs, consecutiveRateLimited = 0) {
+  const base = userMessageForCode(code);
+  if (!showsTextRetryCountdown(code)) {
+    return base;
+  }
+  const seconds = Math.max(1, Math.ceil(Number(cooldownMs || 0) / 1000));
+  let message = `${base} You can retry in ${seconds}s.`;
+  if (code === "rate_limited" && Number(consecutiveRateLimited) >= TEXT_REPEATED_429_MESSAGE_AFTER) {
+    message = `${base} Wait longer / try later. You can retry in ${seconds}s.`;
+  }
+  return message;
+}
+
+function formatRetryAvailableAt(cooldownUntilMs, nowMs = Date.now()) {
+  const until = Number(cooldownUntilMs);
+  if (!Number.isFinite(until) || until <= nowMs) return null;
+  try {
+    return new Date(until).toLocaleTimeString();
+  } catch {
+    return null;
+  }
 }
 
 function looksLikeHtml(text) {
@@ -64,19 +133,29 @@ function sanitizeDiagnosticText(raw, maxLength = 160) {
   return text;
 }
 
-function parseRetryAfterMs(headerValue) {
+/**
+ * Parse Retry-After. Optional capMs defaults to Realtime 30s for backward compatibility.
+ * Pass null/undefined explicitly via options for uncapped (sanity-bounded) parse used by classification.
+ */
+function parseRetryAfterMs(headerValue, capMs = RETRY_AFTER_CAP_MS) {
   if (!headerValue) return undefined;
   const trimmed = String(headerValue).trim();
   if (!trimmed) return undefined;
+  let ms;
   const asSeconds = Number(trimmed);
   if (Number.isFinite(asSeconds) && asSeconds >= 0) {
-    return Math.min(Math.round(asSeconds * 1000), RETRY_AFTER_CAP_MS);
+    ms = Math.round(asSeconds * 1000);
+  } else {
+    const asDate = Date.parse(trimmed);
+    if (!Number.isNaN(asDate)) {
+      ms = Math.max(0, asDate - Date.now());
+    } else {
+      return undefined;
+    }
   }
-  const asDate = Date.parse(trimmed);
-  if (!Number.isNaN(asDate)) {
-    return Math.min(Math.max(0, asDate - Date.now()), RETRY_AFTER_CAP_MS);
-  }
-  return undefined;
+  ms = Math.min(ms, RETRY_AFTER_PARSE_SANITY_MS);
+  if (capMs == null || !Number.isFinite(capMs)) return ms;
+  return Math.min(ms, capMs);
 }
 
 function bodyHash(bodyText) {
@@ -105,7 +184,8 @@ function classifyHttpFailure(options) {
   const httpStatus = Number(options.httpStatus);
   const bodyText = String(options.bodyText || "");
   const lower = bodyText.toLowerCase();
-  const retryAfterMs = parseRetryAfterMs(options.retryAfterHeader);
+  // Store uncapped (sanity-bounded) Retry-After; Realtime/text policies apply their own caps.
+  const retryAfterMs = parseRetryAfterMs(options.retryAfterHeader, null);
   const hash = bodyHash(bodyText);
 
   if (httpStatus === 401 || httpStatus === 403) {
@@ -169,8 +249,18 @@ function badTokenResponseError(reason) {
 module.exports = {
   USER_MESSAGES,
   RETRY_AFTER_CAP_MS,
+  TEXT_RETRY_AFTER_CAP_MS,
+  TEXT_COOLDOWN_FALLBACK_MS,
+  TEXT_REPEATED_429_FLOOR_MS,
+  TEXT_REPEATED_429_MESSAGE_AFTER,
+  TEXT_AUTO_NETWORK_RETRY_DELAY_MS,
   userMessageForCode,
   isRetryableCode,
+  isTextManualRetryAllowed,
+  showsTextRetryCountdown,
+  computeTextCooldownMs,
+  textCooldownUserMessage,
+  formatRetryAvailableAt,
   looksLikeHtml,
   sanitizeDiagnosticText,
   parseRetryAfterMs,

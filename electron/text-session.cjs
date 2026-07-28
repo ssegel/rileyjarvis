@@ -65,6 +65,7 @@ function createTextSessionController(deps) {
       return failResult("session.error", "Jarvis is busy with another text turn.", startedAt, now, {
         outcome: "rejected",
         clientTurnId,
+        retryable: false,
       });
     }
 
@@ -95,6 +96,13 @@ function createTextSessionController(deps) {
     /** @type {Set<string>} */
     const executedCallIds = new Set();
     let usage = { inputTokens: 0, outputTokens: 0, model };
+    /**
+     * Phase 17: auto network retry only when fetch threw before any HTTP response
+     * and before any tool/parsed response work.
+     */
+    let obtainedHttpResponse = false;
+    let parsedSuccessfulResponse = false;
+    let invokedToolCall = false;
 
     try {
       const instructions = await buildInstructions();
@@ -104,6 +112,29 @@ function createTextSessionController(deps) {
       let input = buildInitialInput(text, history);
       let assistantText = "";
       let loops = 0;
+      const pendingHint =
+        request?.pendingConfirmation && typeof request.pendingConfirmation === "object"
+          ? request.pendingConfirmation
+          : null;
+      if (pendingHint && pendingHint.previewToken && pendingHint.toolName && pendingHint.operation) {
+        // Attach a structured hint so the model reuses the same preview token (never log the token).
+        const hintLines = [
+          "PENDING CONFIRMATION (same-process; reuse — do not remint while valid):",
+          `toolName=${String(pendingHint.toolName)}`,
+          `operation=${String(pendingHint.operation)}`,
+          pendingHint.scope ? `scope=${String(pendingHint.scope)}` : null,
+          `previewToken=${String(pendingHint.previewToken)}`,
+          "Call the same tool with confirmed=true and this exact previewToken. Do not request a new preview for the same operation while this token remains valid.",
+        ].filter(Boolean);
+        input = [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: hintLines.join("\n") }],
+          },
+          ...input,
+        ];
+      }
 
       while (loops < maxToolLoops) {
         loops += 1;
@@ -116,6 +147,7 @@ function createTextSessionController(deps) {
             toolTrace,
             clientTurnId,
             model,
+            safeForAutoNetworkRetry: false,
           });
         }
 
@@ -129,7 +161,12 @@ function createTextSessionController(deps) {
           signal: abort.signal,
           classifyHttpFailure,
           createTokenError,
+          onHttpResponseReceived: () => {
+            obtainedHttpResponse = true;
+          },
         });
+        obtainedHttpResponse = true;
+        parsedSuccessfulResponse = true;
 
         usage = mergeUsage(usage, response.usage, model);
         const output = Array.isArray(response.output) ? response.output : [];
@@ -146,6 +183,7 @@ function createTextSessionController(deps) {
               toolTrace,
               clientTurnId,
               model,
+              safeForAutoNetworkRetry: false,
             });
           }
           const durationMs = now() - startedAt;
@@ -182,6 +220,7 @@ function createTextSessionController(deps) {
                 code: "api.bad_response",
                 message: "Jarvis returned no visible response.",
                 retryable: true,
+                safeForAutoNetworkRetry: false,
               },
             };
           }
@@ -228,6 +267,7 @@ function createTextSessionController(deps) {
               toolTrace,
               clientTurnId,
               model,
+              safeForAutoNetworkRetry: false,
             });
           }
           const name = String(call.name || "");
@@ -242,6 +282,7 @@ function createTextSessionController(deps) {
           } catch {
             args = {};
           }
+          invokedToolCall = true;
           const result = await executeTool({ name, arguments: args });
           if (abort.signal.aborted) {
             return abortedOutcome({
@@ -252,6 +293,7 @@ function createTextSessionController(deps) {
               toolTrace,
               clientTurnId,
               model,
+              safeForAutoNetworkRetry: false,
             });
           }
           toolTrace.push({
@@ -273,6 +315,7 @@ function createTextSessionController(deps) {
         toolTrace,
         clientTurnId,
         outcome: "error",
+        safeForAutoNetworkRetry: false,
       });
     } catch (error) {
       if (abort.signal.aborted || (error && error.name === "AbortError")) {
@@ -284,10 +327,17 @@ function createTextSessionController(deps) {
           toolTrace,
           clientTurnId,
           model,
+          safeForAutoNetworkRetry: false,
         });
       }
       const classified = classifyThrown(error, classifyHttpFailure);
       const durationMs = now() - startedAt;
+      // Audit §4.2: safe only if fetch threw before any HTTP response and before tools/parse.
+      const finalSafe =
+        classified.code === "network.offline" &&
+        !obtainedHttpResponse &&
+        !parsedSuccessfulResponse &&
+        !invokedToolCall;
       logTextUsage({
         clientTurnId,
         model,
@@ -301,39 +351,50 @@ function createTextSessionController(deps) {
         apiErrorCode: classified.apiErrorCode,
         apiErrorParam: classified.apiErrorParam,
       });
-    return {
-      ok: false,
-      clientTurnId,
-      assistantText: "",
-      artifacts: [],
-      toolNames: [],
-      artifactCount: 0,
-      selectedArtifact: null,
-      hasSubstantiveArtifact: false,
-      toolTrace,
-      usage,
-      durationMs,
-      outcome: "error",
-      cancelled: false,
-      error: {
-        code: classified.code,
-        message: classified.userMessage,
-        httpStatus: classified.httpStatus,
-        retryable: classified.retryable,
-        apiErrorType: classified.apiErrorType,
-        apiErrorCode: classified.apiErrorCode,
-        apiErrorParam: classified.apiErrorParam,
-      },
-    };
+      return {
+        ok: false,
+        clientTurnId,
+        assistantText: "",
+        artifacts: [],
+        toolNames: [],
+        artifactCount: 0,
+        selectedArtifact: null,
+        hasSubstantiveArtifact: false,
+        toolTrace,
+        usage,
+        durationMs,
+        outcome: "error",
+        cancelled: false,
+        error: {
+          code: classified.code,
+          message: classified.userMessage,
+          httpStatus: classified.httpStatus,
+          retryable: classified.retryable,
+          retryAfterMs: classified.retryAfterMs,
+          safeForAutoNetworkRetry: finalSafe,
+          apiErrorType: classified.apiErrorType,
+          apiErrorCode: classified.apiErrorCode,
+          apiErrorParam: classified.apiErrorParam,
+        },
+      };
     } finally {
       clearTimeout(timeout);
       activeTurns.delete(clientTurnId);
     }
   }
 
+  function cancelAllActiveTurns() {
+    const ids = [...activeTurns.keys()];
+    for (const id of ids) {
+      cancelTextTurn(id);
+    }
+    return { ok: true, cancelled: ids.length };
+  }
+
   return {
     runTextTurn,
     cancelTextTurn,
+    cancelAllActiveTurns,
     getActiveTurnCount: () => activeTurns.size,
     DEFAULT_TEXT_MODEL,
     MAX_TOOL_LOOP_ITERATIONS: maxToolLoops,
@@ -371,6 +432,7 @@ function abortedOutcome(options) {
         code: "session.error",
         message: "Text request timed out.",
         retryable: true,
+        safeForAutoNetworkRetry: false,
       },
     };
   }
@@ -502,6 +564,7 @@ async function callResponsesApi(options) {
     signal,
     classifyHttpFailure,
     createTokenError,
+    onHttpResponseReceived,
   } = options;
 
   const body = {
@@ -537,6 +600,10 @@ async function callResponsesApi(options) {
       userMessage: "Network connection looks down.",
       retryable: true,
     });
+  }
+
+  if (typeof onHttpResponseReceived === "function") {
+    onHttpResponseReceived(response);
   }
 
   if (!response.ok) {
@@ -699,6 +766,12 @@ function classifyThrown(error, classifyHttpFailure) {
               payload.code !== "config.invalid_api_key" &&
               payload.code !== "api.bad_response",
         httpStatus: payload.httpStatus || error?.httpStatus,
+        retryAfterMs:
+          typeof payload.retryAfterMs === "number"
+            ? payload.retryAfterMs
+            : typeof error?.retryAfterMs === "number"
+              ? error.retryAfterMs
+              : undefined,
         ...apiMeta,
       };
     } catch {
@@ -711,6 +784,7 @@ function classifyThrown(error, classifyHttpFailure) {
       userMessage: error.userMessage,
       retryable: Boolean(error.retryable),
       httpStatus: error.httpStatus,
+      retryAfterMs: error.retryAfterMs,
       ...apiMeta,
     };
   }
@@ -749,7 +823,12 @@ function failResult(code, message, startedAt, nowFn, extra = {}) {
     error: {
       code,
       message,
-      retryable: !["config.missing_api_key", "config.invalid_api_key", "quota.exhausted"].includes(code),
+      retryable:
+        typeof extra.retryable === "boolean"
+          ? extra.retryable
+          : !["config.missing_api_key", "config.invalid_api_key", "quota.exhausted"].includes(code),
+      retryAfterMs: extra.retryAfterMs,
+      safeForAutoNetworkRetry: extra.safeForAutoNetworkRetry === true,
     },
   };
 }

@@ -136,7 +136,7 @@ test("App builds history before TextClient submit appends the current user turn"
 
 test("successful assistant text is delivered before completed/idle state", () => {
   const textClient = fs.readFileSync(path.join(root, "src", "lib", "textClient.ts"), "utf8");
-  const assistantIdx = textClient.indexOf("this.callbacks.onAssistantText(plan.assistantText, clientTurnId)");
+  const assistantIdx = textClient.indexOf("this.callbacks.onAssistantText(guardedText, clientTurnId)");
   const completedIdx = textClient.indexOf('this.setState("completed")');
   assert.ok(assistantIdx >= 0 && completedIdx > assistantIdx);
 });
