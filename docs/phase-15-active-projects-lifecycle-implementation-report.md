@@ -1,8 +1,8 @@
 # Phase 15 implementation report: active-projects lifecycle
 
-**Status:** Phase 15 production implementation complete on branch `phase-15` as uncommitted working-tree changes atop audit commit `7c478a7`. This report documents that implementation.  
-**Authority:** `docs/phase-15-active-projects-lifecycle-audit.md`, repository code on `phase-15`, and automated tests run in the implementing Agent conversation.  
-**Scope of this document:** Report only. No further application-code or runtime-memory changes in this documentation step.
+**Status:** Phase 15 complete on branch `phase-15`. Implementation is committed and pushed (`15b6f27`); automated tests passed; live validation (text + Realtime smoke) passed; cleanup restored the original three-project list.
+**Authority:** `docs/phase-15-active-projects-lifecycle-audit.md`, repository code on `phase-15`, automated tests, and live validation performed in the implementing Agent conversations.
+**Scope of this document update:** Report only. No production-code changes in this documentation step.
 
 ---
 
@@ -11,12 +11,12 @@
 | Item | Value |
 |---|---|
 | Branch | `phase-15` |
-| Tracking | `origin/phase-15` (audit already pushed) |
-| Baseline HEAD at implementation start | `7c478a7 Add Phase 15 active-projects lifecycle audit` |
-| Working tree at implementation start | Clean |
-| Jarvis / `npm run dev` | Not running; not started for this phase |
-| Live validation | **Not performed** (deferred by implementation instructions) |
-| Commit / push of implementation | **Not performed** |
+| Tracking | `origin/phase-15` (synchronized after push) |
+| Audit commit | `7c478a7 Add Phase 15 active-projects lifecycle audit` |
+| Implementation commit | `15b6f27 Implement Phase 15 active-projects lifecycle` |
+| Jarvis / `npm run dev` | Started for live validation; stopped after finalization |
+| Live validation | **Passed** (see §15) |
+| Merge to `main` | Not performed (out of this step) |
 
 ---
 
@@ -54,10 +54,9 @@ Locked out of Phase 15 (honored): project status/due/defer/complete, WC→projec
 | `electron/memory.test.cjs` | Seed projects via `memoryActiveProjects` instead of retired upsert |
 | `electron/priority-lifecycle.test.cjs` | Same seeding update for unrelated-field fixtures |
 | `electron/working-context-lifecycle.test.cjs` | Seeding update + instruction-string assertion for active-projects wording |
-| `docs/phase-15-active-projects-lifecycle-implementation-report.md` | **This report** |
+| `docs/phase-15-active-projects-lifecycle-implementation-report.md` | **This report** (updated after live validation) |
 
-Approximate tracked diff at report time (excluding this new report and untracked pure module/tests until staged):  
-`electron/main.cjs`, `electron/memory.cjs`, and regression test edits — **+736 / −22** on the five previously modified tracked files; plus two new untracked implementation files.
+Implementation commit `15b6f27`: **8 files changed, 2282 insertions(+), 22 deletions(-)**.
 
 ---
 
@@ -79,15 +78,15 @@ Approximate tracked diff at report time (excluding this new report and untracked
 | Operations list/add/insert/edit/remove/reorder/replace/preview/restore | Satisfied |
 | Confirmation only for remove/replace/restore | Satisfied |
 | Reference resolution (ordinal/id/exact/phrase/ambiguous/recent + significant tokens) | Satisfied |
-| Preview tokens, stale rejection, bound-plan confirm | Satisfied |
+| Preview tokens, stale rejection, bound-plan confirm | Satisfied (live + automated) |
 | Backup-before-write + fail-closed | Satisfied |
-| Scoped restore (projects only) | Satisfied |
-| Legacy `USE_MEMORY_ACTIVE_PROJECTS` rejection | Satisfied |
-| Unrelated-field preservation both directions | Satisfied |
-| Rollover / personal context / Phase 12 first-project / no WC link cascade | Satisfied (behavior preserved; no scope creep) |
-| Shared text/Realtime tool path | Satisfied |
-| Automated test matrix | Satisfied in suite (see §11) |
-| Live validation checklist | **Deferred** (explicitly not run) |
+| Scoped restore (projects only) | Satisfied (live) |
+| Legacy `USE_MEMORY_ACTIVE_PROJECTS` rejection | Satisfied (automated; not forced live) |
+| Unrelated-field preservation both directions | Satisfied (live + automated) |
+| Rollover / personal context / Phase 12 first-project / no WC link cascade | Satisfied |
+| Shared text/Realtime tool path | Satisfied (live) |
+| Automated test matrix | Satisfied (`103` combined pass) |
+| Live validation checklist | **Satisfied** (see §15; minimal voice smoke accepted) |
 
 ---
 
@@ -170,6 +169,10 @@ Allowed to change: `activeProjects`, `daily.updatedAt`.
 
 Existing Phase 13/14 asserts remain; regression tests still verify `activeProjects` unchanged after priority/WC mutations. Summary-only `memory_update_daily` leaves projects unchanged.
 
+### Live confirmation
+
+During live validation, priorities, working-context arrays, empty summary, `date`, and `schemaVersion` remained unchanged across project mutations after day rollover (verified against mid-session backups and post-restore/cleanup snapshots).
+
 ---
 
 ## 10. Automated tests added
@@ -219,6 +222,8 @@ node --test electron/active-projects-lifecycle.test.cjs electron/priority-lifecy
 
 ## 12. `git diff --check` result
 
+Checked at implementation pre-commit and again after this live-validation report update.
+
 ```text
 git diff --check
 ```
@@ -227,27 +232,15 @@ git diff --check
 
 ---
 
-## 13. `git status --short` result (at report authoring)
+## 13. Repository state after live-validation report update
 
-Before this report file existed, implementation status was:
-
-```text
- M electron/main.cjs
- M electron/memory.cjs
- M electron/memory.test.cjs
- M electron/priority-lifecycle.test.cjs
- M electron/working-context-lifecycle.test.cjs
-?? electron/active-projects-lifecycle.cjs
-?? electron/active-projects-lifecycle.test.cjs
-```
-
-After creating this report, expect the additional untracked path:
+Implementation remains at `15b6f27`. This documentation update is the only expected working-tree change:
 
 ```text
-?? docs/phase-15-active-projects-lifecycle-implementation-report.md
+ M docs/phase-15-active-projects-lifecycle-implementation-report.md
 ```
 
-HEAD remains `7c478a7` until an implementation (+ report) commit is requested.
+`data/memory`, `.env`, `node_modules`, and unrelated paths must remain untracked/unmodified in Git.
 
 ---
 
@@ -255,36 +248,116 @@ HEAD remains `7c478a7` until an implementation (+ report) commit is requested.
 
 | Item | Notes |
 |---|---|
-| Preview/recent process-local | Restart loses confirm tokens and recent id (audit-accepted) |
+| Preview/recent process-local | Restart loses confirm tokens and recent id (audit-accepted; observed live) |
 | Voice context staleness | Realtime still injects memory at token mint; text refreshes each turn (audit-accepted) |
 | Orphan WC `relatedProject` strings | Rename/remove does not cascade (by design) |
-| Duplicate project names | Allowed; resolution returns `AMBIGUOUS_MATCH` |
-| Implementation not yet committed/pushed | Working tree holds all Phase 15 code + this report |
-| Live validation not run | Text/voice checklist in audit §14 still outstanding |
+| Duplicate project names | Allowed; resolution returns `AMBIGUOUS_MATCH` (live-confirmed) |
+| Compound multi-action model planning | Voice compound edit+reorder+list omitted edit; single-op voice rename passed (instruction follow-up) |
+| Backup retention (`MAX_BACKUPS = 10`) | Long live session pruned the exact pre-validation three-project snapshot; cleanup used replace |
+| Merge to `main` | Not yet requested |
 
-No open Sarah product decisions for Phase 15 scope; implementer defaults from audit §17.6 were followed (`items`/`item` args, `projects` return field, optional `expectedUpdatedAt`, ignore unknown keys, empty replace after confirm).
+No open Sarah product decisions for Phase 15 scope; implementer defaults from audit §17.6 were followed.
 
 ---
 
-## 15. Live-validation status
+## 15. Live validation
 
-**Not started.** Per implementation instructions: do not start Jarvis; do not perform live validation yet.
+**Result:** Passed. Jarvis was started with `npm run dev` for this checklist only; `daily.json` was not hand-edited.
 
-Outstanding when live validation is authorized (from audit §14):
+### 15.1 Validated operations and results
 
-1. Text path: list/add/insert/edit/reorder/remove-confirm/replace-confirm/restore-confirm, model routing to `memory_active_projects`, summary-only still works, ambiguous phrase clarification.
-2. Voice smoke once over shared tool path (no Phase 8 audio debugging).
+| Operation / check | Path | Result |
+|---|---|---|
+| `list` | Text | Baseline established (`itemCount` progressed correctly through the session) |
+| `add` | Text | Unique project added (`ok:true`) |
+| `insert` | Text | Insert at position 1 (`ok:true`) |
+| `edit` | Text | Name/note edits (`ok:true`) |
+| `reorder` | Text | Order changed (`ok:true`) |
+| `remove` preview → confirm | Text | Preview then confirmed removal (`ok:true`) |
+| Stale-preview rejection | Text | `STALE_PREVIEW` observed; disk unchanged until valid confirm |
+| `replace` preview → confirm | Text | Nonempty replace applied (`ok:true`) |
+| Expired / invalid preview rejection | Text | Confirm with stale/invalid token → `STALE_PREVIEW`; no wrong write |
+| `restore_backup` (explicit backup file) | Text | Scoped restore to four-project pre-replace state (`ok:true`) |
+| Ambiguous reference | Text | `AMBIGUOUS_MATCH` on shared “website” phrase; no removal write |
+| Realtime routing | Voice | Tool calls used `memory_active_projects` (shared `executeTrustedTool` path) |
+| Single-operation voice rename | Voice | Edit renamed project (`ok:true`) |
+| Cleanup `replace` | Text | Restored original three-project list (`ok:true`) |
+
+Runtime logs for the session showed only `[jarvis-memory] active-projects …` for project lifecycle work — no `memory_update_daily` project writes.
+
+### 15.2 Confirmation and stale-preview behavior
+
+- Destructive ops (`remove`, `replace`, `restore_backup`) minted previews and required `confirmed=true` + matching `previewToken`.
+- Invalid or stale confirms returned `STALE_PREVIEW` and left disk unchanged.
+- Successful confirms applied the bound plan and created pre-write backups under `data/memory/backups/`.
+- `CONFIRMATION_REQUIRED` mint events are not separately logged today (diagnostic gap; optional follow-up).
+
+### 15.3 Successful scoped restore
+
+- Explicit restore from `2026-07-28T17-45-54-435Z-active-projects-replace.json` (and later successful restores) restored projects only.
+- Unrelated daily fields remained intact relative to pre-restore snapshots.
+
+### 15.4 Unrelated-field preservation findings
+
+Across live project mutations after day rollover:
+
+- **Unchanged:** priorities, commitments, follow-ups, unresolved, summary, `date`, `schemaVersion`
+- **Allowed to change:** `activeProjects`, `daily.updatedAt`
+- Day rollover earlier in the long-running session (date 2026-07-27 → 2026-07-28) is separate from project-tool side effects.
+
+### 15.5 Text and Realtime routing
+
+- Text and Realtime both used `memory_active_projects` via the shared trusted tool path.
+- No live evidence of project writes through `memory_update_daily`.
+
+### 15.6 Temporary OpenAI 429 rate limiting
+
+- Multiple `jarvis-text` turns returned `errorCode: "rate_limited"` / HTTP 429 during remove and restore confirmation sequences.
+- Rate limits did **not** clear in-memory preview tokens by themselves, but delayed turns and encouraged remints/retries that contributed to `STALE_PREVIEW` friction and one wrong-direction restore retry before a successful explicit restore.
+
+### 15.7 Process-local preview-token behavior and confirmation timing
+
+- Preview tokens live in process-local `previewStore` with shared `PREVIEW_TTL_MS` (10 minutes).
+- Successful writes call `invalidatePreviews()` and clear pending tokens.
+- Prompt confirms that failed with `STALE_PREVIEW` were primarily **missing/wrong/cleared tokens** (model/tool-routing), not TTL expiry; TTL and process-local design remain audit-accepted.
+- Realtime reconnect does not clear the preview store; app restart would.
+
+### 15.8 Compound vs single-operation voice
+
+- Compound spoken request (rename + move to top + list) executed **reorder only**; edit was omitted; speech reported only the move. Tool did not reject a failed edit — edit was never called.
+- Root cause: model planning / instruction bias (“call … once” for direct ops), not a `memory_active_projects` multi-op defect. Sequential tool calls are supported.
+- **Single-operation voice rename passed**, satisfying minimal Realtime smoke for Phase 15 close.
+
+### 15.9 Final cleanup state
+
+After successful cleanup replacement, active projects are exactly:
+
+1. Jarvis personal desktop assistant
+2. APC website rebuild
+3. AI consulting career transition
+
+Note: the exact three-project-only backup from session start was pruned by `MAX_BACKUPS = 10` during the long validation run; cleanup therefore used **replace** rather than restore from that pruned snapshot.
+
+### 15.10 Phase 15 completion conclusion and optional follow-ups
+
+**Conclusion:** Phase 15 Active Projects Lifecycle is **complete** for audit scope: implementation shipped, automated tests green, live text checklist passed, Realtime shared-path smoke passed (single-op rename), cleanup restored the original three-project list. No production-code correction is required to close the phase.
+
+**Optional follow-ups (not Phase 15 blockers):**
+
+1. Instruction wording: multi-action requests must issue sequential `memory_active_projects` calls and not stop after one op.
+2. Stronger preview diagnostics: log `CONFIRMATION_REQUIRED` mints and `STALE_PREVIEW` reason codes.
+3. Normalize restore `backupId` matching (filename vs `createdAt` stamp forms).
+4. Consider higher backup retention or protect baseline snapshots during long live sessions.
+
+Do **not** treat packaging, integrations, day-briefing/archive, or Phase 8 audio as Phase 15 close work.
 
 ---
 
 ## 16. Recommended next step
 
-1. **Commit** Phase 15 implementation files + this implementation report on `phase-15` (when Sarah requests).
-2. **Push** `phase-15` (when Sarah requests).
-3. **Run live validation** checklist from the audit (text first, then voice smoke).
-4. Optionally open a PR to `main` after live validation passes.
-
-Do **not** begin packaging, integrations, day-briefing/archive, or Phase 8 audio work as part of closing Phase 15.
+1. **Commit** this live-validation report update on `phase-15` (when Sarah requests).
+2. **Push** and optionally open a PR to merge `phase-15` into `main` (when Sarah requests).
+3. Optionally schedule the instruction/diagnostics follow-ups above as a small polish change — not required to declare Phase 15 done.
 
 ---
 
