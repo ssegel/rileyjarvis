@@ -776,7 +776,10 @@ test("stable IDs on edit, status change, and reorder; no unintended field change
     await store.ensureMemory();
     await store.memoryUpdateDaily({
       summary: "Keep summary",
-      activeProjects: [{ name: "Keep project" }],
+    });
+    await store.memoryActiveProjects({
+      operation: "add",
+      item: { name: "Keep project" },
     });
     await store.workingContextItems({
       operation: "add",

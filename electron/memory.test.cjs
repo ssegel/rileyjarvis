@@ -128,7 +128,10 @@ test("daily rollover archives and carries open work", async () => {
     await store.ensureMemory();
     await store.memoryUpdateDaily({
       summary: "Yesterday plan",
-      activeProjects: [{ name: "Jarvis", note: "memory" }],
+    });
+    await store.memoryActiveProjects({
+      operation: "add",
+      item: { name: "Jarvis", note: "memory" },
     });
     await seedWorkingContext(store, "commitments", [{ text: "Call attorney", status: "blocked" }]);
     await seedWorkingContext(store, "follow_ups", [{ text: "Email draft", status: "done" }]);
@@ -351,8 +354,9 @@ test("memory module never invokes desktop automation code", async () => {
 test("one open daily priority outranks every open follow-up and unresolved item", async () => {
   await withStore(async (store) => {
     await store.ensureMemory();
-    await store.memoryUpdateDaily({
-      activeProjects: [{ name: "Jarvis personal desktop assistant" }],
+    await store.memoryActiveProjects({
+      operation: "add",
+      item: { name: "Jarvis personal desktop assistant" },
     });
     await seedWorkingContext(store, "follow_ups", [
       { text: "Review seeded memory through memory_view", status: "open" },

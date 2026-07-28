@@ -26,15 +26,17 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 # Personal Memory
 - Durable personal instructions, preferences, profile facts, daily working context, and memory entries live in local files under data/memory/.
 - Temporary conversation history is session-only and is not persisted as durable memory.
-- Use memory_view, memory_remember, memory_correct, memory_update_daily, memory_priorities, working_context_items, memory_set_preference, memory_set_instructions, and memory_clear to manage personal context.
+- Use memory_view, memory_remember, memory_correct, memory_update_daily, memory_priorities, working_context_items, memory_active_projects, memory_set_preference, memory_set_instructions, and memory_clear to manage personal context.
 - Use memory_priorities for every daily-priority lifecycle request: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry, restore backup, and preview.
 - Use working_context_items for every commitment, follow-up, and unresolved-item lifecycle request: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, defer, clear defer, set/clear due date, convert, promote to priority, restore backup, and preview.
+- Use memory_active_projects for every active-project lifecycle request: list, add, insert, edit, remove, reorder, replace, restore backup, and preview.
 - Never ask Sarah for internal IDs. Resolve by ordinal, exact wording, distinctive phrase, person/project/due qualifier, or the recently changed item.
 - Never invent or expand Sarah's reference wording to force a unique match. Pass the phrase she actually supplied (or its shared meaningful tokens). If several open items share that phrase, the tool returns AMBIGUOUS_MATCH — ask one concise clarification and do not write. Do not pick one candidate by guessing a narrower phrase.
 - Never use memory_update_daily.priorities for add, edit, complete, reopen, remove, reorder, replace, clear, carry, or restore.
 - Never use memory_update_daily.commitments, followUps, or unresolved — use working_context_items instead.
+- Never use memory_update_daily.activeProjects — use memory_active_projects instead.
 - On AMBIGUOUS_MATCH, ask one concise clarification and do not write.
-- Never claim a working-context or priority mutation succeeded unless the tool result has ok:true for that write.
+- Never claim a working-context, priority, or active-project mutation succeeded unless the tool result has ok:true for that write.
 - complete targets an open priority (status open, blocked, or active). reopen targets a completed priority (status done).
 - For working_context_items: complete prefers open/blocked; reopen prefers done. Default open lists exclude future-deferred items.
 - For add, insert, edit, complete, reopen, simple reorder, defer, clear_defer, set_due_date, clear_due_date, and single promote_to_priority: call working_context_items once and execute immediately.
@@ -49,6 +51,16 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
   - List overdue commitments: {"operation":"list","scope":"commitments","filter":"overdue"}
 - For remove, replace, clear_completed, convert, restore_backup, and bulk promote only: present the preview, wait for explicit confirmation, then call again with confirmed=true and the matching previewToken.
 - After every successful working-context write, briefly confirm and report the resulting ordered list for that scope.
+- For add, insert, edit, and simple reorder on active projects: call memory_active_projects once and execute immediately. Do not ask Sarah to confirm these operations.
+- Active-project array order is project order; "first project" means ordinal 1 / index 0. Pass Sarah's project name phrase as supplied.
+- Active-project examples:
+  - Add: {"operation":"add","items":[{"name":"Jarvis desktop assistant"}]}
+  - Insert first: {"operation":"insert","atPosition":1,"item":{"name":"Estate planning"}}
+  - Edit note: {"operation":"edit","reference":{"by":"text","value":"Jarvis"},"item":{"note":"Phase 15"}}
+  - Reorder: {"operation":"reorder","reference":{"by":"text","value":"Website"},"atPosition":1}
+  - Remove/replace/restore: present preview, then confirmed=true with previewToken
+- For remove, replace, and restore_backup on active projects only: present the preview, wait for explicit confirmation, then call again with confirmed=true and the matching previewToken.
+- After every successful active-project write, briefly confirm and report the resulting ordered list.
 - For add, insert, edit, complete, reopen, and simple reorder on priorities: call memory_priorities once and execute immediately. Do not preview these operations and do not ask Sarah to confirm them.
 - For insert: call memory_priorities in one tool call with operation "insert", the item text, and the exact 1-based atPosition. Priority N means atPosition N (array index N-1). Never ask Sarah to confirm an ordinary insertion.
 - For reorder (move one item within today's list): call once with operation "reorder", a text reference, and the 1-based atPosition. Example: move call Cecilia to priority one → {"operation":"reorder","reference":{"by":"text","value":"call Cecilia"},"atPosition":1}. Equivalent reference shapes such as {"text":"call Cecilia"} or item {"text":"call Cecilia"} are also accepted.
@@ -313,13 +325,58 @@ const toolSpecs = [
     type: "function",
     name: "memory_update_daily",
     description:
-      "Update today's summary and active projects only. Do not pass priorities (use memory_priorities) or commitments/followUps/unresolved (use working_context_items).",
+      "Update today's summary only. Do not pass priorities (use memory_priorities), commitments/followUps/unresolved (use working_context_items), or activeProjects (use memory_active_projects).",
     parameters: {
       type: "object",
       properties: {
         summary: { type: "string" },
-        activeProjects: { type: "array", items: { type: "object", additionalProperties: true } },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "memory_active_projects",
+    description:
+      "Manage active projects with deterministic reference resolution. Operations: list, add, insert, edit, remove, reorder, replace, restore_backup, preview. Projects use name and note only (no status/due). Never ask for UUIDs. Pass Sarah's reference phrase as supplied — do not invent a narrower phrase to force a unique match. Execute add/insert/edit/reorder directly. Require preview then confirmed=true+previewToken for remove/replace/restore_backup. On NOT_FOUND/AMBIGUOUS_MATCH do not retry identical arguments; on AMBIGUOUS_MATCH ask one clarification and do not write. Only report success when ok:true.",
+    parameters: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: [
+            "list",
+            "add",
+            "insert",
+            "edit",
+            "remove",
+            "reorder",
+            "replace",
+            "restore_backup",
+            "preview",
+          ],
+        },
+        confirmed: { type: "boolean" },
+        previewToken: { type: "string" },
+        expectedUpdatedAt: { type: "string" },
+        previewOperation: { type: "string" },
+        reference: {
+          description:
+            'Project reference. Prefer {"by":"text","value":"Website"}. Also accepts ordinal, id, recent, name, phrase, or a plain string.',
+          anyOf: [{ type: "string" }, { type: "object", additionalProperties: true }],
+        },
+        item: { type: "object", additionalProperties: true },
+        items: { type: "array", items: { type: "object", additionalProperties: true } },
+        order: {
+          type: "array",
+          items: {
+            anyOf: [{ type: "string" }, { type: "object", additionalProperties: true }],
+          },
+        },
+        atPosition: { type: "number" },
+        backupId: { type: "string" },
+      },
+      required: ["operation"],
       additionalProperties: false,
     },
   },
@@ -1102,6 +1159,9 @@ async function executeTrustedTool(toolCall) {
     if (name === "memory_priorities") {
       return await memoryStore.memoryPriorities(args);
     }
+    if (name === "memory_active_projects") {
+      return await memoryStore.memoryActiveProjects(args);
+    }
     if (name === "working_context_items") {
       return await memoryStore.workingContextItems(args);
     }
@@ -1321,13 +1381,16 @@ Here is what you can ask me to do.
 ## Personal Memory
 
 - View durable instructions, preferences, profile facts, daily context, and memory entries.
-- Remember facts, correct stored items, and update today's projects, commitments, and follow-ups.
+- Remember facts, correct stored items, and update today's summary, projects, commitments, and follow-ups.
 - Manage daily priorities with natural language: list, add, insert, edit, complete, reopen, remove, reorder, replace, clear completed, carry to another day, and restore a backup.
+- Manage active projects with natural language: list, add, insert, edit name/note, remove, reorder, replace, and restore a backup.
 - complete targets an open priority; reopen targets a completed priority.
 - Carry/carry forward/copy into tomorrow keeps today's item (move:false). Only explicit move/transfer removes it from today (move:true).
 - Show tomorrow's priorities with list targetDate tomorrow — do not reuse today's list.
 - Ordinary add, insert, edit, complete, reopen, and reorder run immediately without confirmation.
+- Ordinary active-project add, insert, edit, and reorder run immediately without confirmation.
 - Removing, replacing, clearing completed priorities, carrying across dates, or restoring a backup requires an explicit confirmation after preview.
+- Removing, replacing, or restoring active projects requires an explicit confirmation after preview.
 - Clearing memory or fully replacing instructions requires explicit confirmation.
 - Conversation transcript stays temporary for the current session only.
 

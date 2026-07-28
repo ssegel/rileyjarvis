@@ -41,6 +41,17 @@ const {
   normalizeWorkingContextItem,
   normalizeWcStatus,
 } = require("./working-context-lifecycle.cjs");
+const {
+  DESTRUCTIVE_ACTIVE_PROJECT_OPERATIONS,
+  cloneProjects,
+  canonicalizeProjects,
+  formatActiveProjectsArtifact,
+  resolveActiveProjectReference,
+  normalizeActiveProjectReference,
+  validateActiveProjectsArray,
+  planActiveProjectsMutation,
+  logActiveProjectsEvent,
+} = require("./active-projects-lifecycle.cjs");
 
 const SCHEMA_VERSION = 1;
 const MAX_BACKUPS = 10;
@@ -219,6 +230,7 @@ function createMemoryStore(options = {}) {
   /** @type {Map<string, { expiresAt: number, operation: string, hash: string, afterPriorities: any[], beforePriorities: any[], dailyUpdatedAt: string, meta?: any }>} */
   const previewStore = new Map();
   let recentPriorityId = null;
+  let recentActiveProjectId = null;
   /** @type {{ commitments: string|null, follow_ups: string|null, unresolved_items: string|null }} */
   const recentWcIds = { commitments: null, follow_ups: null, unresolved_items: null };
   /** @type {Set<string>} */
@@ -1012,21 +1024,18 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
             "Use working_context_items for commitments, follow-ups, and unresolved items. memory_update_daily no longer accepts those arrays.",
         };
       }
+      if (Object.prototype.hasOwnProperty.call(args, "activeProjects")) {
+        return {
+          ok: false,
+          code: "USE_MEMORY_ACTIVE_PROJECTS",
+          error:
+            "Use memory_active_projects for active project lifecycle. memory_update_daily no longer accepts activeProjects.",
+        };
+      }
       await ensureMemoryUnlocked();
       await rolloverDailyIfNeeded();
       const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
       if (typeof args.summary === "string") daily.summary = args.summary;
-      if (args.activeProjects) {
-        daily.activeProjects = upsertWorkList(daily.activeProjects, args.activeProjects, (item) => {
-          const project = normalizeWorkItem({ ...item, text: item.name || item.text });
-          return {
-            id: project.id,
-            name: String(item.name || item.text || "Untitled project"),
-            note: String(item.note || ""),
-            updatedAt: isoNow(),
-          };
-        });
-      }
       daily.updatedAt = isoNow();
       await atomicWriteJson(paths.daily, daily);
       return { ok: true, message: "Daily context updated.", daily };
@@ -2964,6 +2973,643 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     return result;
   }
 
+  function successActiveProjectsResult(options) {
+    const { operation, projects, dailyUpdatedAt, message, backupId, startedAt, extra } = options;
+    logActiveProjectsEvent({
+      operation,
+      ok: true,
+      itemCount: projects.length,
+      backupId,
+      durationMs: Date.now() - startedAt,
+    });
+    return {
+      ok: true,
+      message,
+      operation,
+      projects: canonicalizeProjects(projects),
+      dailyUpdatedAt,
+      backupId,
+      artifact: formatActiveProjectsArtifact(projects),
+      confirmation: message,
+      ...extra,
+    };
+  }
+
+  function failActiveProjectsResult(operation, code, message, startedAt, extra = {}) {
+    logActiveProjectsEvent({
+      operation,
+      ok: false,
+      code,
+      itemCount: extra.projects ? extra.projects.length : undefined,
+      durationMs: Date.now() - startedAt,
+    });
+    return {
+      ok: false,
+      code,
+      error: message,
+      message,
+      operation,
+      ...extra,
+    };
+  }
+
+  function updateRecentActiveProjectId(operation, meta, nextProjects) {
+    const mode = meta?.recentMode;
+    if (mode === "last_new" || mode === "touched") {
+      const ids = meta.touchedIds || [];
+      if (ids.length) recentActiveProjectId = ids[ids.length - 1];
+      return;
+    }
+    if (mode === "remove") {
+      if (meta.removedId && recentActiveProjectId === meta.removedId) recentActiveProjectId = null;
+      return;
+    }
+    if (mode === "replace") {
+      recentActiveProjectId = nextProjects?.[0]?.id || null;
+    }
+  }
+
+  async function commitActiveProjectsDaily(beforeDaily, nextDaily, operation, startedAt, allowedKeys) {
+    const unchanged = assertUnrelatedUnchanged(beforeDaily, nextDaily, {
+      allowedKeys: allowedKeys || ["activeProjects"],
+    });
+    if (unchanged) {
+      return failActiveProjectsResult(operation, "VALIDATION_FAILED", unchanged, startedAt, {
+        projects: canonicalizeProjects(beforeDaily.activeProjects || []),
+        dailyUpdatedAt: beforeDaily.updatedAt,
+      });
+    }
+    const shapeError = validateDailyShape(nextDaily);
+    if (shapeError) {
+      return failActiveProjectsResult(operation, "VALIDATION_FAILED", shapeError, startedAt, {
+        projects: canonicalizeProjects(beforeDaily.activeProjects || []),
+        dailyUpdatedAt: beforeDaily.updatedAt,
+      });
+    }
+    const projectsError = validateActiveProjectsArray(nextDaily.activeProjects || []);
+    if (projectsError) {
+      return failActiveProjectsResult(operation, "VALIDATION_FAILED", projectsError, startedAt, {
+        projects: canonicalizeProjects(beforeDaily.activeProjects || []),
+        dailyUpdatedAt: beforeDaily.updatedAt,
+      });
+    }
+
+    let backupId = null;
+    try {
+      const snapshot = await createBackupSnapshot(`active-projects-${operation}`);
+      backupId = snapshot.createdAt;
+    } catch (error) {
+      return failActiveProjectsResult(
+        operation,
+        "BACKUP_FAILED",
+        error instanceof Error ? error.message : "Backup creation failed.",
+        startedAt,
+        {
+          projects: canonicalizeProjects(beforeDaily.activeProjects || []),
+          dailyUpdatedAt: beforeDaily.updatedAt,
+        },
+      );
+    }
+
+    nextDaily.updatedAt = isoNow();
+    try {
+      if (typeof options.failAtomicWrite === "function" && options.failAtomicWrite()) {
+        throw new Error("Simulated atomic write failure.");
+      }
+      await atomicWriteJson(paths.daily, nextDaily);
+    } catch (error) {
+      return failActiveProjectsResult(
+        operation,
+        "WRITE_FAILED",
+        error instanceof Error ? error.message : "Atomic write failed.",
+        startedAt,
+        {
+          projects: canonicalizeProjects(beforeDaily.activeProjects || []),
+          dailyUpdatedAt: beforeDaily.updatedAt,
+          backupId,
+        },
+      );
+    }
+
+    let reread;
+    try {
+      if (typeof options.failReread === "function" && options.failReread()) {
+        throw new Error("Simulated reread failure.");
+      }
+      reread = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
+    } catch (error) {
+      return failActiveProjectsResult(
+        operation,
+        "WRITE_FAILED",
+        error instanceof Error ? error.message : "Reread failed after write.",
+        startedAt,
+        {
+          projects: canonicalizeProjects(nextDaily.activeProjects || []),
+          dailyUpdatedAt: nextDaily.updatedAt,
+          backupId,
+        },
+      );
+    }
+
+    invalidatePreviews();
+    return successActiveProjectsResult({
+      operation,
+      projects: reread.activeProjects || [],
+      dailyUpdatedAt: reread.updatedAt,
+      message: `Active projects ${operation.replace(/_/g, " ")} completed.`,
+      backupId,
+      startedAt,
+      extra: { daily: reread },
+    });
+  }
+
+  function storeActiveProjectsPreview(operation, beforeList, afterList, dailyUpdatedAt, meta = {}) {
+    const token = createPreviewToken();
+    const payload = { operation, beforeList, afterList, dailyUpdatedAt, meta };
+    previewStore.set(token, {
+      expiresAt: Date.now() + PREVIEW_TTL_MS,
+      operation,
+      hash: hashPreviewPayload(payload),
+      beforePriorities: [],
+      afterPriorities: [],
+      beforeList: cloneProjects(beforeList),
+      afterList: cloneProjects(afterList),
+      afterDaily: meta.afterDaily || null,
+      dailyUpdatedAt,
+      meta: { ...meta, kind: "active_projects" },
+    });
+    return token;
+  }
+
+  function readActiveProjectsPreview(token, operation, dailyUpdatedAt) {
+    const entry = previewStore.get(String(token || ""));
+    if (!entry) return { code: "STALE_PREVIEW" };
+    if (Date.now() > entry.expiresAt) {
+      previewStore.delete(token);
+      return { code: "STALE_PREVIEW" };
+    }
+    if (entry.operation !== operation) return { code: "STALE_PREVIEW" };
+    if (entry.dailyUpdatedAt !== dailyUpdatedAt) return { code: "STALE_PREVIEW" };
+    if (entry.meta?.kind !== "active_projects") return { code: "STALE_PREVIEW" };
+    return { entry };
+  }
+
+  function buildActiveProjectsPreviewRequestBinding(args = {}) {
+    const items = Array.isArray(args.items) ? args.items : args.item ? [args.item] : [];
+    return {
+      atPosition: args.atPosition != null && args.atPosition !== "" ? Number(args.atPosition) : null,
+      backupId: args.backupId != null && args.backupId !== "" ? String(args.backupId) : null,
+      reference: args.reference != null ? normalizeActiveProjectReference(args.reference) : null,
+      order: Array.isArray(args.order)
+        ? args.order.map((ref) => normalizeActiveProjectReference(ref))
+        : null,
+      itemNames: items
+        .map((raw) => String(raw?.name != null ? raw.name : raw?.text != null ? raw.text : "").trim())
+        .filter(Boolean),
+    };
+  }
+
+  function confirmationConflictsWithActiveProjectsPreview(args, entry) {
+    const bound = entry?.meta?.request;
+    if (!bound) return null;
+    if (args.backupId != null && args.backupId !== "" && bound.backupId != null) {
+      if (String(args.backupId) !== String(bound.backupId)) {
+        return "Confirmation backupId does not match the preview.";
+      }
+    }
+    if (args.reference != null && bound.reference != null) {
+      const nextRef = normalizeActiveProjectReference(args.reference);
+      if (JSON.stringify(nextRef) !== JSON.stringify(bound.reference)) {
+        return "Confirmation reference does not match the preview.";
+      }
+    }
+    if (Array.isArray(args.items) && bound.itemNames) {
+      const names = args.items
+        .map((raw) => String(raw?.name != null ? raw.name : raw?.text != null ? raw.text : "").trim())
+        .filter(Boolean);
+      if (JSON.stringify(names) !== JSON.stringify(bound.itemNames)) {
+        return "Confirmation items do not match the preview.";
+      }
+    }
+    return null;
+  }
+
+  async function loadValidatedBackupActiveProjects(backupId) {
+    const files = await listBackupFiles();
+    let file = null;
+    if (backupId) {
+      file = files.find(
+        (item) =>
+          item.name.includes(String(backupId)) ||
+          item.name === backupId ||
+          item.full.endsWith(String(backupId)),
+      );
+    } else {
+      file = files[0];
+    }
+    if (!file) {
+      return { error: { code: "RESTORE_FAILED", message: "No backup was found to restore." } };
+    }
+    let snapshot;
+    try {
+      snapshot = JSON.parse(await readText(file.full));
+    } catch (error) {
+      return {
+        error: {
+          code: "RESTORE_FAILED",
+          message: error instanceof Error ? error.message : "Backup could not be read.",
+        },
+      };
+    }
+    if (!snapshot || typeof snapshot !== "object" || !snapshot.daily || typeof snapshot.daily !== "object") {
+      return { error: { code: "RESTORE_FAILED", message: "Backup is missing a valid daily snapshot." } };
+    }
+    const restored = (Array.isArray(snapshot.daily.activeProjects) ? snapshot.daily.activeProjects : []).map(
+      (item) => {
+        const project = normalizeWorkItem({ ...item, text: item.name || item.text });
+        return {
+          id: project.id,
+          name: String(item.name || item.text || "Untitled project"),
+          note: String(item.note || ""),
+          updatedAt: project.updatedAt,
+        };
+      },
+    );
+    const validationError = validateActiveProjectsArray(restored);
+    if (validationError) {
+      return {
+        error: {
+          code: "RESTORE_FAILED",
+          message: `Backup active projects failed validation: ${validationError}`,
+        },
+      };
+    }
+    return { file, restored };
+  }
+
+  async function activeProjectsPreviewPlan(args, daily, startedAt, helpers) {
+    const operation = String(args.operation || "").trim().toLowerCase();
+    const beforeList = cloneProjects(daily.activeProjects || []);
+
+    if (operation === "restore_backup") {
+      const loaded = await loadValidatedBackupActiveProjects(args.backupId);
+      if (loaded.error) {
+        return failActiveProjectsResult(operation, loaded.error.code, loaded.error.message, startedAt, {
+          projects: canonicalizeProjects(beforeList),
+          dailyUpdatedAt: daily.updatedAt,
+        });
+      }
+      const afterList = loaded.restored;
+      const afterDaily = {
+        ...daily,
+        activeProjects: cloneProjects(afterList),
+      };
+      const token = storeActiveProjectsPreview(operation, beforeList, afterList, daily.updatedAt, {
+        backupFile: loaded.file.name,
+        backupId: args.backupId || null,
+        afterDaily,
+        allowedKeys: ["activeProjects"],
+        recentMode: "replace",
+        request: buildActiveProjectsPreviewRequestBinding(args),
+      });
+      return {
+        ok: true,
+        operation: "preview",
+        previewOperation: operation,
+        message: `Preview ready for restore from ${loaded.file.name}. Confirm to apply.`,
+        previewToken: token,
+        before: canonicalizeProjects(beforeList),
+        after: canonicalizeProjects(afterList),
+        projects: canonicalizeProjects(beforeList),
+        dailyUpdatedAt: daily.updatedAt,
+        artifact: formatActiveProjectsArtifact(afterList),
+        requiresConfirmation: true,
+      };
+    }
+
+    const planned = planActiveProjectsMutation(args, daily, helpers);
+    if (planned.error) {
+      return failActiveProjectsResult(operation, planned.error.code, planned.error.message, startedAt, {
+        candidates: planned.error.candidates,
+        projects: canonicalizeProjects(beforeList),
+        dailyUpdatedAt: daily.updatedAt,
+      });
+    }
+
+    const afterList = cloneProjects(planned.nextDaily.activeProjects || []);
+    const requiresConfirm = DESTRUCTIVE_ACTIVE_PROJECT_OPERATIONS.has(operation);
+    const token = requiresConfirm
+      ? storeActiveProjectsPreview(operation, beforeList, afterList, daily.updatedAt, {
+          afterDaily: planned.nextDaily,
+          allowedKeys: planned.meta?.allowedKeys || ["activeProjects"],
+          recentMode: planned.meta?.recentMode,
+          touchedIds: planned.meta?.touchedIds,
+          removedId: planned.meta?.removedId,
+          request: buildActiveProjectsPreviewRequestBinding(args),
+        })
+      : null;
+
+    return {
+      ok: true,
+      operation: "preview",
+      previewOperation: operation,
+      message: requiresConfirm
+        ? `Preview ready for ${operation.replace(/_/g, " ")}. Confirm to apply.`
+        : `Dry-run only for ${operation.replace(/_/g, " ")}. Execute ${operation} directly to apply.`,
+      previewToken: token,
+      before: canonicalizeProjects(beforeList),
+      after: canonicalizeProjects(afterList),
+      projects: canonicalizeProjects(beforeList),
+      dailyUpdatedAt: daily.updatedAt,
+      artifact: formatActiveProjectsArtifact(afterList),
+      requiresConfirmation: requiresConfirm,
+    };
+  }
+
+  async function applyActiveProjectsOperation(args, daily, startedAt, helpers) {
+    const operation = String(args.operation || "").trim().toLowerCase();
+    const planned = planActiveProjectsMutation(args, daily, helpers);
+    if (planned.error) {
+      return failActiveProjectsResult(operation, planned.error.code, planned.error.message, startedAt, {
+        candidates: planned.error.candidates,
+        projects: canonicalizeProjects(daily.activeProjects || []),
+        dailyUpdatedAt: daily.updatedAt,
+      });
+    }
+    const result = await commitActiveProjectsDaily(
+      daily,
+      planned.nextDaily,
+      operation,
+      startedAt,
+      planned.meta?.allowedKeys || ["activeProjects"],
+    );
+    if (result.ok) {
+      updateRecentActiveProjectId(
+        operation,
+        planned.meta,
+        result.daily?.activeProjects || planned.nextDaily.activeProjects,
+      );
+    }
+    return result;
+  }
+
+  async function memoryActiveProjects(args = {}) {
+    const startedAt = Date.now();
+    const operation = String(args.operation || "").trim().toLowerCase();
+    if (!operation) {
+      return failActiveProjectsResult("unknown", "UNSUPPORTED_OPERATION", "operation is required.", startedAt);
+    }
+
+    return enqueue(async () => {
+      await ensureMemoryUnlocked();
+      await rolloverDailyIfNeeded();
+      const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
+      const helpers = {
+        randomUUID,
+        nowIso: isoNow,
+        recentId: recentActiveProjectId,
+      };
+
+      if (args.expectedUpdatedAt && args.expectedUpdatedAt !== daily.updatedAt) {
+        return failActiveProjectsResult(
+          operation,
+          "STALE_WRITE",
+          "Daily context changed since the last read.",
+          startedAt,
+          {
+            projects: canonicalizeProjects(daily.activeProjects || []),
+            dailyUpdatedAt: daily.updatedAt,
+            artifact: formatActiveProjectsArtifact(daily.activeProjects || []),
+          },
+        );
+      }
+
+      if (operation === "list") {
+        const listed = cloneProjects(daily.activeProjects || []);
+        logActiveProjectsEvent({
+          operation,
+          ok: true,
+          itemCount: listed.length,
+          durationMs: Date.now() - startedAt,
+        });
+        return {
+          ok: true,
+          operation,
+          message: "Current active projects.",
+          projects: canonicalizeProjects(listed),
+          dailyUpdatedAt: daily.updatedAt,
+          artifact: formatActiveProjectsArtifact(listed),
+          confirmation: "Listed current active projects.",
+        };
+      }
+
+      if (operation === "preview") {
+        const nestedOp = String(args.previewOperation || args.targetOperation || "").trim().toLowerCase();
+        if (!nestedOp) {
+          return failActiveProjectsResult(
+            operation,
+            "UNSUPPORTED_OPERATION",
+            "preview requires previewOperation.",
+            startedAt,
+          );
+        }
+        return activeProjectsPreviewPlan(
+          { ...args, operation: nestedOp, confirmed: false, _previewOnly: true },
+          daily,
+          startedAt,
+          helpers,
+        );
+      }
+
+      if (DESTRUCTIVE_ACTIVE_PROJECT_OPERATIONS.has(operation)) {
+        if (args.confirmed === true && !args.previewToken) {
+          return failActiveProjectsResult(
+            operation,
+            "STALE_PREVIEW",
+            "Active-projects preview is stale or invalid.",
+            startedAt,
+            {
+              projects: canonicalizeProjects(daily.activeProjects || []),
+              dailyUpdatedAt: daily.updatedAt,
+            },
+          );
+        }
+
+        if (args.confirmed !== true) {
+          const planned = await activeProjectsPreviewPlan(
+            { ...args, _previewOnly: true },
+            daily,
+            startedAt,
+            helpers,
+          );
+          if (planned.ok === false && planned.code !== "CONFIRMATION_REQUIRED") return planned;
+          return {
+            ok: false,
+            code: "CONFIRMATION_REQUIRED",
+            requiresConfirmation: true,
+            message: planned.message || `Confirmation required before ${operation.replace(/_/g, " ")}.`,
+            operation,
+            previewToken: planned.previewToken,
+            before: planned.before,
+            after: planned.after,
+            projects: canonicalizeProjects(daily.activeProjects || []),
+            dailyUpdatedAt: daily.updatedAt,
+            artifact: planned.artifact || formatActiveProjectsArtifact(daily.activeProjects || []),
+          };
+        }
+
+        const preview = readActiveProjectsPreview(args.previewToken, operation, daily.updatedAt);
+        if (preview.code) {
+          return failActiveProjectsResult(
+            operation,
+            "STALE_PREVIEW",
+            "Active-projects preview is stale or invalid.",
+            startedAt,
+            {
+              projects: canonicalizeProjects(daily.activeProjects || []),
+              dailyUpdatedAt: daily.updatedAt,
+            },
+          );
+        }
+        const conflict = confirmationConflictsWithActiveProjectsPreview(args, preview.entry);
+        if (conflict) {
+          return failActiveProjectsResult(operation, "STALE_PREVIEW", conflict, startedAt, {
+            projects: canonicalizeProjects(daily.activeProjects || []),
+            dailyUpdatedAt: daily.updatedAt,
+          });
+        }
+
+        if (operation === "restore_backup") {
+          const backupFile = preview.entry.meta?.backupFile;
+          if (!backupFile) {
+            return failActiveProjectsResult(
+              operation,
+              "RESTORE_FAILED",
+              "Restore preview is missing its backup reference.",
+              startedAt,
+              {
+                projects: canonicalizeProjects(daily.activeProjects || []),
+                dailyUpdatedAt: daily.updatedAt,
+              },
+            );
+          }
+          const full = path.join(paths.backups, backupFile);
+          if (!(await pathExists(full))) {
+            return failActiveProjectsResult(
+              operation,
+              "RESTORE_FAILED",
+              "Backup file is no longer available.",
+              startedAt,
+              {
+                projects: canonicalizeProjects(daily.activeProjects || []),
+                dailyUpdatedAt: daily.updatedAt,
+              },
+            );
+          }
+          let snapshot;
+          try {
+            snapshot = JSON.parse(await readText(full));
+          } catch (error) {
+            return failActiveProjectsResult(
+              operation,
+              "RESTORE_FAILED",
+              error instanceof Error ? error.message : "Backup could not be read.",
+              startedAt,
+              {
+                projects: canonicalizeProjects(daily.activeProjects || []),
+                dailyUpdatedAt: daily.updatedAt,
+              },
+            );
+          }
+          if (!snapshot || typeof snapshot !== "object" || !snapshot.daily || typeof snapshot.daily !== "object") {
+            return failActiveProjectsResult(
+              operation,
+              "RESTORE_FAILED",
+              "Backup is missing a valid daily snapshot.",
+              startedAt,
+              {
+                projects: canonicalizeProjects(daily.activeProjects || []),
+                dailyUpdatedAt: daily.updatedAt,
+              },
+            );
+          }
+          const restored = (Array.isArray(snapshot.daily.activeProjects) ? snapshot.daily.activeProjects : []).map(
+            (item) => {
+              const project = normalizeWorkItem({ ...item, text: item.name || item.text });
+              return {
+                id: project.id,
+                name: String(item.name || item.text || "Untitled project"),
+                note: String(item.note || ""),
+                updatedAt: project.updatedAt,
+              };
+            },
+          );
+          const validationError = validateActiveProjectsArray(restored);
+          if (validationError) {
+            return failActiveProjectsResult(
+              operation,
+              "RESTORE_FAILED",
+              `Backup active projects failed validation: ${validationError}`,
+              startedAt,
+              {
+                projects: canonicalizeProjects(daily.activeProjects || []),
+                dailyUpdatedAt: daily.updatedAt,
+              },
+            );
+          }
+          if (
+            JSON.stringify(canonicalizeProjects(restored)) !==
+            JSON.stringify(canonicalizeProjects(preview.entry.afterList || []))
+          ) {
+            return failActiveProjectsResult(
+              operation,
+              "STALE_PREVIEW",
+              "Backup contents changed since preview.",
+              startedAt,
+              {
+                projects: canonicalizeProjects(daily.activeProjects || []),
+                dailyUpdatedAt: daily.updatedAt,
+              },
+            );
+          }
+          const nextDaily = { ...daily, activeProjects: cloneProjects(restored) };
+          const result = await commitActiveProjectsDaily(daily, nextDaily, operation, startedAt, [
+            "activeProjects",
+          ]);
+          if (result.ok) updateRecentActiveProjectId(operation, { recentMode: "replace" }, restored);
+          return result;
+        }
+
+        const afterDaily = preview.entry.afterDaily || preview.entry.meta?.afterDaily;
+        if (!afterDaily) {
+          return failActiveProjectsResult(
+            operation,
+            "STALE_PREVIEW",
+            "Preview is missing a stored plan.",
+            startedAt,
+            {
+              projects: canonicalizeProjects(daily.activeProjects || []),
+              dailyUpdatedAt: daily.updatedAt,
+            },
+          );
+        }
+        const result = await commitActiveProjectsDaily(
+          daily,
+          afterDaily,
+          operation,
+          startedAt,
+          preview.entry.meta?.allowedKeys || ["activeProjects"],
+        );
+        if (result.ok) {
+          updateRecentActiveProjectId(operation, preview.entry.meta, afterDaily.activeProjects || []);
+        }
+        return result;
+      }
+
+      return applyActiveProjectsOperation(args, daily, startedAt, helpers);
+    });
+  }
+
   return {
     SCHEMA_VERSION,
     PERSONAL_CONTEXT_SOFT_CAP,
@@ -2982,6 +3628,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     memoryUpdateDaily,
     memoryPriorities,
     workingContextItems,
+    memoryActiveProjects,
     memorySetPreference,
     memorySetInstructions,
     memoryClear,
@@ -3004,6 +3651,10 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       getRecentPriorityId: () => recentPriorityId,
       setRecentPriorityId: (id) => {
         recentPriorityId = id;
+      },
+      getRecentActiveProjectId: () => recentActiveProjectId,
+      setRecentActiveProjectId: (id) => {
+        recentActiveProjectId = id;
       },
       getRecentWcId: (scope) => recentWcIds[normalizeScope(scope)] || null,
       setRecentWcId: (scope, id) => {
@@ -3032,4 +3683,5 @@ module.exports = {
   createMemoryStore,
   priorityLifecycle: require("./priority-lifecycle.cjs"),
   workingContextLifecycle: require("./working-context-lifecycle.cjs"),
+  activeProjectsLifecycle: require("./active-projects-lifecycle.cjs"),
 };

@@ -755,7 +755,10 @@ test("scoped restore only; unrelated fields unchanged", async () => {
     await store.ensureMemory();
     await store.memoryUpdateDaily({
       summary: "Keep me",
-      activeProjects: [{ name: "Project X" }],
+    });
+    await store.memoryActiveProjects({
+      operation: "add",
+      item: { name: "Project X" },
     });
     await store.workingContextItems({
       operation: "add",
@@ -926,7 +929,9 @@ test("text and voice share identical working_context_items schema and handler", 
   assert.match(main, /Use working_context_items for every commitment/);
   assert.match(main, /List overdue commitments/);
   assert.match(main, /Never invent or expand Sarah's reference wording/);
-  assert.match(main, /Never claim a working-context or priority mutation succeeded unless the tool result has ok:true/);
+  assert.match(main, /Never claim a working-context, priority, or active-project mutation succeeded unless the tool result has ok:true/);
+  assert.match(main, /Use memory_active_projects for every active-project lifecycle request/);
+  assert.match(main, /Never use memory_update_daily\.activeProjects/);
 });
 
 test("legacy items without createdAt remain valid on read", async () => {
