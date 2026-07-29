@@ -419,6 +419,55 @@ test("17.5 attacker-crafted preview keys ignored on load/write", () => {
   assert.deepEqual(Object.keys(written).sort(), ["recent", "schemaVersion", "updatedAt"]);
 });
 
+test("17.5 instruction maps that one/that/the recent one to by recent", () => {
+  const main = read("electron/main.cjs");
+  assert.match(main, /that one/);
+  assert.match(main, /the recent one/);
+  assert.match(main, /"by":"recent"/);
+  assert.match(main, /Do not ask which item she meant while a valid recent reference exists/);
+  assert.match(main, /Complete that one/);
+  assert.match(main, /memory_priorities \{"operation":"complete","reference":\{"by":"recent"\}\}/);
+});
+
+test("17.5 memory_priorities schema accepts by recent", () => {
+  const main = read("electron/main.cjs");
+  const prioritiesToolStart = main.indexOf('name: "memory_priorities"');
+  assert.ok(prioritiesToolStart > 0);
+  const nextTool = main.indexOf('name: "', prioritiesToolStart + 10);
+  const toolBlock = main.slice(prioritiesToolStart, nextTool > prioritiesToolStart ? nextTool : prioritiesToolStart + 4000);
+  assert.match(toolBlock, /reference:/);
+  assert.match(toolBlock, /"by":"recent"/);
+  assert.match(toolBlock, /that one/);
+});
+
+test("17.5 persisted recent priority resolves after simulated restart", async () => {
+  await withTempMemory(async (store, dir) => {
+    const added = await store.memoryPriorities({
+      operation: "add",
+      items: [{ text: "P17 restart continuity check" }],
+    });
+    assert.equal(added.ok, true);
+    const recentId = store._test.getRecentPriorityId();
+    assert.ok(recentId);
+    await store._test.forcePersistContinuity();
+
+    const restarted = createMemoryStore({ rootDir: dir });
+    await restarted.ensureMemory();
+    assert.equal(restarted._test.getRecentPriorityId(), recentId);
+    assert.equal(restarted.getPendingConfirmation(), null);
+
+    const resolved = await restarted.memoryPriorities({
+      operation: "complete",
+      reference: { by: "recent" },
+    });
+    assert.equal(resolved.ok, true);
+    const hit = (resolved.priorities || []).find((item) => item.id === recentId);
+    assert.ok(hit);
+    assert.equal(hit.text, "P17 restart continuity check");
+    assert.equal(hit.status, "done");
+  });
+});
+
 // --- §17.6 Restart policy ---
 
 test("17.6 pending not in continuity writer; restart drops pending; recent loads", async () => {
@@ -500,8 +549,390 @@ test("17.7 launch prerequisite messaging for missing deps/dist", () => {
   assert.match(ps1, /Starting Jarvis \(built UI\)/);
   assert.match(ps1, /Jarvis is already running/);
   assert.match(ps1, /taskkill\.exe/);
+  assert.match(ps1, /Resolve-NpmStartExecutable/);
+  assert.match(ps1, /Get-Command "npm\.cmd"/);
+  assert.match(ps1, /node_modules\\electron\\dist\\electron\.exe/);
+  assert.match(ps1, /Start-JarvisElectronProcess/);
+  assert.match(ps1, /ProcessStartInfo/);
+  assert.match(ps1, /\$psi\.Arguments\s*=\s*'"'\s*\+\s*\(\$RepoRoot/);
+  assert.match(ps1, /Wait-JarvisProcessIdentity/);
+  assert.match(ps1, /Test-IsJarvisProcessCommandLine/);
+  assert.match(ps1, /default_app\\\.asar/);
+  assert.match(ps1, /process identity confirmed/);
   assert.doesNotMatch(ps1, /VITE_DEV_SERVER_URL\s*=/);
+  assert.doesNotMatch(ps1, /Start-Process -FilePath \$npmPath/);
+  assert.doesNotMatch(ps1, /Start-Process -FilePath \$npmExe -ArgumentList @\("start"\)/);
+  assert.doesNotMatch(ps1, /ArgumentList @\("start"\)/);
+  assert.doesNotMatch(ps1, /ArgumentList @\(\$RepoRoot\)/);
   assert.match(bat, /start-jarvis\.ps1/);
+
+  const main = read("electron/main.cjs");
+  assert.match(main, /isJarvisApplicationPath/);
+  assert.match(main, /default_app\\\.asar/);
+  assert.match(main, /\[jarvis-launch\] ready/);
+  assert.match(main, /refused non-Jarvis app path/);
+  assert.match(main, /show:\s*false/);
+  assert.match(main, /ready-to-show/);
+  assert.match(main, /did-fail-load/);
+  assert.match(main, /did-finish-load/);
+  assert.match(main, /renderer-load-failed/);
+  assert.match(main, /evaluateJarvisUiReadiness/);
+  // Ready must not be printed in whenReady before createWindow visibility path.
+  assert.doesNotMatch(
+    main,
+    /refused non-Jarvis app path[\s\S]*console\.info\("\[jarvis-launch\] ready"[\s\S]*void createWindow/,
+  );
+});
+
+test("17.7 Windows npm.cmd is preferred over npm.ps1 for builds", () => {
+  const exists = new Set([
+    String.raw`C:\Program Files\nodejs\npm.ps1`,
+    String.raw`C:\Program Files\nodejs\npm.cmd`,
+  ]);
+  const resolved = launchHelpers.resolveNpmStartExecutable(
+    [String.raw`C:\Program Files\nodejs\npm.ps1`],
+    {
+      platform: "win32",
+      exists: (p) => exists.has(p),
+    },
+  );
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.path, String.raw`C:\Program Files\nodejs\npm.cmd`);
+  assert.doesNotMatch(resolved.path, /\.ps1$/i);
+
+  const directCmd = launchHelpers.resolveNpmStartExecutable(
+    [String.raw`C:\Program Files\nodejs\npm.cmd`, String.raw`C:\Program Files\nodejs\npm.ps1`],
+    {
+      platform: "win32",
+      exists: (p) => exists.has(p),
+    },
+  );
+  assert.equal(directCmd.path, String.raw`C:\Program Files\nodejs\npm.cmd`);
+});
+
+test("17.7 explicit electron.exe absolute app path for spaced repository roots", () => {
+  const repoRoot = String.raw`C:\Users\Sarah Segel\OneDrive\Cursor\rileyjarvis`;
+  const electronExe = path.join(repoRoot, "node_modules", "electron", "dist", "electron.exe");
+  const plan = launchHelpers.buildLaunchPlan(
+    {
+      nodeAvailable: true,
+      npmAvailable: true,
+      packageJsonPresent: true,
+      electronInstalled: true,
+      envLocalPresent: true,
+      openAiKeyPresent: true,
+      distPresent: true,
+      willRebuild: false,
+      repoRoot,
+    },
+    {
+      platform: "win32",
+      npmCandidates: [String.raw`C:\Program Files\nodejs\npm.ps1`],
+      exists: (p) =>
+        p === String.raw`C:\Program Files\nodejs\npm.ps1` ||
+        p === String.raw`C:\Program Files\nodejs\npm.cmd` ||
+        p === electronExe,
+    },
+  );
+  assert.equal(plan.ok, true);
+  assert.equal(plan.workingDirectory, repoRoot);
+  assert.match(plan.workingDirectory, /Sarah Segel/);
+  assert.equal(plan.startCommand, electronExe);
+  assert.deepEqual(plan.startArgs, [repoRoot]);
+  assert.equal(plan.absoluteAppPath, repoRoot);
+  assert.equal(plan.usesExplicitAppPath, true);
+  assert.equal(plan.avoidsNpmStartDot, true);
+  assert.equal(plan.rejectsDefaultApp, true);
+  assert.equal(plan.setViteDevServerUrl, false);
+  assert.doesNotMatch(plan.startArgs.join(" "), /(^|\s)\.(\s|$)/);
+  assert.doesNotMatch(plan.startCommand, /default_app/i);
+  assert.equal(launchHelpers.shouldSetViteDevServerUrl(), false);
+});
+
+test("17.7 Windows quoting keeps Sarah Segel repository root as one app argument", () => {
+  const repoRoot = String.raw`C:\Users\Sarah Segel\OneDrive\Cursor\rileyjarvis`;
+  const truncated = String.raw`C:\Users\Sarah`;
+
+  assert.equal(launchHelpers.wouldTruncateSpacedPathIfUnquoted(repoRoot), true);
+  assert.equal(truncated, repoRoot.split(/\s+/)[0]);
+
+  const quoted = launchHelpers.quoteWindowsProcessArgument(repoRoot);
+  assert.equal(quoted, `"${repoRoot}"`);
+  assert.match(quoted, /Sarah Segel/);
+  assert.doesNotMatch(quoted, /^"C:\\Users\\Sarah"$/);
+
+  const argList = launchHelpers.buildWindowsStartProcessArgumentList(repoRoot);
+  assert.equal(argList.length, 1);
+  assert.equal(argList[0], `"${repoRoot}"`);
+
+  const decoded = launchHelpers.decodeWindowsStartProcessArgumentList(argList);
+  assert.equal(decoded.length, 1);
+  assert.equal(decoded[0], repoRoot);
+  assert.match(decoded[0], /Sarah Segel/);
+  assert.notEqual(decoded[0], truncated);
+  assert.doesNotMatch(decoded[0], /^C:\\Users\\Sarah$/);
+
+  const psiArgs = launchHelpers.buildWindowsProcessStartInfoArguments(repoRoot);
+  assert.equal(psiArgs, `"${repoRoot}"`);
+  assert.equal(launchHelpers.tokenizeCommandLineArgs(psiArgs).length, 1);
+  assert.equal(launchHelpers.tokenizeCommandLineArgs(psiArgs)[0], repoRoot);
+
+  // Unquoted spaced path would become multiple tokens; quoting must prevent that.
+  assert.ok(launchHelpers.tokenizeCommandLineArgs(repoRoot).length > 1);
+  assert.equal(launchHelpers.tokenizeCommandLineArgs(repoRoot)[0], truncated);
+
+  const electronExe = path.join(repoRoot, "node_modules", "electron", "dist", "electron.exe");
+  const plan = launchHelpers.buildLaunchPlan(
+    {
+      nodeAvailable: true,
+      npmAvailable: true,
+      packageJsonPresent: true,
+      electronInstalled: true,
+      envLocalPresent: true,
+      openAiKeyPresent: true,
+      distPresent: true,
+      willRebuild: false,
+      repoRoot,
+    },
+    {
+      platform: "win32",
+      npmCandidates: [String.raw`C:\Program Files\nodejs\npm.cmd`],
+      exists: (p) => p.endsWith("npm.cmd") || p === electronExe,
+    },
+  );
+  assert.equal(plan.appArgumentCount, 1);
+  assert.deepEqual(plan.decodedAppArguments, [repoRoot]);
+  assert.equal(plan.startProcessArgumentList.length, 1);
+  assert.equal(plan.startProcessArguments, `"${repoRoot}"`);
+  assert.equal(plan.rejectsDefaultApp, true);
+  assert.doesNotMatch(plan.startProcessArguments, /default_app/i);
+  assert.doesNotMatch(plan.decodedAppArguments.join("\0"), /^C:\\Users\\Sarah$/);
+});
+
+test("17.7 missing Electron executable and nonzero child exit are reported clearly", () => {
+  const repoRoot = String.raw`C:\Users\Sarah Segel\OneDrive\Cursor\rileyjarvis`;
+  const missingExe = launchHelpers.resolveElectronExecutable(repoRoot, {
+    platform: "win32",
+    exists: () => false,
+  });
+  assert.equal(missingExe.ok, false);
+  assert.match(missingExe.message, /Electron executable was not found/i);
+
+  const missingNpm = launchHelpers.resolveNpmStartExecutable([], {
+    platform: "win32",
+    exists: () => false,
+  });
+  assert.equal(missingNpm.ok, false);
+  assert.match(missingNpm.message, /npm was not found/i);
+
+  const onlyPs1 = launchHelpers.resolveNpmStartExecutable(
+    [String.raw`C:\Program Files\nodejs\npm.ps1`],
+    {
+      platform: "win32",
+      exists: (p) => p.endsWith("npm.ps1"),
+    },
+  );
+  assert.equal(onlyPs1.ok, false);
+
+  const planMissingExe = launchHelpers.buildLaunchPlan(
+    {
+      nodeAvailable: true,
+      npmAvailable: true,
+      packageJsonPresent: true,
+      electronInstalled: true,
+      envLocalPresent: true,
+      openAiKeyPresent: true,
+      distPresent: true,
+      willRebuild: false,
+      repoRoot,
+    },
+    {
+      platform: "win32",
+      npmCandidates: [String.raw`C:\Program Files\nodejs\npm.cmd`],
+      exists: (p) => p.endsWith("npm.cmd"),
+    },
+  );
+  assert.equal(planMissingExe.ok, false);
+  assert.ok(planMissingExe.failures.some((f) => f.code === "electron_exe_missing"));
+
+  const nonzero = launchHelpers.interpretLaunchChildExit(7, { alreadyRunning: false });
+  assert.equal(nonzero.ok, false);
+  assert.equal(nonzero.exitCode, 7);
+  assert.match(nonzero.message, /code 7/);
+
+  const clean = launchHelpers.interpretLaunchChildExit(0, { alreadyRunning: false });
+  assert.equal(clean.ok, true);
+  assert.equal(clean.action, "clean_exit");
+
+  const focused = launchHelpers.interpretLaunchChildExit(0, { alreadyRunning: true });
+  assert.equal(focused.ok, true);
+  assert.equal(focused.action, "already_running_focused");
+});
+
+test("17.7 process identity rejects bare/default Electron and accepts Jarvis app path", () => {
+  const repoRoot = String.raw`C:\Users\Sarah Segel\OneDrive\Cursor\rileyjarvis`;
+  const bare = `"${repoRoot}\\node_modules\\electron\\dist\\electron.exe" `;
+  const defaultRenderer =
+    `"${repoRoot}\\node_modules\\electron\\dist\\electron.exe" --type=renderer --app-path="${repoRoot}\\node_modules\\electron\\dist\\resources\\default_app.asar"`;
+  const jarvisMain = `"${repoRoot}\\node_modules\\electron\\dist\\electron.exe" "${repoRoot}"`;
+  const jarvisRenderer =
+    `"${repoRoot}\\node_modules\\electron\\dist\\electron.exe" --type=renderer --user-data-dir="C:\\Users\\Sarah Segel\\AppData\\Roaming\\rileyjarvis" --app-path="${repoRoot}"`;
+
+  assert.equal(launchHelpers.isDefaultElectronAppCommandLine(bare), true);
+  assert.equal(launchHelpers.isDefaultElectronAppCommandLine(defaultRenderer), true);
+  assert.equal(launchHelpers.isJarvisProcessCommandLine(bare, repoRoot), false);
+  assert.equal(launchHelpers.isJarvisProcessCommandLine(defaultRenderer, repoRoot), false);
+  assert.equal(launchHelpers.isJarvisProcessCommandLine(jarvisMain, repoRoot), true);
+  assert.equal(launchHelpers.isJarvisProcessCommandLine(jarvisRenderer, repoRoot), true);
+
+  const withheld = launchHelpers.evaluateJarvisLaunchReadiness({
+    repoRoot,
+    commandLines: [bare, defaultRenderer],
+  });
+  assert.equal(withheld.ready, false);
+  assert.match(withheld.reason, /electron_without_jarvis_identity|jarvis_identity_not_confirmed/);
+  assert.doesNotMatch(withheld.message || "", /\[jarvis-launch\] ready/);
+
+  const ready = launchHelpers.evaluateJarvisLaunchReadiness({
+    repoRoot,
+    commandLines: [bare, jarvisMain],
+  });
+  assert.equal(ready.ready, true);
+  assert.equal(ready.message, "[jarvis-launch] ready");
+
+  const defaultAppPath = launchHelpers.evaluateJarvisLaunchReadiness({
+    repoRoot,
+    appPath: `${repoRoot}\\node_modules\\electron\\dist\\resources\\default_app.asar`,
+  });
+  assert.equal(defaultAppPath.ready, false);
+
+  const jarvisAppPath = launchHelpers.evaluateJarvisLaunchReadiness({
+    repoRoot,
+    appPath: repoRoot,
+  });
+  assert.equal(jarvisAppPath.ready, true);
+  assert.equal(launchHelpers.isJarvisApplicationPath(repoRoot, repoRoot), true);
+  assert.equal(
+    launchHelpers.isJarvisApplicationPath(
+      `${repoRoot}\\node_modules\\electron\\dist\\resources\\default_app.asar`,
+      repoRoot,
+    ),
+    false,
+  );
+});
+
+test("17.7 relative production asset URLs for Electron file:// loading", () => {
+  const viteConfig = read("vite.config.ts");
+  assert.match(viteConfig, /base:\s*["']\.\/["']/);
+
+  const distHtml = read("dist/index.html");
+  assert.match(distHtml, /src="\.\/assets\//);
+  assert.match(distHtml, /href="\.\/assets\//);
+  assert.doesNotMatch(distHtml, /src="\/assets\//);
+  assert.doesNotMatch(distHtml, /href="\/assets\//);
+});
+
+test("17.7 UI readiness emitted only after successful show/visibility", () => {
+  const windowLaunch = require("./window-launch.cjs");
+  const displays = [{ bounds: { x: 0, y: 0, width: 1920, height: 1080 } }];
+  assert.equal(
+    windowLaunch.isBoundsOnScreen({ x: 100, y: 100, width: 1120, height: 760 }, displays),
+    true,
+  );
+  assert.equal(
+    windowLaunch.isBoundsOnScreen({ x: -8000, y: -8000, width: 1120, height: 760 }, displays),
+    false,
+  );
+
+  const notShown = windowLaunch.evaluateJarvisUiReadiness({
+    loadFailed: false,
+    destroyed: false,
+    loaded: true,
+    shown: false,
+    minimized: false,
+    visible: false,
+    boundsOnScreen: true,
+  });
+  assert.equal(notShown.ready, false);
+  assert.equal(notShown.message, null);
+
+  const visible = windowLaunch.evaluateJarvisUiReadiness({
+    loadFailed: false,
+    destroyed: false,
+    loaded: true,
+    shown: true,
+    minimized: false,
+    visible: true,
+    boundsOnScreen: true,
+  });
+  assert.equal(visible.ready, true);
+  assert.equal(visible.message, "[jarvis-launch] ready");
+  assert.equal(visible.reason, "visible_ui");
+
+  const main = read("electron/main.cjs");
+  const readyIdx = main.indexOf('console.info("[jarvis-launch] ready"');
+  const evalIdx = main.indexOf("evaluateJarvisUiReadiness");
+  const showFalseIdx = main.indexOf("show: false");
+  assert.ok(readyIdx > 0 && evalIdx > 0 && showFalseIdx > 0);
+  assert.ok(evalIdx < readyIdx, "ready log must follow visibility evaluation");
+  assert.ok(showFalseIdx < readyIdx, "window must start hidden before ready");
+});
+
+test("17.7 no UI readiness after renderer load failure", () => {
+  const windowLaunch = require("./window-launch.cjs");
+  const errors = require("./realtime-errors.cjs");
+  const failed = windowLaunch.evaluateJarvisUiReadiness({
+    loadFailed: true,
+    destroyed: false,
+    loaded: true,
+    shown: true,
+    minimized: false,
+    visible: true,
+    boundsOnScreen: true,
+  });
+  assert.equal(failed.ready, false);
+  assert.equal(failed.reason, "renderer_load_failed");
+  assert.equal(failed.message, null);
+
+  const detail = windowLaunch.sanitizeRendererLoadFailure(
+    {
+      errorCode: -6,
+      errorDescription: "ERR_FILE_NOT_FOUND sk-abcdefghijklmnopqrstuvwxyz",
+      validatedURL: "file:///C:/Users/Sarah%20Segel/app/dist/index.html?token=secret",
+    },
+    errors.sanitizeDiagnosticText,
+  );
+  assert.equal(detail.errorCode, -6);
+  assert.doesNotMatch(detail.errorDescription, /sk-abcdefghijklmnopqrstuvwxyz/);
+  assert.doesNotMatch(String(detail.url || ""), /token=secret/);
+  assert.match(String(detail.url || ""), /file:/);
+
+  const main = read("electron/main.cjs");
+  assert.match(main, /did-fail-load/);
+  assert.match(main, /renderer-load-failed/);
+  assert.match(main, /sanitizeRendererLoadFailure/);
+});
+
+test("17.7 long-running child start is not treated as immediate failure", async () => {
+  // Simulate a child that stays alive briefly (Electron daily path), then exits 0.
+  const child = launchHelpers.spawn(process.execPath, ["-e", "setTimeout(() => {}, 150)"], {
+    stdio: "ignore",
+  });
+  assert.ok(child.pid > 0);
+  assert.equal(child.exitCode, null);
+  const stillRunning = launchHelpers.interpretLaunchChildExit(child.exitCode, {
+    alreadyRunning: false,
+  });
+  assert.equal(stillRunning.ok, true);
+  assert.equal(stillRunning.action, "still_running_or_unknown");
+
+  const code = await new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", (exitCode) => resolve(exitCode ?? 0));
+  });
+  const after = launchHelpers.interpretLaunchChildExit(code, { alreadyRunning: false });
+  assert.equal(after.ok, true);
+  assert.equal(after.exitCode, 0);
 });
 
 test("17.7 single-instance lock false quits; second-instance focuses", () => {

@@ -8,6 +8,12 @@ const dotenv = require("dotenv");
 const { createDesktopControl } = require("./platform/index.cjs");
 const { createMemoryStore } = require("./memory.cjs");
 const { createSingleInstanceController } = require("./single-instance.cjs");
+const {
+  sanitizeRendererLoadFailure,
+  isBoundsOnScreen,
+  evaluateJarvisUiReadiness,
+} = require("./window-launch.cjs");
+const { sanitizeDiagnosticText } = require("./realtime-errors.cjs");
 
 dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 
@@ -95,6 +101,9 @@ Concise, calm, useful. Use a confident man's voice. Talk like a smart operator, 
 - Show the briefing artifact; give a short spoken/text lead from the tool message. Do not re-list every bullet in speech. Do not invent items missing from the artifact. On failure, report the tool error once; do not retry identical args.
 - Never say that full details are in the artifact panel (or similar) unless this turn's tool result included a substantive artifact that was delivered for display. If memory_day_briefing failed or returned no artifact, do not claim the panel shows the briefing.
 - Never ask Sarah for internal IDs. Resolve by ordinal, exact wording, distinctive phrase, person/project/due qualifier, or the recently changed item.
+- When Sarah says "that one", "that", or "the recent one", map it to the most recently touched compatible item in that domain (daily priority, active project, or working-context item for the relevant scope). Call the matching tool with reference {"by":"recent"} (plain string "recent" is also accepted). Do not ask which item she meant while a valid recent reference exists for that domain. If the tool returns NOT_FOUND for recent, then ask one concise clarification.
+- Example — User: "Complete that one." → memory_priorities {"operation":"complete","reference":{"by":"recent"}}
+- Example — User: "Remove that one." → memory_priorities {"operation":"remove","reference":{"by":"recent"}} (preview, then confirm with the same previewToken)
 - Never invent or expand Sarah's reference wording to force a unique match. Pass the phrase she actually supplied (or its shared meaningful tokens). If several open items share that phrase, the tool returns AMBIGUOUS_MATCH — ask one concise clarification and do not write. Do not pick one candidate by guessing a narrower phrase.
 - Never use memory_update_daily.priorities for add, edit, complete, reopen, remove, reorder, replace, clear, carry, or restore.
 - Never use memory_update_daily.commitments, followUps, or unresolved — use working_context_items instead.
@@ -595,7 +604,7 @@ const toolSpecs = [
         item: { type: "object", additionalProperties: true },
         reference: {
           description:
-            'Priority reference. Prefer {"by":"text","value":"call Cecilia"}. Also accepts {"text":"call Cecilia"} or a plain string.',
+            'Priority reference. Prefer {"by":"text","value":"call Cecilia"}. Also accepts {"by":"recent"} or plain string "recent" for "that one"/"that"/"the recent one", {"text":"call Cecilia"}, ordinal, id, or a plain string.',
           anyOf: [{ type: "string" }, { type: "object", additionalProperties: true }],
         },
         atPosition: { type: "number" },
@@ -929,6 +938,11 @@ async function createWindow() {
   await ensureData();
   await memoryStore.ensureMemory();
   await clearStartupLoadingThumbnails();
+
+  let loadFailed = false;
+  let readyEmitted = false;
+  let mainFrameLoaded = false;
+
   const win = new BrowserWindow({
     width: 1120,
     height: 760,
@@ -938,6 +952,7 @@ async function createWindow() {
     frame: false,
     transparent: true,
     backgroundColor: "#00000000",
+    show: false,
     icon: nativeImage.createEmpty(),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -951,11 +966,78 @@ async function createWindow() {
     callback(permission === "media");
   });
 
-  const devUrl = process.env.VITE_DEV_SERVER_URL;
-  if (devUrl) {
-    await win.loadURL(devUrl);
-  } else {
-    await win.loadFile(path.join(process.cwd(), "dist", "index.html"));
+  const tryEmitJarvisLaunchReady = () => {
+    if (readyEmitted || win.isDestroyed()) return;
+    const bounds = win.getBounds();
+    const displays = screen.getAllDisplays().map((display) => ({ bounds: display.bounds }));
+    const readiness = evaluateJarvisUiReadiness({
+      loadFailed,
+      destroyed: win.isDestroyed(),
+      loaded: mainFrameLoaded,
+      shown: win.isVisible(),
+      minimized: typeof win.isMinimized === "function" ? win.isMinimized() : false,
+      visible: win.isVisible(),
+      boundsOnScreen: isBoundsOnScreen(bounds, displays),
+    });
+    if (!readiness.ready) return;
+    readyEmitted = true;
+    console.info("[jarvis-launch] ready", JSON.stringify(getBuildInfo()));
+  };
+
+  const showJarvisWindowIfReady = () => {
+    if (loadFailed || win.isDestroyed()) return;
+    if (!mainFrameLoaded) return;
+    if (typeof win.isMinimized === "function" && win.isMinimized()) {
+      win.restore();
+    }
+    const bounds = win.getBounds();
+    const displays = screen.getAllDisplays().map((display) => ({ bounds: display.bounds }));
+    if (!isBoundsOnScreen(bounds, displays)) {
+      win.center();
+    }
+    win.show();
+    win.focus();
+    tryEmitJarvisLaunchReady();
+  };
+
+  win.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame) return;
+    loadFailed = true;
+    const detail = sanitizeRendererLoadFailure(
+      { errorCode, errorDescription, validatedURL },
+      sanitizeDiagnosticText,
+    );
+    console.error("[jarvis-launch] renderer-load-failed", JSON.stringify(detail));
+  });
+
+  win.webContents.on("did-finish-load", () => {
+    if (loadFailed || win.isDestroyed()) return;
+    mainFrameLoaded = true;
+    showJarvisWindowIfReady();
+  });
+
+  win.once("ready-to-show", () => {
+    showJarvisWindowIfReady();
+  });
+
+  try {
+    const devUrl = process.env.VITE_DEV_SERVER_URL;
+    if (devUrl) {
+      await win.loadURL(devUrl);
+    } else {
+      await win.loadFile(path.join(process.cwd(), "dist", "index.html"));
+    }
+  } catch (error) {
+    loadFailed = true;
+    const detail = sanitizeRendererLoadFailure(
+      {
+        errorCode: null,
+        errorDescription: error && error.message ? String(error.message) : "renderer_load_failed",
+        validatedURL: null,
+      },
+      sanitizeDiagnosticText,
+    );
+    console.error("[jarvis-launch] renderer-load-failed", JSON.stringify(detail));
   }
 }
 
@@ -2120,10 +2202,40 @@ function fallbackMermaidDiagram(title) {
   return `flowchart TD\n  A["${safeTitle}"] --> B["Chart request received"]\n  B --> C["Jarvis will show a safe fallback if syntax fails"]`;
 }
 
+function isJarvisApplicationPath(appPath) {
+  const resolvedApp = path.resolve(String(appPath || ""));
+  if (!resolvedApp || /default_app\.asar/i.test(resolvedApp)) return false;
+  try {
+    return resolvedApp === path.resolve(process.cwd());
+  } catch {
+    return false;
+  }
+}
+
 if (singleInstance.gotLock) {
   app.whenReady().then(() => {
-    console.info("[jarvis-launch] ready", JSON.stringify(getBuildInfo()));
-    void createWindow();
+    const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
+    // Never treat Electron's default_app as Jarvis; require the repository app path.
+    if (!isJarvisApplicationPath(appPath)) {
+      console.error(
+        "[jarvis-launch] refused non-Jarvis app path",
+        JSON.stringify({ appPath, cwd: process.cwd() }),
+      );
+      app.quit();
+      return;
+    }
+    // Ready is emitted from createWindow only after load + visible on-screen show.
+    void createWindow().catch((error) => {
+      const detail = sanitizeRendererLoadFailure(
+        {
+          errorCode: null,
+          errorDescription: error && error.message ? String(error.message) : "window_create_failed",
+          validatedURL: null,
+        },
+        sanitizeDiagnosticText,
+      );
+      console.error("[jarvis-launch] window-create-failed", JSON.stringify(detail));
+    });
   });
 
   app.on("window-all-closed", () => {

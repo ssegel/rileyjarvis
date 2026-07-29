@@ -1,6 +1,6 @@
 # Phase 17 Implementation Report — Daily-Use Reliability
 
-**Status:** Implementation complete; pre-commit review corrections applied. Live validation not run (per instructions).  
+**Status:** Implementation complete; live validation (§18 L1–L8 + sanitized diagnostics) passed. Temporary DevTools hook removed.
 **Branch:** `phase-17-daily-use-reliability`  
 **Baseline:** `4d36e5c` — *Add Phase 17 daily-use reliability design*  
 **Audit contract:** `docs/phase-17-daily-use-reliability-audit.md`
@@ -23,8 +23,11 @@
 
 ### Modified
 - `README.md` — daily vs development launch
-- `electron/main.cjs` — single-instance lock, build-info IPC, continuity IPC, pending attach on `text:run`, before-quit cancel, launch ready log
-- `electron/memory.cjs` — pending projection, remint suppression, recent continuity load/save/flush, stale recent clear
+- `electron/main.cjs` — single-instance lock, build-info IPC, continuity IPC, pending attach on `text:run`, before-quit cancel, launch ready only after visible UI, refuse non-Jarvis app path
+- `electron/memory.cjs` — pending projection, remint suppression, recent continuity load/save/flush, stale recent clear; instruction/schema mapping for `by: "recent"`
+- `vite.config.ts` — `base: "./"` for Electron `file://` assets
+- `scripts/start-jarvis.ps1` / `scripts/launch-helpers.cjs` — npm.cmd preference, explicit electron.exe + quoted absolute app path, process identity
+- `electron/window-launch.cjs` — UI readiness / sanitized load-failure helpers (added)
 - `electron/preload.cjs` — `getContinuity`, `dismissPendingConfirmation`, `getBuildInfo`
 - `electron/realtime-errors.cjs` — text cooldown policy helpers; uncapped Retry-After parse for classification
 - `electron/text-session.cjs` — `safeForAutoNetworkRetry`, `retryAfterMs`, pending hint injection, cancel-all
@@ -39,9 +42,10 @@
 - `electron/session-continuity.cjs` — schema load/save/validate + launch prerequisite helpers
 - `electron/single-instance.cjs` — testable lock/focus helper
 - `electron/phase-17-daily-use-reliability.test.cjs` — audit §17 matrix
-- `scripts/start-jarvis.ps1` — daily built-renderer launcher
+- `scripts/start-jarvis.ps1` — daily built-renderer launcher (see Modified for launch hardening)
 - `scripts/start-jarvis.bat` — shortcut-friendly wrapper
 - `scripts/launch-helpers.cjs` — pure launch checks for tests
+- `electron/window-launch.cjs` — visibility / readiness helpers
 - `docs/phase-17-daily-use-reliability-implementation-report.md` — this report
 
 ---
@@ -140,12 +144,13 @@ Copy never says “Retrying in…” for 429; it says the user **may** retry aft
 ## Launch architecture
 
 Daily path (`scripts/start-jarvis.ps1` / `.bat`):
-1. Verify Node, npm, project root, `node_modules/electron`, `.env.local`, non-empty `OPENAI_API_KEY` (never prints secrets)
-2. Build only if `dist/index.html` missing or `-Rebuild`
-3. Clear `VITE_DEV_SERVER_URL`; run `npm start` (Electron loads built `dist/`)
-4. No Vite process
-5. If Jarvis already appears running, print `Jarvis is already running` then still start so Electron can focus the existing window
-6. Ctrl+C / unclean stop uses `taskkill /T` to kill the launch process tree
+1. Verify Node, npm (for builds), project root, `node_modules/electron`, Electron `dist/electron.exe`, `.env.local`, non-empty `OPENAI_API_KEY` (never prints secrets)
+2. Build only if `dist/index.html` missing or `-Rebuild` (via `npm.cmd`, never `npm.ps1`)
+3. Clear `VITE_DEV_SERVER_URL`; start `node_modules\electron\dist\electron.exe` with the **absolute repository root** as one quoted `ProcessStartInfo.Arguments` token and `WorkingDirectory` set to that root
+4. No Vite process; no `npm start` / `electron .` for the daily Electron child
+5. Confirm process identity (repo app path / not `default_app.asar`) before treating the launch as successful; `main.cjs` prints `[jarvis-launch] ready` only after `app.getAppPath()` matches the repository
+6. If Jarvis already appears running (strict identity), print `Jarvis is already running` then still start so Electron can focus the existing window
+7. Ctrl+C / unclean stop uses `taskkill /T` to kill the launch process tree
 
 Development path remains `npm run dev` (Vite + Electron).
 
@@ -269,8 +274,39 @@ DIFF_CHECK_EXIT:0
 
 ## Live-validation status
 
-**Not performed** (explicitly out of scope for this stop point).  
-Audit §18 checklist remains for a later thrifty live pass (daily launcher, second-instance focus, one confirm chain, restart pending absent, no orphan processes).
+Audit §18 live checklist (API-thrifty) completed for L1–L8 plus sanitized diagnostics proof.
+
+| Check | Result |
+|---|---|
+| L1 Built UI via `scripts/start-jarvis.bat` | **Pass** (after npm.cmd → explicit electron.exe + absolute app path → Sarah Segel quoting → visible UI readiness fixes) |
+| L2 Second launch focuses existing instance | **Pass** |
+| L3 Simple text + build/version status | **Pass** |
+| L4 Disposable preview + pending banner | **Pass** |
+| L5 Live 429 not provoked | **Skipped** (automated §17.1 covers countdown; per audit) |
+| L6 Same-token confirm succeeds; remint suppressed | **Pass** |
+| L7 Restart: pending absent; recent continuity | **Pass after correction** (see Fifth finding + live re-check below) |
+| L8 Quit; no orphan Electron/Node from daily launcher | **Pass** (repository-scoped Win32 query: no `electron.exe` / `node.exe`) |
+| Sanitized diagnostics copy | **Pass** (DevTools console path; UI Copy diagnostics only when an error is set) |
+
+### Initial recent-reference failure (L7) and final correction
+
+**First L7 attempt (failed):** After pending-discard restart, `P17 restart continuity check` remained in daily priorities and the pending banner was correctly absent, but `What is the exact text of that one?` did not resolve — Jarvis asked which item.
+
+**Cause:** Continuity persistence was healthy (`session-continuity.json` held the matching `priorityId`). Instructions and `memory_priorities` schema did not map “that one” / “that” / “the recent one” to `reference: {"by":"recent"}`, so the model clarified instead of calling the tool.
+
+**Fix:** Instruction mapping + schema acceptance of `{"by":"recent"}` / `"recent"` (Fifth finding). `data/memory` not modified by the fix.
+
+**Re-check:** After the correction, recent-reference resolution on the last touched priority succeeded without asking which item.
+
+### Sanitized diagnostics live proof
+
+- UI **Copy diagnostics** only appears when `lastTextError` / voice error is set; double-submit while busy does not surface that control (early return on `textTurnActive`).
+- Chrome `chrome://inspect` / remote-debugging against Electron 42.5.1 produced 404 / non-functional Inspect — not used for the proof.
+- Temporary local hook `win.webContents.openDevTools({ mode: "detach" })` in `did-finish-load` opened Electron’s own DevTools; preload checks `getBuildInfo` / `getContinuity` passed.
+- Console-built sanitized report (matching `textClient.getDiagnosticReport` safe fields) copied via `window.jarvis.copyTextToClipboard`.
+- Observed report included: Realtime Diagnostics header, `generatedAt`, `appVersion` 1.0.0, `branch` `phase-17-daily-use-reliability`, `gitSha` `4016e46`, `lastErrorCode` null, empty Events, `connectionState` null, `cooldownUntilMs` null, `pendingOperation` null, `composerChars` 0, `restartPolicyNote` “Pending confirmations do not survive restart.”
+- Confirmed absent: `previewToken`, destructive plans / before-after arrays, API keys / auth values, full composer text, transcripts, durable-memory contents.
+- Temporary `openDevTools` hook **removed** after validation; no temporary diagnostics code remains in `main.cjs`.
 
 ---
 
@@ -278,30 +314,29 @@ Audit §18 checklist remains for a later thrifty live pass (daily launcher, seco
 
 | Criterion | Status |
 |---|---|
-| Daily scripts without Cursor/`npm run dev` | Implemented (not live-checked) |
-| Second launch focuses instance | Implemented + unit-tested |
-| Built renderer, no Vite on daily path | Implemented |
-| Text 429 UX / composer / no auto 429 | Implemented + automated |
+| Daily scripts without Cursor/`npm run dev` | **Live-checked** |
+| Second launch focuses instance | **Live-checked** + unit-tested |
+| Built renderer, no Vite on daily path | **Live-checked** |
+| Text 429 UX / composer / no auto 429 | Implemented + automated (live 429 not provoked) |
 | Quota without retry loop | Implemented + automated |
-| Same-process pending + remint suppression | Implemented + automated |
-| Restart drops pending; recent IDs persist | Implemented + automated |
+| Same-process pending + remint suppression | **Live-checked** + automated |
+| Restart drops pending; recent IDs persist | **Live-checked** (after instruction/schema fix) + automated |
 | No preview/plans on disk | Implemented + automated |
-| Thin sanitized diagnostics | Implemented + automated |
-| Clean shutdown / no intentional daily orphans | Implemented (live check pending) |
-| §17 automated green | **Yes (24/24)** |
-| §18 live checklist | **Pending** |
+| Thin sanitized diagnostics | **Live-checked** (DevTools path) + automated |
+| Clean shutdown / no intentional daily orphans | **Live-checked** |
+| §17 automated green | **Yes (36/36)** |
+| §18 live checklist | **Pass (L1–L8 + sanitized diagnostics)** |
 | No §20 out-of-scope items | **Yes** |
 
-**Pilot readiness:** Ready for automated-backed pilot engineering; **not** fully certified until §18 live validation.
+**Pilot readiness:** Phase 17 engineering and live validation complete; ready to commit when requested.
 
 ---
 
 ## Recommended next step
 
-1. Commit Phase 17 implementation (when requested).
-2. Run audit §18 live checklist once with the daily launcher (API-thrifty; do not provoke 429s).
-3. Optionally create the Windows desktop shortcut pointing at `scripts/start-jarvis.bat` (out of band).
-4. Begin the one-week pilot only after L1–L8 live checks pass.
+1. Commit Phase 17 launch/visibility/recent-reference corrections and live-validation report (when requested).
+2. Optionally create the Windows desktop shortcut pointing at `scripts/start-jarvis.bat` (out of band).
+3. Begin the one-week pilot.
 
 ---
 
@@ -325,3 +360,252 @@ Audit §18 checklist remains for a later thrifty live pass (daily launcher, seco
 ## Pre-commit review status
 
 Pre-commit review completed against the audit and this report. Substantive corrections above were applied before the final automated validation pass.
+
+---
+
+## Live-validation L1 failure and launcher correction
+
+### First live-launch attempt (failed) — npm.ps1 via Start-Process
+
+Attempted `scripts/start-jarvis.bat` on Windows during audit §18 L1 prep.
+
+Observed:
+- Banner `Starting Jarvis (built UI)…` printed
+- Prerequisite checks appeared to run
+- No Electron/Vite/Node/start-jarvis process remained afterward
+- Memory files under `data/memory` were unchanged
+
+Exact launcher error:
+```
+Start-Process : This command cannot be run due to the error: %1 is not a valid Win32 application.
+At scripts\start-jarvis.ps1:123
+$proc = Start-Process -FilePath $npmPath -ArgumentList @("start") ...
+```
+
+#### Root cause
+
+`Get-Command npm` on this Windows host resolves to `C:\Program Files\nodejs\npm.ps1` (`CommandType=ExternalScript`).
+`Start-Process` / CreateProcess cannot execute a PowerShell script as a Win32 application.
+`npm.cmd` exists beside it and is the correct Start-Process target for npm builds.
+
+#### First correction
+
+- Prefer `npm.cmd` for `npm run build` (never Start-Process `npm.ps1`)
+- `-LiteralPath` for roots that contain spaces
+- Daily path still clears `VITE_DEV_SERVER_URL` and never sets it
+
+---
+
+### Second live-launch attempt (failed) — Electron default welcome app
+
+After the npm.cmd fix, `scripts\start-jarvis.bat` appeared to succeed.
+
+Observed:
+- Terminal showed `npm start` / `electron .`, dotenv `.env.local` injection, and `[jarvis-launch] ready`
+- Visible window was Electron’s default welcome page (“To run a local app, execute electron.exe path-to-app”)
+- Jarvis UI did not load
+
+#### Exact root cause
+
+Live process inspection found:
+
+```text
+electron.exe   (no application argument)
+--app-path=...\node_modules\electron\dist\resources\default_app.asar
+--user-data-dir=...\AppData\Roaming\Electron
+window title: Electron
+```
+
+A correct Jarvis process looks like:
+
+```text
+electron.exe "<absolute repository root>"
+--app-path=<repository root>
+--user-data-dir=...\AppData\Roaming\rileyjarvis
+window title: Jarvis
+```
+
+`Start-Process` → `npm.cmd start` → `electron .` did not reliably leave a child whose command line included the repository app path. A bare `electron.exe` loads `default_app.asar`. Manual `npm.cmd start` from the repository root did open Jarvis, but the daily launcher path must not depend on `.` resolution through Start-Process.
+
+Additional defect: already-running detection treated a bare `...\rileyjarvis\node_modules\electron\dist\electron.exe` command line as Jarvis because the exe path contains the repository string.
+
+#### Explicit-app-path correction
+
+Daily launch now invokes:
+
+```text
+node_modules\electron\dist\electron.exe <absolute repository root>
+WorkingDirectory = <absolute repository root>
+```
+
+- Does not use bare `electron.exe`, `electron .`, or `npm start` for the Electron child
+- `npm.cmd` remains only for optional `-Rebuild` / missing-dist builds
+
+#### Process-identity and readiness safeguards
+
+- Already-running detection matches only command lines that identify this repository as the Electron **app** (`--app-path=<repo>`, absolute repo argument after `electron.exe`, or `electron/main.cjs` under the repo)
+- Bare Electron / `default_app.asar` never counts as Jarvis
+- Launcher waits for Jarvis process identity after start; otherwise kills the child tree and fails with a readable error
+- `main.cjs` prints `[jarvis-launch] ready` only after `app.getAppPath()` equals the repository cwd (refuses `default_app.asar`)
+- Second valid Jarvis launch still starts Electron so the single-instance lock focuses the existing window
+
+---
+
+### Third live-launch attempt (failed) — spaced path split at “Sarah”
+
+Observed after the explicit-app-path correction:
+
+```text
+Unable to find Electron app at C:\Users\Sarah
+Cannot find module 'C:\Users\Sarah'
+```
+
+Actual repository root: `C:\Users\Sarah Segel\OneDrive\Cursor\rileyjarvis`.
+
+#### Exact root cause
+
+Windows PowerShell `Start-Process -ArgumentList @($RepoRoot)` does **not** quote arguments that contain spaces. CreateProcess therefore received two tokens (`C:\Users\Sarah` and `Segel\OneDrive\Cursor\rileyjarvis`) instead of one application path. Electron treated `C:\Users\Sarah` as the app path.
+
+#### Quoting correction
+
+Daily launch now starts Electron via `System.Diagnostics.ProcessStartInfo`:
+
+```text
+FileName          = <repo>\node_modules\electron\dist\electron.exe
+WorkingDirectory  = <absolute repository root>
+Arguments         = "<absolute repository root>"   # one quoted CreateProcess argument
+UseShellExecute   = false
+```
+
+- Does not concatenate an unquoted command string
+- Does not use `Start-Process -ArgumentList @($RepoRoot)` for the Electron child
+- Helpers `quoteWindowsProcessArgument` / `buildWindowsStartProcessArgumentList` document and test the quoted form
+
+#### Regression coverage added (quoting)
+
+- “Sarah Segel” repository path remains one decoded app argument
+- Truncated `C:\Users\Sarah` cannot be produced by the quoted argument list
+- Exactly one app-path argument in the generated process argument list
+- Ordinary Windows paths with spaces (no apostrophes) work
+- No `default_app.asar` fallback in the launch plan
+
+#### Regression results (explicit-app-path + quoting corrections)
+
+```
+node --test electron/phase-17-daily-use-reliability.test.cjs
+→ 30/30 pass
+
+npm run build
+→ tsc --noEmit OK; vite build OK
+
+git diff --check
+→ EXIT 0
+```
+
+Jarvis not relaunched after this quoting fix (per instructions).
+
+### Fourth finding — ready without visible BrowserWindow
+
+After the quoting fix, the launcher could report:
+
+```text
+[jarvis-launch] process identity confirmed
+[jarvis-launch] ready
+```
+
+while no Jarvis UI was visible.
+
+#### Exact root cause
+
+1. `[jarvis-launch] ready` was printed in `app.whenReady()` **before** `createWindow()` completed or showed a window. Launcher “process identity confirmed” only proved the Electron process had the repository app path.
+2. Daily UI uses a frameless transparent `BrowserWindow`. Vite’s default `base: "/"` emitted absolute `/assets/...` URLs in `dist/index.html`, which often fail under Electron `loadFile` (`file://`), leaving an empty transparent (effectively invisible) window. There was no `did-fail-load` handling and no explicit `ready-to-show` → `show()`/`focus()` path.
+
+#### Visibility correction
+
+- `vite.config.ts`: `base: "./"` so production assets resolve next to `dist/index.html` under `file://`
+- `electron/window-launch.cjs`: pure visibility / readiness / sanitized load-failure helpers
+- `electron/main.cjs`:
+  - `show: false` until load succeeds
+  - `did-finish-load` / `ready-to-show` → restore if minimized, center if off-screen, `show()` + `focus()`
+  - `[jarvis-launch] ready` only after `evaluateJarvisUiReadiness` (loaded, shown, not minimized, visible, on-screen)
+  - main-frame `did-fail-load` / load exceptions → sanitized `[jarvis-launch] renderer-load-failed` and **no** ready
+- Single-instance focus behavior unchanged
+
+#### Regression coverage added (visibility)
+
+- Relative production asset URLs in Vite config and built `dist/index.html`
+- Readiness only after successful show/visibility
+- No readiness after renderer load failure (sanitized diagnostics)
+
+#### Regression results (visibility correction)
+
+```
+node --test --test-name-pattern "17.7 relative production|17.7 UI readiness|17.7 no UI readiness|17.7 launch prerequisite|17.7 single-instance" electron/phase-17-daily-use-reliability.test.cjs
+→ 5/5 pass
+
+npm run build
+→ OK (dist assets now ./assets/…)
+
+git diff --check
+→ EXIT 0
+```
+
+Jarvis not relaunched (per instructions).
+
+---
+
+### Fifth finding — recent “that one” failed after restart (live L7)
+
+Observed after pending-discard restart passed:
+
+- `P17 restart continuity check` remained in daily priorities.
+- Pending banner correctly absent.
+- Prompt `What is the exact text of that one?` did **not** resolve; Jarvis asked which item.
+
+#### Exact root cause
+
+Persistence/restore were healthy: `session-continuity.json` held `priorityId` matching the P17 item in `daily.json`. Preview-remove did not clear recent. Startup hydration loads that id into `recentPriorityId`, and `resolvePriorityReference` supports `by: "recent"`.
+
+The live miss was **prompt-routing / schema gap**: instructions never mapped “that one” / “that” / “the recent one” to `reference: {"by":"recent"}`, and `memory_priorities` reference docs omitted `recent` (unlike working-context / active-projects). The model clarified instead of calling the tool with `by: "recent"`. Automated coverage exercised tool-level recent resolve, not the instruction mapping.
+
+#### Correction
+
+- Instructions: explicit mapping of “that one” / “that” / “the recent one” → most recently touched compatible item; require `reference: {"by":"recent"}`; do not ask which item while a valid recent reference exists.
+- `memory_priorities` reference schema/description: explicitly accepts `{"by":"recent"}` / `"recent"`.
+- Continuity file format unchanged; `data/memory` not modified by the fix.
+- Focused regressions: instruction mapping, schema accepts recent, persisted recent resolves after simulated restart.
+
+#### Regression results (recent-reference correction)
+
+```
+node --test --test-name-pattern "17.5 instruction maps|17.5 memory_priorities schema|17.5 persisted recent" electron/phase-17-daily-use-reliability.test.cjs
+→ 3/3 pass
+
+git diff --check
+→ EXIT 0
+```
+
+(`npm run build` not required — Electron main/instruction changes only.)
+
+### Temporary DevTools hook (diagnostics only; removed)
+
+Inserted only for sanitized-diagnostics live proof:
+
+```js
+win.webContents.openDevTools({ mode: "detach" });
+```
+
+inside `did-finish-load` after `showJarvisWindowIfReady()`. Removed immediately after the clipboard report passed. No durable-memory changes. No temporary diagnostics code remains.
+
+### Final clean-shutdown verification (L8) — passed
+
+With Jarvis quit via the normal UI close path, repository-scoped Win32 process query:
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object {
+  $_.Name -match '^(electron|node)\.exe$' -and
+  [string]$_.CommandLine -match [regex]::Escape((Resolve-Path .).Path)
+} | Select-Object ProcessId, Name, CommandLine
+```
+
+**Result:** no remaining `electron.exe` / `node.exe` processes for this repository. Jarvis fully closed.
