@@ -2,6 +2,20 @@ const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const {
+  resolveBackupIdentifier,
+  listOrdinaryBackupFiles,
+  isoToStamp,
+} = require("./backup-ids.cjs");
+const {
+  createBaselineStore,
+  projectPublicBaselineMetadata,
+  MAX_PROTECTED_BASELINES,
+  MAX_PROTECTED_BASELINE_BYTES,
+  MAX_SINGLE_BACKUP_BYTES: BASELINE_MAX_SINGLE_BYTES,
+} = require("./backup-baselines.cjs");
+const { createPilotJournal } = require("./pilot-journal.cjs");
+const { buildTurnArtifactDelivery } = require("./artifact-selection.cjs");
+const {
   PREVIEW_TTL_MS,
   DESTRUCTIVE_OPERATIONS,
   canonicalizePriorities,
@@ -68,7 +82,11 @@ const {
 } = require("./session-continuity.cjs");
 
 const SCHEMA_VERSION = 1;
-const MAX_BACKUPS = 10;
+const MAX_ORDINARY_BACKUPS = 40;
+/** @deprecated alias — prefer MAX_ORDINARY_BACKUPS */
+const MAX_BACKUPS = MAX_ORDINARY_BACKUPS;
+const MAX_ORDINARY_BACKUP_BYTES = 64 * 1024 * 1024;
+const MAX_SINGLE_BACKUP_BYTES = 8 * 1024 * 1024;
 const PERSONAL_CONTEXT_SOFT_CAP = 9_500;
 const INSTRUCTIONS_EXCERPT_CAP = 3_000;
 const DAILY_SECTION_CAP = 2_000;
@@ -242,6 +260,29 @@ function createMemoryStore(options = {}) {
     sessionContinuity: path.join(rootDir, CONTINUITY_FILENAME),
   };
 
+  /** Shared execution/mutation ownership: null | { kind, id } */
+  let sharedOwner = null;
+  let confirmInFlightId = null;
+  const isExternallyBusy =
+    typeof options.isExternallyBusy === "function" ? options.isExternallyBusy : () => false;
+
+  function tryAcquireSharedOwner(kind, id) {
+    if (isExternallyBusy()) return false;
+    if (sharedOwner && !(sharedOwner.kind === kind && sharedOwner.id === id)) return false;
+    sharedOwner = { kind, id };
+    return true;
+  }
+
+  function releaseSharedOwner(kind, id) {
+    if (sharedOwner && sharedOwner.kind === kind && sharedOwner.id === id) {
+      sharedOwner = null;
+    }
+  }
+
+  function getSharedOwner() {
+    return sharedOwner ? { ...sharedOwner } : null;
+  }
+
   /** @type {Map<string, { expiresAt: number, operation: string, hash: string, afterPriorities: any[], beforePriorities: any[], dailyUpdatedAt: string, meta?: any }>} */
   const previewStore = new Map();
   let recentPriorityId = null;
@@ -305,7 +346,7 @@ function createMemoryStore(options = {}) {
   function refreshPendingFromStore() {
     if (!pendingConfirmation) return;
     const entry = previewStore.get(pendingConfirmation.previewToken);
-    if (!entry || Date.now() > entry.expiresAt) {
+    if (!entry || now().getTime() > entry.expiresAt) {
       clearPendingConfirmation();
     }
   }
@@ -362,7 +403,7 @@ function createMemoryStore(options = {}) {
       return null;
     }
     const entry = previewStore.get(pendingConfirmation.previewToken);
-    if (!entry || Date.now() > entry.expiresAt) {
+    if (!entry || now().getTime() > entry.expiresAt) {
       clearPendingConfirmation();
       return null;
     }
@@ -623,6 +664,23 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     await atomicWriteText(filePath, `${JSON.stringify(value, null, 2)}\n`);
   }
 
+  const { sanitizeDiagnosticText } = require("./realtime-errors.cjs");
+  const baselineStore = createBaselineStore({
+    rootDir,
+    fsApi,
+    now,
+    randomUUID,
+    sanitizeText: sanitizeDiagnosticText,
+    atomicWriteJson,
+  });
+  const pilotJournal = createPilotJournal({
+    rootDir,
+    fsApi,
+    now,
+    randomUUID,
+    sanitizeText: sanitizeDiagnosticText,
+  });
+
   function enqueue(task) {
     const run = writeQueue.then(task, task);
     writeQueue = run.then(
@@ -630,6 +688,25 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       () => undefined,
     );
     return run;
+  }
+
+  let writeQueueDepth = 0;
+  let memoryTaskActive = false;
+
+  function enqueueTracked(task) {
+    writeQueueDepth += 1;
+    const run = enqueue(async () => {
+      try {
+        return await task();
+      } finally {
+        writeQueueDepth = Math.max(0, writeQueueDepth - 1);
+      }
+    });
+    return run;
+  }
+
+  function isMemoryQueueBusy() {
+    return writeQueueDepth > 0 || memoryTaskActive === true;
   }
 
   function normalizeSensitivity(value) {
@@ -856,25 +933,21 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   }
 
   async function listBackupFiles() {
-    try {
-      const names = await fsApi.readdir(paths.backups);
-      const withStats = [];
-      for (const name of names) {
-        const full = path.join(paths.backups, name);
-        const stats = await fsApi.stat(full);
-        withStats.push({ name, full, mtimeMs: stats.mtimeMs || 0 });
-      }
-      return withStats.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    } catch {
-      return [];
-    }
+    return listOrdinaryBackupFiles(paths.backups, fsApi);
   }
 
   async function pruneBackups() {
     const files = await listBackupFiles();
-    for (const file of files.slice(MAX_BACKUPS)) {
+    // Sort oldest-first for removal.
+    const ordered = [...files].sort((a, b) => (a.mtimeMs || 0) - (b.mtimeMs || 0));
+    let totalBytes = ordered.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
+    let count = ordered.length;
+    for (const file of ordered) {
+      if (count <= MAX_ORDINARY_BACKUPS && totalBytes <= MAX_ORDINARY_BACKUP_BYTES) break;
       try {
         await fsApi.unlink(file.full);
+        count -= 1;
+        totalBytes -= Number(file.size) || 0;
       } catch {
         // Ignore prune races.
       }
@@ -899,7 +972,15 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       entries: await readJsonFile(paths.entries, normalizeEntries, defaultEntries),
       ...extras,
     };
-    await atomicWriteJson(path.join(paths.backups, `${prefix}.json`), snapshot);
+    const serialized = `${JSON.stringify(snapshot, null, 2)}\n`;
+    const byteLength = Buffer.byteLength(serialized, "utf8");
+    if (byteLength > MAX_SINGLE_BACKUP_BYTES) {
+      const err = new Error("Backup snapshot exceeds the single-file size ceiling.");
+      err.code = "BACKUP_TOO_LARGE";
+      throw err;
+    }
+    const target = path.join(paths.backups, `${prefix}.json`);
+    await atomicWriteJson(target, snapshot);
     await pruneBackups();
     return snapshot;
   }
@@ -1684,7 +1765,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     }
 
     const token = createPreviewToken();
-    const expiresAt = Date.now() + PREVIEW_TTL_MS;
+    const expiresAt = now().getTime() + PREVIEW_TTL_MS;
     const payload = { operation, beforePriorities, afterPriorities, dailyUpdatedAt, meta };
     previewStore.set(token, {
       expiresAt,
@@ -1721,7 +1802,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       clearPendingIfMatchingToken(token);
       return { code: "STALE_PREVIEW" };
     }
-    if (Date.now() > entry.expiresAt) {
+    if (now().getTime() > entry.expiresAt) {
       previewStore.delete(token);
       clearPendingIfMatchingToken(token);
       return { code: "STALE_PREVIEW" };
@@ -1870,12 +1951,23 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     if (!operation) {
       return failPriorityResult("unknown", "UNSUPPORTED_OPERATION", "operation is required.", startedAt);
     }
+    if (isConfirmOwnershipActive()) {
+      return failPriorityResult(operation, "session.busy", "Jarvis is busy. Wait for the current action to finish.", startedAt);
+    }
 
-    return enqueue(async () => {
-      const result = await runMemoryPrioritiesOperation(args, operation, startedAt);
-      const out = applyFailedRetryPolicy(args, result);
-      await flushContinuityIfDirty();
-      return out;
+    return enqueueTracked(async () => {
+      if (isConfirmOwnershipActive()) {
+        return failPriorityResult(operation, "session.busy", "Jarvis is busy. Wait for the current action to finish.", startedAt);
+      }
+      memoryTaskActive = true;
+      try {
+        const result = await runMemoryPrioritiesOperation(args, operation, startedAt);
+        const out = applyFailedRetryPolicy(args, result);
+        await flushContinuityIfDirty();
+        return out;
+      } finally {
+        memoryTaskActive = false;
+      }
     });
   }
 
@@ -2012,21 +2104,30 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   }
 
   async function loadValidatedBackupPriorities(backupId) {
-    const files = await listBackupFiles();
-    let file = null;
-    if (backupId) {
-      file = files.find(
-        (item) =>
-          item.name.includes(String(backupId)) ||
-          item.name === backupId ||
-          item.full.endsWith(String(backupId)),
-      );
-    } else {
-      file = files[0];
+    const ordinaryFiles = await listBackupFiles();
+    // Optionally enrich with createdAt from header for ISO matching — best-effort from filename stamp.
+    const baselines = await baselineStore.listBaselines();
+    const baselineEntries = baselines.ok
+      ? baselines.baselines.filter((item) => !item.invalid && !item.missing && !item.conflict)
+      : [];
+    const resolved = resolveBackupIdentifier(backupId, {
+      ordinaryFiles,
+      baselineEntries: baselineEntries.map((item) => ({
+        id: item.id,
+        name: item.name,
+        fileName: item.fileName,
+        full: item.full,
+        createdAt: item.createdAt,
+        mtimeMs: item.mtimeMs,
+        conflict: item.conflict,
+        invalid: item.invalid,
+        missing: item.missing,
+      })),
+    });
+    if (!resolved.ok) {
+      return { error: { code: resolved.code, message: resolved.message, candidates: resolved.candidates } };
     }
-    if (!file) {
-      return { error: { code: "RESTORE_FAILED", message: "No backup was found to restore." } };
-    }
+    const file = resolved.file;
     let snapshot;
     try {
       snapshot = JSON.parse(await readText(file.full));
@@ -2070,6 +2171,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       const afterPriorities = loaded.restoredPriorities;
       const token = storePreview(operation, beforePriorities, afterPriorities, daily.updatedAt, {
         backupFile: loaded.file.name,
+        backupFullPath: loaded.file.full,
         request: buildPreviewRequestBinding(args),
       });
       return {
@@ -2471,7 +2573,10 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
             dailyUpdatedAt: daily.updatedAt,
           });
         }
-        const full = path.join(paths.backups, backupFile);
+        const full =
+          typeof preview.entry.meta?.backupFullPath === "string" && preview.entry.meta.backupFullPath
+            ? preview.entry.meta.backupFullPath
+            : path.join(paths.backups, backupFile);
         if (!(await pathExists(full))) {
           return failPriorityResult(operation, "RESTORE_FAILED", "Backup file is no longer available.", startedAt, {
             priorities: canonicalizePriorities(daily.priorities),
@@ -2834,7 +2939,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     }
 
     const token = createPreviewToken();
-    const expiresAt = Date.now() + PREVIEW_TTL_MS;
+    const expiresAt = now().getTime() + PREVIEW_TTL_MS;
     const payload = { operation, scope, beforeList, afterList, dailyUpdatedAt, meta };
     previewStore.set(token, {
       expiresAt,
@@ -2874,7 +2979,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       clearPendingIfMatchingToken(token);
       return { code: "STALE_PREVIEW" };
     }
-    if (Date.now() > entry.expiresAt) {
+    if (now().getTime() > entry.expiresAt) {
       previewStore.delete(token);
       clearPendingIfMatchingToken(token);
       return { code: "STALE_PREVIEW" };
@@ -2915,21 +3020,29 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
 
   async function loadValidatedBackupScope(backupId, scope) {
     const key = scopeKey(scope);
-    const files = await listBackupFiles();
-    let file = null;
-    if (backupId) {
-      file = files.find(
-        (item) =>
-          item.name.includes(String(backupId)) ||
-          item.name === backupId ||
-          item.full.endsWith(String(backupId)),
-      );
-    } else {
-      file = files[0];
+    const ordinaryFiles = await listBackupFiles();
+    const baselines = await baselineStore.listBaselines();
+    const baselineEntries = baselines.ok
+      ? baselines.baselines.filter((item) => !item.invalid && !item.missing && !item.conflict)
+      : [];
+    const resolved = resolveBackupIdentifier(backupId, {
+      ordinaryFiles,
+      baselineEntries: baselineEntries.map((item) => ({
+        id: item.id,
+        name: item.name,
+        fileName: item.fileName,
+        full: item.full,
+        createdAt: item.createdAt,
+        mtimeMs: item.mtimeMs,
+        conflict: item.conflict,
+        invalid: item.invalid,
+        missing: item.missing,
+      })),
+    });
+    if (!resolved.ok) {
+      return { error: { code: resolved.code, message: resolved.message, candidates: resolved.candidates } };
     }
-    if (!file) {
-      return { error: { code: "RESTORE_FAILED", message: "No backup was found to restore." } };
-    }
+    const file = resolved.file;
     let snapshot;
     try {
       snapshot = JSON.parse(await readText(file.full));
@@ -2966,12 +3079,23 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     if (!operation) {
       return failWcResult("unknown", "UNSUPPORTED_OPERATION", "operation is required.", startedAt);
     }
+    if (isConfirmOwnershipActive()) {
+      return failWcResult(operation, "session.busy", "Jarvis is busy. Wait for the current action to finish.", startedAt);
+    }
 
-    return enqueue(async () => {
-      const result = await runWorkingContextOperation(args, operation, startedAt);
-      const out = applyWcFailedRetryPolicy(args, result);
-      await flushContinuityIfDirty();
-      return out;
+    return enqueueTracked(async () => {
+      if (isConfirmOwnershipActive()) {
+        return failWcResult(operation, "session.busy", "Jarvis is busy. Wait for the current action to finish.", startedAt);
+      }
+      memoryTaskActive = true;
+      try {
+        const result = await runWorkingContextOperation(args, operation, startedAt);
+        const out = applyWcFailedRetryPolicy(args, result);
+        await flushContinuityIfDirty();
+        return out;
+      } finally {
+        memoryTaskActive = false;
+      }
     });
   }
 
@@ -3241,6 +3365,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         allowedKeys: [scopeKey(scope)],
         afterDaily,
         backupFile: loaded.file.name,
+        backupFullPath: loaded.file.full,
         request,
         setPending: true,
         message: `Preview ready for restore of ${scopeTitle(scope).toLowerCase()} from ${loaded.file.name}. Confirm to apply.`,
@@ -3559,7 +3684,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     if (reused) return reused;
 
     const token = createPreviewToken();
-    const expiresAt = Date.now() + PREVIEW_TTL_MS;
+    const expiresAt = now().getTime() + PREVIEW_TTL_MS;
     const payload = { operation, beforeList, afterList, dailyUpdatedAt, meta };
     previewStore.set(token, {
       expiresAt,
@@ -3597,7 +3722,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       clearPendingIfMatchingToken(token);
       return { code: "STALE_PREVIEW" };
     }
-    if (Date.now() > entry.expiresAt) {
+    if (now().getTime() > entry.expiresAt) {
       previewStore.delete(token);
       clearPendingIfMatchingToken(token);
       return { code: "STALE_PREVIEW" };
@@ -3658,21 +3783,29 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
   }
 
   async function loadValidatedBackupActiveProjects(backupId) {
-    const files = await listBackupFiles();
-    let file = null;
-    if (backupId) {
-      file = files.find(
-        (item) =>
-          item.name.includes(String(backupId)) ||
-          item.name === backupId ||
-          item.full.endsWith(String(backupId)),
-      );
-    } else {
-      file = files[0];
+    const ordinaryFiles = await listBackupFiles();
+    const baselines = await baselineStore.listBaselines();
+    const baselineEntries = baselines.ok
+      ? baselines.baselines.filter((item) => !item.invalid && !item.missing && !item.conflict)
+      : [];
+    const resolved = resolveBackupIdentifier(backupId, {
+      ordinaryFiles,
+      baselineEntries: baselineEntries.map((item) => ({
+        id: item.id,
+        name: item.name,
+        fileName: item.fileName,
+        full: item.full,
+        createdAt: item.createdAt,
+        mtimeMs: item.mtimeMs,
+        conflict: item.conflict,
+        invalid: item.invalid,
+        missing: item.missing,
+      })),
+    });
+    if (!resolved.ok) {
+      return { error: { code: resolved.code, message: resolved.message, candidates: resolved.candidates } };
     }
-    if (!file) {
-      return { error: { code: "RESTORE_FAILED", message: "No backup was found to restore." } };
-    }
+    const file = resolved.file;
     let snapshot;
     try {
       snapshot = JSON.parse(await readText(file.full));
@@ -3729,6 +3862,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       };
       const token = storeActiveProjectsPreview(operation, beforeList, afterList, daily.updatedAt, {
         backupFile: loaded.file.name,
+        backupFullPath: loaded.file.full,
         backupId: args.backupId || null,
         afterDaily,
         allowedKeys: ["activeProjects"],
@@ -4028,12 +4162,33 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     if (!operation) {
       return failActiveProjectsResult("unknown", "UNSUPPORTED_OPERATION", "operation is required.", startedAt);
     }
+    if (isConfirmOwnershipActive()) {
+      return failActiveProjectsResult(
+        operation,
+        "session.busy",
+        "Jarvis is busy. Wait for the current action to finish.",
+        startedAt,
+      );
+    }
 
-    return enqueue(async () => {
-      const result = await runMemoryActiveProjectsOperation(args, operation, startedAt);
-      if (result && result.code === "NOT_FOUND") clearStaleRecentIfNeeded("active_project", args);
-      await flushContinuityIfDirty();
-      return result;
+    return enqueueTracked(async () => {
+      if (isConfirmOwnershipActive()) {
+        return failActiveProjectsResult(
+          operation,
+          "session.busy",
+          "Jarvis is busy. Wait for the current action to finish.",
+          startedAt,
+        );
+      }
+      memoryTaskActive = true;
+      try {
+        const result = await runMemoryActiveProjectsOperation(args, operation, startedAt);
+        if (result && result.code === "NOT_FOUND") clearStaleRecentIfNeeded("active_project", args);
+        await flushContinuityIfDirty();
+        return result;
+      } finally {
+        memoryTaskActive = false;
+      }
     });
   }
 
@@ -4178,7 +4333,10 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
               },
             );
           }
-          const full = path.join(paths.backups, backupFile);
+          const full =
+            typeof preview.entry.meta?.backupFullPath === "string" && preview.entry.meta.backupFullPath
+              ? preview.entry.meta.backupFullPath
+              : path.join(paths.backups, backupFile);
           if (!(await pathExists(full))) {
             return failActiveProjectsResult(
               operation,
@@ -4303,15 +4461,277 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
       return applyActiveProjectsOperation(args, daily, startedAt, helpers);
   }
 
+  function busySessionResult(message = "Jarvis is busy. Wait for the current action to finish.") {
+    return {
+      ok: false,
+      code: "session.busy",
+      message,
+      retryable: false,
+    };
+  }
+
+  function isConfirmOwnershipActive() {
+    return Boolean(confirmInFlightId) || Boolean(sharedOwner && sharedOwner.kind === "confirm");
+  }
+
+  function buildPublicConfirmResult(internalResult, toolName) {
+    const ok = Boolean(internalResult && internalResult.ok);
+    const messageRaw =
+      (internalResult && (internalResult.message || internalResult.error || internalResult.confirmation)) ||
+      (ok ? "Confirmed." : "Confirmation failed.");
+    const publicResult = {
+      ok,
+      message: sanitizeDiagnosticText(String(messageRaw), 240),
+      toolName: toolName || null,
+      operation: internalResult && internalResult.operation ? String(internalResult.operation) : null,
+      scope: internalResult && internalResult.scope != null ? internalResult.scope : null,
+      dailyUpdatedAt:
+        internalResult && internalResult.dailyUpdatedAt != null
+          ? String(internalResult.dailyUpdatedAt)
+          : null,
+    };
+    if (!ok && internalResult && internalResult.code) {
+      publicResult.code = sanitizeDiagnosticText(String(internalResult.code), 64);
+    }
+
+    // Route through the established selection/delivery pipeline only. Do not flatten
+    // markdown via sanitizeDiagnosticText. Omit delivery when the artifact is unsafe.
+    const artifact = internalResult && internalResult.artifact;
+    if (
+      artifact &&
+      typeof artifact === "object" &&
+      !Array.isArray(artifact) &&
+      typeof artifact.content === "string" &&
+      typeof artifact.title === "string"
+    ) {
+      const panelArtifact = {
+        title: String(artifact.title).slice(0, 200),
+        kind: String(artifact.kind || "markdown").slice(0, 40),
+        content: String(artifact.content).slice(0, 100000),
+      };
+      if (artifact.language != null) panelArtifact.language = String(artifact.language).slice(0, 40);
+      const delivery = buildTurnArtifactDelivery([panelArtifact], [{ name: toolName }]);
+      if (delivery.selectedArtifact && delivery.hasSubstantiveArtifact) {
+        publicResult.artifactDelivery = {
+          artifactCount: delivery.artifactCount,
+          hasSubstantiveArtifact: delivery.hasSubstantiveArtifact,
+          toolNames: delivery.toolNames,
+          selectedArtifact: {
+            title: delivery.selectedArtifact.title,
+            kind: delivery.selectedArtifact.kind,
+            content: delivery.selectedArtifact.content,
+            ...(delivery.selectedArtifact.language != null
+              ? { language: delivery.selectedArtifact.language }
+              : {}),
+          },
+        };
+      }
+    }
+    return publicResult;
+  }
+
+  async function confirmPendingInternal(ownerId) {
+    if (confirmInFlightId !== ownerId || !sharedOwner || sharedOwner.kind !== "confirm" || sharedOwner.id !== ownerId) {
+      return busySessionResult();
+    }
+    if (isExternallyBusy()) {
+      return busySessionResult();
+    }
+
+    const pending = getPendingConfirmationInternal();
+    if (!pending) {
+      return { ok: false, code: "STALE_PREVIEW", message: "Nothing to confirm." };
+    }
+
+    await ensureMemoryUnlocked();
+    await rolloverDailyIfNeeded();
+    const daily = await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily());
+
+    const entry = previewStore.get(pending.previewToken);
+    if (!entry || now().getTime() > entry.expiresAt) {
+      clearPendingIfMatchingToken(pending.previewToken);
+      return { ok: false, code: "STALE_PREVIEW", message: "Pending confirmation expired." };
+    }
+    if (entry.operation !== pending.operation) {
+      clearPendingConfirmation();
+      return { ok: false, code: "STALE_PREVIEW", message: "Pending confirmation is stale." };
+    }
+    if (entry.dailyUpdatedAt !== daily.updatedAt) {
+      clearPendingConfirmation();
+      return { ok: false, code: "STALE_PREVIEW", message: "Pending confirmation is stale." };
+    }
+    if (entry.meta?.bindingKey && entry.meta.bindingKey !== pending.bindingKey) {
+      clearPendingConfirmation();
+      return { ok: false, code: "STALE_PREVIEW", message: "Pending confirmation binding drifted." };
+    }
+
+    const boundRequest = entry.meta?.request || {};
+    const args = {
+      operation: pending.operation,
+      confirmed: true,
+      previewToken: pending.previewToken,
+    };
+    if (pending.scope) args.scope = pending.scope;
+    if (boundRequest.reference != null) args.reference = boundRequest.reference;
+    if (boundRequest.backupId != null) args.backupId = boundRequest.backupId;
+    if (boundRequest.targetDate != null) args.targetDate = boundRequest.targetDate;
+    if (Object.prototype.hasOwnProperty.call(boundRequest, "move")) args.move = boundRequest.move === true;
+    if (boundRequest.order != null) args.order = boundRequest.order;
+    if (boundRequest.atPosition != null) args.atPosition = boundRequest.atPosition;
+    if (boundRequest.destinationScope != null) args.destinationScope = boundRequest.destinationScope;
+    if (boundRequest.dueDate != null) args.dueDate = boundRequest.dueDate;
+    if (boundRequest.deferredUntil != null) args.deferredUntil = boundRequest.deferredUntil;
+
+    const startedAt = Date.now();
+    let internalResult;
+    if (pending.toolName === "memory_priorities") {
+      internalResult = await runMemoryPrioritiesOperation(args, pending.operation, startedAt);
+    } else if (pending.toolName === "working_context_items") {
+      internalResult = await runWorkingContextOperation(args, pending.operation, startedAt);
+    } else if (pending.toolName === "memory_active_projects") {
+      internalResult = await runMemoryActiveProjectsOperation(args, pending.operation, startedAt);
+    } else {
+      return { ok: false, code: "STALE_PREVIEW", message: "Pending confirmation tool is unsupported." };
+    }
+
+    await flushContinuityIfDirty();
+    return buildPublicConfirmResult(internalResult, pending.toolName);
+  }
+
+  async function confirmPendingConfirmation(_ignoredPayload = {}) {
+    // Renderer payload is intentionally ignored — no token/operation accepted.
+    if (confirmInFlightId) {
+      return {
+        ok: false,
+        code: "session.busy",
+        message: "A confirmation is already in progress.",
+        retryable: false,
+      };
+    }
+    if (isExternallyBusy() || isMemoryQueueBusy() || getSharedOwner()) {
+      return busySessionResult();
+    }
+    const ownerId = `confirm-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    if (!tryAcquireSharedOwner("confirm", ownerId)) {
+      return busySessionResult();
+    }
+    confirmInFlightId = ownerId;
+    try {
+      return await enqueueTracked(async () => {
+        memoryTaskActive = true;
+        try {
+          return await confirmPendingInternal(ownerId);
+        } finally {
+          memoryTaskActive = false;
+          if (confirmInFlightId === ownerId) confirmInFlightId = null;
+          releaseSharedOwner("confirm", ownerId);
+        }
+      });
+    } catch (error) {
+      if (confirmInFlightId === ownerId) confirmInFlightId = null;
+      releaseSharedOwner("confirm", ownerId);
+      return busySessionResult();
+    }
+  }
+
+  function runSerializedBaselineMutation(task) {
+    if (isConfirmOwnershipActive()) {
+      return Promise.resolve(busySessionResult());
+    }
+    return enqueueTracked(async () => {
+      if (isConfirmOwnershipActive()) {
+        return busySessionResult();
+      }
+      memoryTaskActive = true;
+      try {
+        return await task();
+      } finally {
+        memoryTaskActive = false;
+      }
+    });
+  }
+
+  async function createProtectedBaseline(input = {}) {
+    return runSerializedBaselineMutation(async () =>
+      baselineStore.createBaseline({
+        name: input.name,
+        note: input.note,
+        snapshotWriter: async ({ baselineId, baselineName, reason }) => {
+          // Snapshot reads occur only while this mutation owns the memory queue.
+          const snapshot = {
+            schemaVersion: SCHEMA_VERSION,
+            reason,
+            createdAt: isoNow(),
+            baselineId,
+            baselineName,
+            instructions: (await pathExists(paths.instructions))
+              ? await readText(paths.instructions)
+              : defaultInstructions(),
+            preferences: await readJsonFile(paths.preferences, normalizePreferences, defaultPreferences),
+            profile: await readJsonFile(paths.profile, normalizeProfile, defaultProfile),
+            daily: await readJsonFile(paths.daily, (raw) => normalizeDaily(raw), () => defaultDaily()),
+            entries: await readJsonFile(paths.entries, normalizeEntries, defaultEntries),
+          };
+          return snapshot;
+        },
+      }),
+    );
+  }
+
+  async function listBackupMetadata() {
+    const ordinary = await listBackupFiles();
+    const baselines = await baselineStore.listBaselines();
+    const publicBaselines = baselines.ok
+      ? (baselines.baselines || []).map((row) => projectPublicBaselineMetadata(row))
+      : [];
+    return {
+      ok: true,
+      ordinary: ordinary.slice(0, 10).map((file) => ({
+        fileName: file.name,
+        mtimeMs: file.mtimeMs || 0,
+        size: file.size || 0,
+        createdAt: null,
+        reason: null,
+      })),
+      baselines: publicBaselines,
+      baselineListOk: baselines.ok !== false,
+      baselineError:
+        baselines.ok === false
+          ? {
+              code: baselines.code || "BASELINE_LIST_FAILED",
+              message: baselines.message || "Could not list baselines.",
+            }
+          : null,
+    };
+  }
+
   return {
     SCHEMA_VERSION,
     PERSONAL_CONTEXT_SOFT_CAP,
     MAX_BACKUPS,
+    MAX_ORDINARY_BACKUPS,
+    MAX_ORDINARY_BACKUP_BYTES,
+    MAX_SINGLE_BACKUP_BYTES,
+    MAX_PROTECTED_BASELINES,
+    MAX_PROTECTED_BASELINE_BYTES,
     paths,
     ensureMemory,
     loadAll,
     createBackupSnapshot,
     listBackupFiles,
+    listBackupMetadata,
+    createProtectedBaseline,
+    listBaselines: () => baselineStore.listBaselines(),
+    reregisterBaseline: (input) => runSerializedBaselineMutation(() => baselineStore.reregisterBaseline(input)),
+    deleteBaseline: (input) => runSerializedBaselineMutation(() => baselineStore.deleteBaseline(input)),
+    recordPilotIssue: (input) => pilotJournal.appendRecord(input),
+    readPilotIssues: (limit) => pilotJournal.readRecent(limit),
+    confirmPendingConfirmation,
+    isConfirmInFlight: () => Boolean(confirmInFlightId) || isConfirmOwnershipActive(),
+    isMemoryQueueBusy,
+    getSharedOwner,
+    tryAcquireSharedOwner,
+    releaseSharedOwner,
     rolloverDailyIfNeeded,
     buildPersonalContextBlock,
     buildPersonalContextForSession,
@@ -4337,6 +4757,7 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
     normalizeProfile,
     openDailyItems,
     enqueue,
+    enqueueTracked,
     atomicWriteJson,
     atomicWriteText,
     todayDate,
@@ -4375,6 +4796,14 @@ Edit this file or ask Jarvis to update it with memory_set_instructions.
         enqueue(async () => {
           await persistRecentContinuity();
         }),
+      runMemoryPrioritiesInternal: (args) =>
+        runMemoryPrioritiesOperation(args, String(args.operation || "").trim().toLowerCase(), Date.now()),
+      runWorkingContextInternal: (args) =>
+        runWorkingContextOperation(args, String(args.operation || "").trim().toLowerCase(), Date.now()),
+      runActiveProjectsInternal: (args) =>
+        runMemoryActiveProjectsOperation(args, String(args.operation || "").trim().toLowerCase(), Date.now()),
+      getConfirmInFlightId: () => confirmInFlightId,
+      getWriteQueueDepth: () => writeQueueDepth,
     },
   };
 }
@@ -4383,6 +4812,9 @@ module.exports = {
   SCHEMA_VERSION,
   PERSONAL_CONTEXT_SOFT_CAP,
   MAX_BACKUPS,
+  MAX_ORDINARY_BACKUPS,
+  MAX_ORDINARY_BACKUP_BYTES,
+  MAX_SINGLE_BACKUP_BYTES,
   PRIORITY_SELECTION_PRECEDENCE,
   NO_OPEN_DAILY_PRIORITIES_LINE,
   NO_OPEN_DAILY_PRIORITIES_REPLY,

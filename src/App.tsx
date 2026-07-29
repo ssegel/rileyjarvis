@@ -28,6 +28,13 @@ import {
   isTextManualRetryAllowed,
   showsTextRetryCountdown,
 } from "./lib/realtimeErrors";
+import {
+  buildBaselineDeletePayload,
+  buildBaselineReregisterPayload,
+  buildDeleteConfirmMessage,
+  formatBaselineStatus,
+  type PilotBaselineRow,
+} from "./lib/pilotBaselines";
 import type { JarvisBuildInfo, JarvisPendingConfirmationPublic, RickyArtifact } from "./vite-env";
 
 type RickyMode = "display" | "computer";
@@ -74,6 +81,15 @@ export default function App() {
   const [pendingConfirmation, setPendingConfirmation] = useState<JarvisPendingConfirmationPublic | null>(
     null,
   );
+  const [confirmPendingActive, setConfirmPendingActive] = useState(false);
+  const [memoryBusy, setMemoryBusy] = useState(false);
+  const [pilotNote, setPilotNote] = useState("");
+  const [pilotStatus, setPilotStatus] = useState("");
+  const [backupSummary, setBackupSummary] = useState("");
+  const [backupRows, setBackupRows] = useState<{
+    ordinary: Array<{ fileName: string; mtimeMs: number; size: number }>;
+    baselines: PilotBaselineRow[];
+  }>({ ordinary: [], baselines: [] });
   const [buildInfo, setBuildInfo] = useState<JarvisBuildInfo>({ version: "1.0.0" });
   const clientRef = useRef<RickyRealtimeClient | null>(null);
   const sessionOwnerRef = useRef(new SessionOwnerLock());
@@ -185,6 +201,8 @@ export default function App() {
         setBuildInfo(info || continuity.buildInfo || { version: "1.0.0" });
         textClientRef.current?.setBuildInfo(info || continuity.buildInfo);
         setPendingConfirmation(continuity.pendingConfirmation || null);
+        setMemoryBusy(Boolean(continuity.memoryBusy));
+        setConfirmPendingActive(Boolean(continuity.confirmInFlight));
       } catch {
         // Continuity IPC may be unavailable in non-Electron test shells.
       }
@@ -230,8 +248,127 @@ export default function App() {
     try {
       const continuity = await window.jarvis.getContinuity();
       setPendingConfirmation(continuity.pendingConfirmation || null);
+      setMemoryBusy(Boolean(continuity.memoryBusy));
+      setConfirmPendingActive(Boolean(continuity.confirmInFlight));
+      if (continuity.buildInfo) setBuildInfo(continuity.buildInfo);
     } catch {
       // Ignore.
+    }
+  }
+
+  const confirmDisabled =
+    !pendingConfirmation ||
+    confirmPendingActive ||
+    textTurnActive ||
+    memoryBusy ||
+    isBusy;
+
+  async function confirmPendingBanner() {
+    if (confirmDisabled) return;
+    setConfirmPendingActive(true);
+    try {
+      const result = await window.jarvis.confirmPendingConfirmation();
+      setStatus(result?.message || (result?.ok ? "Confirmed." : "Confirmation failed."));
+      if (result?.ok && result.artifactDelivery?.selectedArtifact) {
+        const nextArtifact = result.artifactDelivery.selectedArtifact;
+        artifactRef.current = nextArtifact;
+        setArtifact(nextArtifact);
+        setArtifactVisible(true);
+      }
+      await refreshPendingFromMain();
+    } catch {
+      setStatus("Confirmation failed.");
+    } finally {
+      setConfirmPendingActive(false);
+      await refreshPendingFromMain();
+    }
+  }
+
+  async function recordPilotIssue() {
+    try {
+      const result = await window.jarvis.recordPilotIssue({
+        note: pilotNote,
+        errorCode: lastTextError?.code || lastError?.code || null,
+        httpStatus: typeof lastTextError?.httpStatus === "number" ? lastTextError.httpStatus : null,
+        cooldownUntilMs: textCooldownUntilMs,
+        connectionState,
+      });
+      setPilotStatus(result?.ok ? `Issue recorded (${result.id}).` : result?.message || "Could not record issue.");
+      if (result?.ok) setPilotNote("");
+    } catch {
+      setPilotStatus("Could not record issue.");
+    }
+  }
+
+  async function saveBaseline() {
+    const name = window.prompt("Baseline name?");
+    if (!name || !name.trim()) return;
+    try {
+      const result = await window.jarvis.createBaseline({ name: name.trim() });
+      setBackupSummary(result?.ok ? `Baseline saved: ${name.trim()}` : result?.message || "Baseline save failed.");
+      await refreshBackupList();
+    } catch {
+      setBackupSummary("Baseline save failed.");
+    }
+  }
+
+  async function deleteBaselineRow(row: PilotBaselineRow) {
+    const payload = buildBaselineDeletePayload(row);
+    if (!payload.ok) {
+      setBackupSummary(payload.message);
+      return;
+    }
+    if (!window.confirm(buildDeleteConfirmMessage(row))) return;
+    try {
+      const result = await window.jarvis.deleteBaseline({
+        id: payload.id,
+        fileName: payload.fileName,
+      });
+      setBackupSummary(
+        result?.ok
+          ? `Deleted baseline: ${String(row.name || "").trim() || "(unnamed)"} (${payload.fileName})`
+          : result?.message || "Delete failed.",
+      );
+      await refreshBackupList();
+    } catch {
+      setBackupSummary("Delete failed.");
+    }
+  }
+
+  async function reregisterBaselineRow(row: PilotBaselineRow) {
+    const suggested =
+      (typeof row.name === "string" && row.name.trim()) ||
+      window.prompt("Name for recovered baseline?") ||
+      "";
+    const payload = buildBaselineReregisterPayload(row, suggested);
+    if (!payload.ok) {
+      setBackupSummary(payload.message);
+      return;
+    }
+    try {
+      const result = await window.jarvis.reregisterBaseline({
+        fileName: payload.fileName,
+        name: payload.name,
+      });
+      setBackupSummary(
+        result?.ok ? `Re-registered: ${payload.name}` : result?.message || "Re-register failed.",
+      );
+      await refreshBackupList();
+    } catch {
+      setBackupSummary("Re-register failed.");
+    }
+  }
+
+  async function refreshBackupList() {
+    try {
+      const list = await window.jarvis.listBackups();
+      const ordinary = Array.isArray(list.ordinary) ? list.ordinary : [];
+      const baselines = Array.isArray(list.baselines) ? (list.baselines as PilotBaselineRow[]) : [];
+      setBackupRows({ ordinary, baselines });
+      setBackupSummary(`Backups: ${ordinary.length} recent ordinary · ${baselines.length} baselines`);
+    } catch {
+      setBackupSummary("Could not list backups.");
+      setBackupRows({ ordinary: [], baselines: [] });
     }
   }
 
@@ -593,6 +730,7 @@ export default function App() {
                   {retryAvailableAt ? ` (${retryAvailableAt})` : ""}
                 </span>
               ) : null}
+              {buildInfo.staleBuild ? <span className="session-meta-item">build stale</span> : null}
             </div>
             {pendingConfirmation ? (
               <div className="session-pending-banner">
@@ -602,11 +740,67 @@ export default function App() {
                   {pendingConfirmation.redactedSummary}
                   {pendingExpiryLabel ? ` · expires ${pendingExpiryLabel}` : ""}
                 </span>
+                <button
+                  type="button"
+                  onClick={() => void confirmPendingBanner()}
+                  disabled={confirmDisabled}
+                >
+                  Confirm
+                </button>
                 <button type="button" onClick={() => void dismissPendingBanner()}>
                   Dismiss
                 </button>
               </div>
             ) : null}
+            <div className="session-pilot-row">
+              <button type="button" onClick={() => void refreshBackupList()}>
+                List backups
+              </button>
+              <button type="button" onClick={() => void saveBaseline()}>
+                Save baseline
+              </button>
+              <input
+                value={pilotNote}
+                onChange={(event) => setPilotNote(event.target.value)}
+                placeholder="Optional issue note"
+                aria-label="Pilot issue note"
+              />
+              <button type="button" onClick={() => void recordPilotIssue()}>
+                Record issue
+              </button>
+            </div>
+            {backupSummary ? <small className="session-copy-status">{backupSummary}</small> : null}
+            {backupRows.ordinary.length > 0 || backupRows.baselines.length > 0 ? (
+              <div className="session-backup-meta" aria-label="Backup metadata">
+                {backupRows.ordinary.map((row) => (
+                  <small key={`o-${row.fileName}`} className="session-backup-meta-row">
+                    ordinary · {row.fileName} · {row.size}B
+                  </small>
+                ))}
+                {backupRows.baselines.map((row, index) => (
+                  <div
+                    key={`b-${String(row.id || row.fileName || index)}`}
+                    className="session-backup-meta-row session-baseline-row"
+                  >
+                    <small>
+                      baseline · {String(row.name || row.fileName || "unnamed")}
+                      {row.fileName ? ` · ${row.fileName}` : ""} · {formatBaselineStatus(row)}
+                    </small>
+                    <span className="session-baseline-actions">
+                      {row.recovered === true || row.registered === false ? (
+                        <button type="button" onClick={() => void reregisterBaselineRow(row)}>
+                          Re-register
+                        </button>
+                      ) : null}
+                      <button type="button" onClick={() => void deleteBaselineRow(row)}>
+                        Delete
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {pilotStatus ? <small className="session-copy-status">{pilotStatus}</small> : null}
             {showVoiceErrorControls ? (
               <div className="session-error-actions">
                 <button type="button" onClick={() => void retry()} disabled={isBusy}>

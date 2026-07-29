@@ -68,6 +68,7 @@ export type JarvisBuildInfo = {
   version: string;
   gitSha?: string | null;
   branch?: string | null;
+  staleBuild?: boolean;
 };
 
 export type JarvisContinuitySnapshot = {
@@ -83,6 +84,8 @@ export type JarvisContinuitySnapshot = {
   pendingConfirmation: JarvisPendingConfirmationPublic | null;
   buildInfo: JarvisBuildInfo;
   restartPolicyNote: string;
+  confirmInFlight?: boolean;
+  memoryBusy?: boolean;
 };
 
 export type JarvisTextTurnRequest = {
@@ -155,7 +158,44 @@ declare global {
       cancelTextTurn: (clientTurnId: string) => Promise<JarvisTextCancelResult>;
       getContinuity: () => Promise<JarvisContinuitySnapshot>;
       dismissPendingConfirmation: () => Promise<{ ok: boolean }>;
+      confirmPendingConfirmation: () => Promise<{
+        ok: boolean;
+        code?: string;
+        message?: string;
+        toolName?: string | null;
+        operation?: string | null;
+        scope?: string | null;
+        dailyUpdatedAt?: string | null;
+        artifactDelivery?: {
+          artifactCount: number;
+          hasSubstantiveArtifact: boolean;
+          toolNames: string[];
+          selectedArtifact: RickyArtifact | null;
+        };
+      }>;
       getBuildInfo: () => Promise<JarvisBuildInfo>;
+      listBackups: () => Promise<{
+        ok: boolean;
+        ordinary: Array<{ fileName: string; mtimeMs: number; size: number }>;
+        baselines: Array<Record<string, unknown>>;
+      }>;
+      createBaseline: (payload: { name: string; note?: string }) => Promise<{ ok: boolean; code?: string; message?: string }>;
+      reregisterBaseline: (payload: {
+        fileName: string;
+        name: string;
+        note?: string;
+      }) => Promise<{ ok: boolean; code?: string; message?: string }>;
+      deleteBaseline: (payload: {
+        id?: string;
+        fileName?: string;
+      }) => Promise<{ ok: boolean; code?: string; message?: string }>;
+      recordPilotIssue: (payload: {
+        note?: string;
+        errorCode?: string | null;
+        httpStatus?: number | null;
+        cooldownUntilMs?: number | null;
+        connectionState?: string | null;
+      }) => Promise<{ ok: boolean; id?: string; code?: string; message?: string }>;
     };
   }
 }

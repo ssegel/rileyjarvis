@@ -203,6 +203,37 @@ if ($NeedBuild) {
     Write-Error "Jarvis could not build. See messages above."
     exit 1
   }
+} elseif (-not $Rebuild) {
+  # Stale-build warning only — never auto-rebuild here.
+  try {
+    $distTime = (Get-Item -LiteralPath $DistHtml).LastWriteTimeUtc
+    $watch = @(
+      (Join-Path $RepoRoot "src"),
+      (Join-Path $RepoRoot "electron"),
+      (Join-Path $RepoRoot "package.json"),
+      (Join-Path $RepoRoot "vite.config.ts"),
+      (Join-Path $RepoRoot "index.html")
+    )
+    $newest = $null
+    foreach ($pathItem in $watch) {
+      if (-not (Test-Path -LiteralPath $pathItem)) { continue }
+      $item = Get-Item -LiteralPath $pathItem
+      if ($item.PSIsContainer) {
+        Get-ChildItem -LiteralPath $pathItem -Recurse -File -ErrorAction SilentlyContinue |
+          Where-Object { $_.FullName -notmatch '\\node_modules\\|\\dist\\|\\.git\\' } |
+          ForEach-Object {
+            if ($null -eq $newest -or $_.LastWriteTimeUtc -gt $newest) { $newest = $_.LastWriteTimeUtc }
+          }
+      } else {
+        if ($null -eq $newest -or $item.LastWriteTimeUtc -gt $newest) { $newest = $item.LastWriteTimeUtc }
+      }
+    }
+    if ($null -ne $newest -and $newest -gt $distTime) {
+      Write-Host "Built UI may be stale (source files newer than dist). Run: .\scripts\start-jarvis.ps1 -Rebuild"
+    }
+  } catch {
+    # Non-fatal freshness check.
+  }
 }
 
 # Ensure daily path never starts Vite.

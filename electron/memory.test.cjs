@@ -152,14 +152,14 @@ test("daily rollover archives and carries open work", async () => {
   });
 });
 
-test("backup retention keeps last 10 snapshots", async () => {
+test("backup retention keeps last 40 ordinary snapshots", async () => {
   await withStore(async (store) => {
     await store.ensureMemory();
-    for (let i = 0; i < 12; i += 1) {
+    for (let i = 0; i < 45; i += 1) {
       await store.createBackupSnapshot(`snap-${i}`);
     }
     const backups = await store.listBackupFiles();
-    assert.equal(backups.length, 10);
+    assert.equal(backups.length, 40);
   });
 });
 

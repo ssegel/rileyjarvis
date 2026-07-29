@@ -423,6 +423,13 @@ function buildLaunchPlan(env, options = {}) {
     });
   }
 
+  const freshness =
+    options.freshness ||
+    evaluateRendererBuildFreshness(absoluteRepoRoot, {
+      exists,
+      statSync: options.statSync,
+    });
+
   return {
     ok: failures.length === 0,
     failures,
@@ -443,6 +450,106 @@ function buildLaunchPlan(env, options = {}) {
     rejectsDefaultApp: !startArgs.some((a) => /default_app/i.test(String(a))),
     appArgumentCount: decodedStartArgs.length,
     decodedAppArguments: decodedStartArgs,
+    staleBuild: freshness.stale === true,
+    staleBuildReason: freshness.reason || null,
+    staleBuildMessage: freshness.message || null,
+  };
+}
+
+/**
+ * Compare dist/index.html mtime against watched source roots.
+ * Does not auto-rebuild — callers warn and require explicit -Rebuild.
+ */
+function evaluateRendererBuildFreshness(repoRoot, options = {}) {
+  const exists = typeof options.exists === "function" ? options.exists : (p) => fs.existsSync(p);
+  const statSync =
+    typeof options.statSync === "function"
+      ? options.statSync
+      : (p) => fs.statSync(p);
+  const root = path.resolve(String(repoRoot || ""));
+  const distHtml = path.join(root, "dist", "index.html");
+  if (!exists(distHtml)) {
+    return {
+      stale: true,
+      reason: "dist_missing",
+      willRebuildOnLaunch: true,
+      message:
+        "Built UI is missing. The launcher will build it now, or run: .\\scripts\\start-jarvis.ps1 -Rebuild",
+    };
+  }
+
+  let distMtime = 0;
+  try {
+    distMtime = Number(statSync(distHtml).mtimeMs) || 0;
+  } catch {
+    return {
+      stale: true,
+      reason: "dist_unreadable",
+      willRebuildOnLaunch: false,
+      message:
+        "Built UI may be stale (dist unreadable). Run: .\\scripts\\start-jarvis.ps1 -Rebuild",
+    };
+  }
+
+  const watched = [
+    path.join(root, "src"),
+    path.join(root, "electron"),
+    path.join(root, "package.json"),
+    path.join(root, "vite.config.ts"),
+    path.join(root, "index.html"),
+  ];
+
+  function newestMtime(target) {
+    if (!exists(target)) return 0;
+    let stats;
+    try {
+      stats = statSync(target);
+    } catch {
+      return 0;
+    }
+    if (stats.isFile()) return Number(stats.mtimeMs) || 0;
+    if (!stats.isDirectory()) return 0;
+    let newest = Number(stats.mtimeMs) || 0;
+    let names = [];
+    try {
+      names = fs.readdirSync(target);
+    } catch {
+      return newest;
+    }
+    for (const name of names) {
+      if (name === "node_modules" || name === "dist" || name === ".git") continue;
+      const child = path.join(target, name);
+      const childNewest = newestMtime(child);
+      if (childNewest > newest) newest = childNewest;
+    }
+    return newest;
+  }
+
+  let sourceNewest = 0;
+  for (const item of watched) {
+    const m = newestMtime(item);
+    if (m > sourceNewest) sourceNewest = m;
+  }
+
+  if (sourceNewest > distMtime) {
+    return {
+      stale: true,
+      reason: "sources_newer_than_dist",
+      willRebuildOnLaunch: false,
+      message:
+        "Built UI may be stale (source files newer than dist). Run: .\\scripts\\start-jarvis.ps1 -Rebuild",
+      distMtimeMs: distMtime,
+      sourceNewestMtimeMs: sourceNewest,
+    };
+  }
+
+  return {
+    stale: false,
+    reason: "fresh",
+    willRebuildOnLaunch: false,
+    message: null,
+    distMtimeMs: distMtime,
+    sourceNewestMtimeMs: sourceNewest,
   };
 }
 
@@ -467,6 +574,7 @@ module.exports = {
   shouldSetViteDevServerUrl,
   inspectLaunchEnvironment,
   buildLaunchPlan,
+  evaluateRendererBuildFreshness,
   checkLaunchPrerequisites,
   parseEnvLocalHasOpenAiKey,
   normalizePathForCompare,

@@ -363,7 +363,7 @@ test("confirmed true without token and expired token are STALE_PREVIEW", async (
     assert.equal(preview.code, "CONFIRMATION_REQUIRED");
     const entry = store._test.getPreviewEntry(preview.previewToken);
     assert.ok(entry);
-    entry.expiresAt = Date.now() - 1;
+    entry.expiresAt = 0;
     helpers.tick(1);
 
     const expired = await store.memoryActiveProjects({
