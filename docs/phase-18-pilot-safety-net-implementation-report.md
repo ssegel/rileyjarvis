@@ -74,6 +74,12 @@
 - **Concurrency:** Delete remains inside `runSerializedBaselineMutation`; duplicate requests serialize to one success plus one stale/not-found result. A baseline-store recovery queue prevents overlapping recovery passes, and active delete transactions are not mistaken for startup artifacts.
 - **Tests:** Successful transaction; startup rollback; startup cleanup; conflict exclusion from listing/restore; duplicate delete.
 
+### 10. In-app protected-baseline naming
+- **Live-validation defect:** Electron launched and text completed, but Save baseline produced no visible prompt or status because the renderer depended on `window.prompt`.
+- **Correction:** Save baseline now opens a focused inline form with name, Save, and Cancel controls. Enter submits; Escape/Cancel closes without IPC; whitespace-only names show an inline error; submission is guarded and controls are disabled while saving. Re-register uses the same in-app naming flow, so no `window.prompt` dependency remains.
+- **Result handling:** The renderer displays the exact IPC message. Successful creation/re-registration responses now carry explicit public messages; success closes the form and refreshes metadata, while failure leaves the form editable. Snapshot bodies and internal paths remain outside renderer payloads.
+- **Tests:** Form-open wiring and focus; no prompt dependency; exact single name submission; cancel/no-send; empty rejection; success close + refresh; failure remains open with exact message; in-flight guard/disabled controls.
+
 ---
 
 ## Architecture (post-correction)
@@ -86,7 +92,7 @@ Baselines: enqueueTracked mutation boundary; public metadata projection only
 Delete: active → same-dir quarantine → registry commit → cleanup
 Recovery scan: registry present → rollback; registry absent → cleanup; conflict → fail closed
 Journal: build line → projected ceilings → rollover if needed → append
-UI: per-row baseline actions; no first-eligible fallback
+UI: per-row actions + focused inline baseline naming; no browser prompt or first-eligible fallback
 ```
 
 ---
@@ -107,6 +113,7 @@ UI: per-row baseline actions; no first-eligible fallback
 - `electron/memory.cjs` — ownership, serialized baselines, public metadata, Confirm delivery
 - `electron/main.cjs` — Confirm-busy gates on text:run + tools
 - `electron/preload.cjs`, `src/App.tsx`, `src/styles.css`, `src/vite-env.d.ts`
+- `src/lib/pilotBaselines.ts` — explicit selection and baseline naming form behavior
 - `electron/pilot-journal.cjs`, `electron/backup-baselines.cjs`
 - `scripts/launch-helpers.cjs`, `scripts/start-jarvis.ps1`, `README.md`
 - `electron/memory.test.cjs`, `electron/active-projects-lifecycle.test.cjs`
@@ -121,7 +128,7 @@ UI: per-row baseline actions; no first-eligible fallback
 
 | Suite | Result |
 |---|---|
-| `node --test electron/phase-18-pilot-safety-net.test.cjs` | **47 pass / 0 fail** |
+| `node --test electron/phase-18-pilot-safety-net.test.cjs` | **48 pass / 0 fail** |
 | `node --test electron/phase-17-daily-use-reliability.test.cjs` | **44 pass / 0 fail** |
 | Text + diagnostics (7 files) | **78 pass / 0 fail** |
 | Phase 13–16 regression | **126 pass / 0 fail** |
@@ -132,7 +139,7 @@ UI: per-row baseline actions; no first-eligible fallback
 
 ## Remaining risks
 
-1. Live validation (audit §15) still not run.
+1. A fresh live Electron rerun of corrected Save baseline remains outstanding.
 2. Baseline row actions are compact pilot UI, not a full management console.
 3. Shortcut tests remain source-contract (no COM `.lnk` dry-run).
 4. Voice conflict relies on `tools:execute` + Confirm ownership; non-tool voice activity is covered by existing external busy / session patterns.
@@ -141,4 +148,4 @@ UI: per-row baseline actions; no first-eligible fallback
 
 ## Live-validation status
 
-**Not performed.** No Jarvis launch, no OpenAI calls, no live `data/` inspection/modification.
+**Partial, user-run validation identified and scoped the defect.** Jarvis launch and a text request succeeded; Save baseline exposed the browser-prompt failure. The correction has automated coverage but has not yet been manually rerun in Electron. This correction pass made no OpenAI request and did not inspect or modify live `data/`.

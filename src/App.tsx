@@ -30,9 +30,12 @@ import {
 } from "./lib/realtimeErrors";
 import {
   buildBaselineDeletePayload,
-  buildBaselineReregisterPayload,
   buildDeleteConfirmMessage,
+  closeBaselineNameForm,
   formatBaselineStatus,
+  openBaselineNameForm,
+  submitBaselineNameAction,
+  type BaselineNameFormState,
   type PilotBaselineRow,
 } from "./lib/pilotBaselines";
 import type { JarvisBuildInfo, JarvisPendingConfirmationPublic, RickyArtifact } from "./vite-env";
@@ -90,6 +93,11 @@ export default function App() {
     ordinary: Array<{ fileName: string; mtimeMs: number; size: number }>;
     baselines: PilotBaselineRow[];
   }>({ ordinary: [], baselines: [] });
+  const [baselineNameForm, setBaselineNameForm] = useState<BaselineNameFormState>(
+    closeBaselineNameForm(),
+  );
+  const [baselineNameError, setBaselineNameError] = useState("");
+  const [baselineSaving, setBaselineSaving] = useState(false);
   const [buildInfo, setBuildInfo] = useState<JarvisBuildInfo>({ version: "1.0.0" });
   const clientRef = useRef<RickyRealtimeClient | null>(null);
   const sessionOwnerRef = useRef(new SessionOwnerLock());
@@ -97,6 +105,8 @@ export default function App() {
   const textClientRef = useRef<TextClient | null>(null);
   const transcriptRef = useRef(transcript);
   const artifactRef = useRef(artifact);
+  const baselineNameInputRef = useRef<HTMLInputElement | null>(null);
+  const baselineSubmitInFlightRef = useRef(false);
   const deliveredAssistantTurnRef = useRef<string | null>(null);
   const appendAssistantToLogRef = useRef<(text: string, clientTurnId: string) => boolean>(() => false);
 
@@ -228,6 +238,12 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [textCooldownUntilMs]);
 
+  useEffect(() => {
+    if (!baselineNameForm.open) return;
+    baselineNameInputRef.current?.focus();
+    baselineNameInputRef.current?.select();
+  }, [baselineNameForm.open, baselineNameForm.mode]);
+
   const isConnected = connectionState === "connected";
   const isBusy = connectionState === "connecting" || sessionUiState === "reconnecting";
   const showVoiceErrorControls = sessionUiState === "error" || connectionState === "error";
@@ -300,15 +316,47 @@ export default function App() {
     }
   }
 
-  async function saveBaseline() {
-    const name = window.prompt("Baseline name?");
-    if (!name || !name.trim()) return;
+  function showBaselineNameForm(
+    mode: BaselineNameFormState["mode"],
+    row: PilotBaselineRow | null = null,
+  ) {
+    setBaselineNameError("");
+    setBaselineNameForm(openBaselineNameForm(mode, row));
+  }
+
+  function cancelBaselineNameForm() {
+    if (baselineSaving || baselineSubmitInFlightRef.current) return;
+    setBaselineNameError("");
+    setBaselineNameForm(closeBaselineNameForm());
+  }
+
+  async function submitBaselineName() {
+    if (baselineSaving || baselineSubmitInFlightRef.current) return;
+    baselineSubmitInFlightRef.current = true;
+    setBaselineSaving(true);
+    setBaselineNameError("");
     try {
-      const result = await window.jarvis.createBaseline({ name: name.trim() });
-      setBackupSummary(result?.ok ? `Baseline saved: ${name.trim()}` : result?.message || "Baseline save failed.");
-      await refreshBackupList();
+      const outcome = await submitBaselineNameAction({
+        mode: baselineNameForm.mode,
+        row: baselineNameForm.row,
+        name: baselineNameForm.name,
+        createBaseline: (payload) => window.jarvis.createBaseline(payload),
+        reregisterBaseline: (payload) => window.jarvis.reregisterBaseline(payload),
+        refresh: refreshBackupList,
+      });
+      setBackupSummary(outcome.message);
+      if (outcome.close) {
+        setBaselineNameForm(closeBaselineNameForm());
+      } else {
+        setBaselineNameError(outcome.message);
+      }
     } catch {
-      setBackupSummary("Baseline save failed.");
+      const message = "Baseline save failed.";
+      setBackupSummary(message);
+      setBaselineNameError(message);
+    } finally {
+      baselineSubmitInFlightRef.current = false;
+      setBaselineSaving(false);
     }
   }
 
@@ -332,30 +380,6 @@ export default function App() {
       await refreshBackupList();
     } catch {
       setBackupSummary("Delete failed.");
-    }
-  }
-
-  async function reregisterBaselineRow(row: PilotBaselineRow) {
-    const suggested =
-      (typeof row.name === "string" && row.name.trim()) ||
-      window.prompt("Name for recovered baseline?") ||
-      "";
-    const payload = buildBaselineReregisterPayload(row, suggested);
-    if (!payload.ok) {
-      setBackupSummary(payload.message);
-      return;
-    }
-    try {
-      const result = await window.jarvis.reregisterBaseline({
-        fileName: payload.fileName,
-        name: payload.name,
-      });
-      setBackupSummary(
-        result?.ok ? `Re-registered: ${payload.name}` : result?.message || "Re-register failed.",
-      );
-      await refreshBackupList();
-    } catch {
-      setBackupSummary("Re-register failed.");
     }
   }
 
@@ -756,7 +780,7 @@ export default function App() {
               <button type="button" onClick={() => void refreshBackupList()}>
                 List backups
               </button>
-              <button type="button" onClick={() => void saveBaseline()}>
+              <button type="button" onClick={() => showBaselineNameForm("create")}>
                 Save baseline
               </button>
               <input
@@ -769,6 +793,54 @@ export default function App() {
                 Record issue
               </button>
             </div>
+            {baselineNameForm.open ? (
+              <form
+                className="session-baseline-name-form"
+                aria-label={
+                  baselineNameForm.mode === "create"
+                    ? "Save protected baseline"
+                    : "Re-register protected baseline"
+                }
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void submitBaselineName();
+                }}
+              >
+                <input
+                  ref={baselineNameInputRef}
+                  value={baselineNameForm.name}
+                  onChange={(event) => {
+                    setBaselineNameError("");
+                    setBaselineNameForm((current) => ({
+                      ...current,
+                      name: event.target.value,
+                    }));
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      cancelBaselineNameForm();
+                    }
+                  }}
+                  placeholder="Baseline name"
+                  aria-label="Baseline name"
+                  aria-invalid={Boolean(baselineNameError)}
+                  aria-describedby={baselineNameError ? "baseline-name-error" : undefined}
+                  disabled={baselineSaving}
+                />
+                <button type="submit" disabled={baselineSaving}>
+                  {baselineSaving ? "Saving…" : "Save"}
+                </button>
+                <button type="button" onClick={cancelBaselineNameForm} disabled={baselineSaving}>
+                  Cancel
+                </button>
+                {baselineNameError ? (
+                  <small id="baseline-name-error" role="alert">
+                    {baselineNameError}
+                  </small>
+                ) : null}
+              </form>
+            ) : null}
             {backupSummary ? <small className="session-copy-status">{backupSummary}</small> : null}
             {backupRows.ordinary.length > 0 || backupRows.baselines.length > 0 ? (
               <div className="session-backup-meta" aria-label="Backup metadata">
@@ -788,7 +860,10 @@ export default function App() {
                     </small>
                     <span className="session-baseline-actions">
                       {row.recovered === true || row.registered === false ? (
-                        <button type="button" onClick={() => void reregisterBaselineRow(row)}>
+                        <button
+                          type="button"
+                          onClick={() => showBaselineNameForm("reregister", row)}
+                        >
                           Re-register
                         </button>
                       ) : null}

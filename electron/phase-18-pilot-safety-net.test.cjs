@@ -234,6 +234,7 @@ test("B03/B04 baseline create under baselines/ and ordinary prune leaves them", 
   await withStore(async (store, helpers) => {
     const created = await store.createProtectedBaseline({ name: "Week Start" });
     assert.equal(created.ok, true);
+    assert.equal(created.message, "Baseline saved: Week Start.");
     const baselinePath = path.join(helpers.rootDir, "backups", "baselines", created.baseline.fileName);
     assert.equal(fs.existsSync(baselinePath), true);
     for (let i = 0; i < 45; i += 1) {
@@ -777,7 +778,102 @@ test("UI baseline actions require explicit row selection (no first-eligible fall
   assert.doesNotMatch(app, /deleteSelectedBaseline|reregisterSelectedBaseline/);
   assert.doesNotMatch(app, /baselines\.find\(\(row\)/);
   assert.match(app, /deleteBaselineRow\(row\)/);
-  assert.match(app, /reregisterBaselineRow\(row\)/);
+  assert.match(app, /showBaselineNameForm\("reregister", row\)/);
+});
+
+test("in-app baseline naming UI opens, validates, submits once, cancels, and preserves failures", async () => {
+  const helpers = await import("../src/lib/pilotBaselines.ts");
+  const app = fs.readFileSync(path.join(__dirname, "..", "src", "App.tsx"), "utf8");
+
+  const opened = helpers.openBaselineNameForm("create");
+  assert.equal(opened.open, true);
+  assert.equal(opened.mode, "create");
+  assert.equal(opened.name, "");
+  assert.doesNotMatch(app, /window\.prompt/);
+  assert.match(app, /onClick=\{\(\) => showBaselineNameForm\("create"\)\}/);
+  assert.match(app, /baselineNameInputRef\.current\?\.focus\(\)/);
+  assert.match(app, /onSubmit=\{\(event\) =>/);
+  assert.match(app, /event\.key === "Escape"/);
+  assert.match(app, /baselineSubmitInFlightRef\.current/);
+  assert.match(app, /type="submit" disabled=\{baselineSaving\}/);
+
+  let createCalls = 0;
+  let reregisterCalls = 0;
+  let refreshCalls = 0;
+  const sentNames = [];
+  const success = await helpers.submitBaselineNameAction({
+    mode: "create",
+    row: null,
+    name: "Pilot Week One",
+    createBaseline: async (payload) => {
+      createCalls += 1;
+      sentNames.push(payload.name);
+      return { ok: true, message: "Baseline saved: Pilot Week One." };
+    },
+    reregisterBaseline: async () => {
+      reregisterCalls += 1;
+      return { ok: true, message: "unexpected" };
+    },
+    refresh: async () => {
+      refreshCalls += 1;
+    },
+  });
+  assert.equal(success.ok, true);
+  assert.equal(success.close, true);
+  assert.equal(success.message, "Baseline saved: Pilot Week One.");
+  assert.equal(createCalls, 1);
+  assert.equal(reregisterCalls, 0);
+  assert.deepEqual(sentNames, ["Pilot Week One"]);
+  assert.equal(refreshCalls, 1);
+
+  const empty = await helpers.submitBaselineNameAction({
+    mode: "create",
+    row: null,
+    name: "   ",
+    createBaseline: async () => {
+      createCalls += 1;
+      return { ok: true };
+    },
+    reregisterBaseline: async () => {
+      reregisterCalls += 1;
+      return { ok: true };
+    },
+    refresh: async () => {
+      refreshCalls += 1;
+    },
+  });
+  assert.equal(empty.ok, false);
+  assert.equal(empty.sent, false);
+  assert.equal(empty.close, false);
+  assert.equal(empty.message, "Baseline name is required.");
+  assert.equal(createCalls, 1);
+  assert.equal(refreshCalls, 1);
+
+  const cancelled = helpers.closeBaselineNameForm();
+  assert.equal(cancelled.open, false);
+  assert.equal(createCalls, 1);
+  assert.equal(reregisterCalls, 0);
+
+  let failureRefreshes = 0;
+  const failure = await helpers.submitBaselineNameAction({
+    mode: "create",
+    row: null,
+    name: "Duplicate",
+    createBaseline: async () => ({
+      ok: false,
+      code: "BASELINE_NAME_EXISTS",
+      message: "A baseline with that name already exists.",
+    }),
+    reregisterBaseline: async () => ({ ok: false }),
+    refresh: async () => {
+      failureRefreshes += 1;
+    },
+  });
+  assert.equal(failure.ok, false);
+  assert.equal(failure.sent, true);
+  assert.equal(failure.close, false);
+  assert.equal(failure.message, "A baseline with that name already exists.");
+  assert.equal(failureRefreshes, 0);
 });
 
 test("baseline mutations serialize; create during memory mutation waits on queue", async () => {

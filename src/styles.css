@@ -404,6 +404,53 @@ button:disabled {
   font-size: 11px;
 }
 
+.session-baseline-name-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 6px;
+  max-width: 100%;
+}
+
+.session-baseline-name-form input {
+  min-width: 150px;
+  flex: 1 1 170px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  color: inherit;
+  padding: 5px 8px;
+  font-size: 11px;
+}
+
+.session-baseline-name-form input[aria-invalid="true"] {
+  border-color: rgba(255, 126, 145, 0.8);
+}
+
+.session-baseline-name-form button {
+  min-height: 25px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.07);
+  color: inherit;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.session-baseline-name-form button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.session-baseline-name-form small {
+  flex: 1 0 100%;
+  color: #ffc9d1;
+  text-align: center;
+}
+
 .session-backup-meta {
   display: flex;
   flex-direction: column;

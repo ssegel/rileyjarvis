@@ -796,6 +796,7 @@ function createBaselineStore(options = {}) {
 
     return {
       ok: true,
+      message: `Baseline saved: ${displayName}.`,
       baseline: {
         id,
         name: displayName,
@@ -873,7 +874,11 @@ function createBaselineStore(options = {}) {
       note: note ? sanitizeBaselineName(note, sanitizeText) : null,
     });
     await writeRegistry(doc);
-    return { ok: true, baseline: { id, name: displayName, fileName } };
+    return {
+      ok: true,
+      message: `Baseline re-registered: ${displayName}.`,
+      baseline: { id, name: displayName, fileName },
+    };
   }
 
   async function deleteBaseline({ id, fileName }) {

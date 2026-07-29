@@ -15,6 +15,99 @@ export type PilotBaselineRow = {
   createdAt?: string | null;
 };
 
+export type BaselineNameFormMode = "create" | "reregister";
+
+export type BaselineNameFormState = {
+  open: boolean;
+  mode: BaselineNameFormMode;
+  row: PilotBaselineRow | null;
+  name: string;
+};
+
+export type BaselineNameIpcResult = {
+  ok: boolean;
+  code?: string;
+  message?: string;
+};
+
+export function openBaselineNameForm(
+  mode: BaselineNameFormMode,
+  row: PilotBaselineRow | null = null,
+): BaselineNameFormState {
+  return {
+    open: true,
+    mode,
+    row,
+    name: mode === "reregister" && typeof row?.name === "string" ? row.name : "",
+  };
+}
+
+export function closeBaselineNameForm(): BaselineNameFormState {
+  return { open: false, mode: "create", row: null, name: "" };
+}
+
+export function validateBaselineName(name: string):
+  | { ok: true; name: string }
+  | { ok: false; message: string } {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) {
+    return { ok: false, message: "Baseline name is required." };
+  }
+  return { ok: true, name: trimmed };
+}
+
+/**
+ * Shared submission behavior used by the in-app form and behavioral tests.
+ * It calls exactly one IPC path and refreshes only after success.
+ */
+export async function submitBaselineNameAction(options: {
+  mode: BaselineNameFormMode;
+  row: PilotBaselineRow | null;
+  name: string;
+  createBaseline: (payload: { name: string }) => Promise<BaselineNameIpcResult>;
+  reregisterBaseline: (payload: {
+    fileName: string;
+    name: string;
+  }) => Promise<BaselineNameIpcResult>;
+  refresh: () => Promise<void>;
+}): Promise<{
+  ok: boolean;
+  sent: boolean;
+  close: boolean;
+  message: string;
+}> {
+  const validated = validateBaselineName(options.name);
+  if (!validated.ok) {
+    return { ok: false, sent: false, close: false, message: validated.message };
+  }
+
+  let result: BaselineNameIpcResult;
+  if (options.mode === "create") {
+    result = await options.createBaseline({ name: validated.name });
+  } else {
+    const payload = buildBaselineReregisterPayload(options.row, validated.name);
+    if (!payload.ok) {
+      return { ok: false, sent: false, close: false, message: payload.message };
+    }
+    result = await options.reregisterBaseline({
+      fileName: payload.fileName,
+      name: payload.name,
+    });
+  }
+
+  const message =
+    typeof result?.message === "string" && result.message
+      ? result.message
+      : result?.ok
+        ? "Baseline saved."
+        : "Baseline save failed.";
+  if (!result?.ok) {
+    return { ok: false, sent: true, close: false, message };
+  }
+  await options.refresh();
+  return { ok: true, sent: true, close: true, message };
+}
+
 export function formatBaselineStatus(row: PilotBaselineRow): string {
   const flags: string[] = [];
   if (row.conflict) flags.push("conflict");
