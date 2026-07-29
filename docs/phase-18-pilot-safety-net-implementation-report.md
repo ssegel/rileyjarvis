@@ -1,6 +1,6 @@
 # Phase 18 Implementation Report — Pilot Safety Net & Lightweight Observability
 
-**Status:** Implementation complete; pre-commit correction pass applied; automated validation green. Live validation deferred (not performed).
+**Status:** Phase 18 automated and live validation passed. The initial baseline naming defect was corrected and retested successfully.
 **Branch:** `phase-18-pilot-safety-net`
 **Baseline:** `e35e25b63c6c6413f0ea3dc863d00e228a606da4`
 **Audit contract:** `docs/phase-18-pilot-safety-net-audit.md`
@@ -13,9 +13,9 @@
 |---|---|
 | Branch | `phase-18-pilot-safety-net` |
 | Baseline commit | `e35e25b` (clean synchronized `main`) |
-| Jarvis during implementation | Not started |
-| Live OpenAI requests | None |
-| Live `data/` | Not inspected or modified |
+| Jarvis during implementation | Started for completed live validation |
+| Live OpenAI requests | Exact-response text validation performed; Realtime intentionally skipped |
+| Live `data/` | Protected baseline, journal sanitization, and disposable priority behavior validated |
 | Commit / push / PR | Not performed |
 
 ---
@@ -139,13 +139,61 @@ UI: per-row actions + focused inline baseline naming; no browser prompt or first
 
 ## Remaining risks
 
-1. A fresh live Electron rerun of corrected Save baseline remains outstanding.
-2. Baseline row actions are compact pilot UI, not a full management console.
-3. Shortcut tests remain source-contract (no COM `.lnk` dry-run).
-4. Voice conflict relies on `tools:execute` + Confirm ownership; non-tool voice activity is covered by existing external busy / session patterns.
+1. Realtime validation was intentionally skipped.
+2. No rate-limit stress was induced, and no unexpected real 429 occurred.
+3. Broad emergency restore and in-process rebuild remain out of scope.
+4. Baseline row actions are compact pilot UI, not a full management console.
+5. Voice conflict relies on `tools:execute` + Confirm ownership; non-tool voice activity is covered by existing external busy / session patterns.
 
 ---
 
 ## Live-validation status
 
-**Partial, user-run validation identified and scoped the defect.** Jarvis launch and a text request succeeded; Save baseline exposed the browser-prompt failure. The correction has automated coverage but has not yet been manually rerun in Electron. This correction pass made no OpenAI request and did not inspect or modify live `data/`.
+### Shortcut helper
+- `scripts/create-desktop-shortcut.ps1` created or updated `C:\Users\Sarah Segel\OneDrive\Desktop\Jarvis.lnk`.
+- Target: `C:\Users\Sarah Segel\OneDrive\Cursor\rileyjarvis\scripts\start-jarvis.bat`.
+- Working directory: `C:\Users\Sarah Segel\OneDrive\Cursor\rileyjarvis`.
+- Initial confusion came from clicking the Electron taskbar icon rather than the desktop Jarvis shortcut.
+- Direct launcher execution opened Jarvis correctly.
+
+### Rebuild and current build
+- Fresh rebuild succeeded with `.\scripts\start-jarvis.ps1 -Rebuild`.
+- Jarvis displayed live build `83dbe24`.
+- Closing/stopping prior Electron processes before relaunch resolved the stale old-process issue.
+
+### Text validation
+- Prompt: `Reply with exactly: Phase 18 text check passed.`
+- Result: `Phase 18 text check passed.`
+- **Passed.**
+
+### Protected baseline creation
+- Initial live failure: clicking Save baseline produced no visible browser prompt.
+- Root cause: the browser-style prompt flow was not usable in the Electron renderer.
+- Correction: explicit in-app baseline naming form.
+- Retest name: `Phase 18 live validation`.
+- Result: `Baseline saved: Phase 18 live validation.`
+- The baseline appeared in the backup list.
+- **Passed.**
+
+### Pilot issue journal
+- Note entered: `Phase 18 journal test with fake key sk-test-1234567890`.
+- The issue record was created successfully.
+- Direct file verification showed the stored note as `Phase 18 journal test with fake key [redacted-key]`.
+- **Sanitization passed.**
+
+### Deterministic Confirm
+- Added disposable priority: `Phase 18 disposable validation item`.
+- Requested removal; the pending banner appeared with Confirm and Dismiss.
+- Clicked Confirm.
+- Result: `Daily priorities remove completed.`
+- The disposable item was removed without a second LLM confirmation turn.
+- **Passed.**
+
+### Remaining live items and readiness
+- Realtime validation intentionally skipped.
+- No rate-limit stress was induced.
+- No unexpected real 429 occurred.
+- Broad emergency restore and in-process rebuild remain out of scope.
+- **One-week pilot readiness is satisfied for the validated Phase 18 scope.**
+
+**Final live status:** Phase 18 automated and live validation passed, with the initial baseline naming defect corrected and retested successfully.
