@@ -126,17 +126,17 @@ test("history normalization preserves chronological ordering", () => {
 test("App builds history before TextClient submit appends the current user turn", () => {
   const app = fs.readFileSync(path.join(root, "src", "App.tsx"), "utf8");
   const textClient = fs.readFileSync(path.join(root, "src", "lib", "textClient.ts"), "utf8");
-  assert.match(app, /buildTextHistoryFromTranscript\(transcriptRef\.current,\s*trimmed\)/);
+  assert.match(app, /buildTextHistoryFromTranscript\(transcriptRef\.current,\s*exactText\)/);
   assert.match(app, /const history = buildTextHistoryFromTranscript/);
-  const historyIdx = app.indexOf("buildTextHistoryFromTranscript(transcriptRef.current, trimmed)");
-  const submitIdx = app.indexOf("textClientRef.current?.submit(trimmed, history)");
+  const historyIdx = app.indexOf("buildTextHistoryFromTranscript(transcriptRef.current, exactText)");
+  const submitIdx = app.indexOf("textClientRef.current?.submit(exactText, history");
   assert.ok(historyIdx >= 0 && submitIdx > historyIdx);
-  assert.match(textClient, /this\.callbacks\.onUserText\(trimmed\)/);
+  assert.match(textClient, /this\.callbacks\.onUserText\(exactText\)/);
 });
 
 test("successful assistant text is delivered before completed/idle state", () => {
   const textClient = fs.readFileSync(path.join(root, "src", "lib", "textClient.ts"), "utf8");
-  const assistantIdx = textClient.indexOf("this.callbacks.onAssistantText(plan.assistantText, clientTurnId)");
+  const assistantIdx = textClient.indexOf("this.callbacks.onAssistantText(guardedText, clientTurnId)");
   const completedIdx = textClient.indexOf('this.setState("completed")');
   assert.ok(assistantIdx >= 0 && completedIdx > assistantIdx);
 });

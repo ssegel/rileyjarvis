@@ -39,7 +39,8 @@ function planTypedPromptSubmit(args) {
   }
 
   const textIpcCalls = 1;
-  const result = args.runText(trimmed);
+  // Submit the exact composer string; trim is only for emptiness above.
+  const result = args.runText(args.text);
   if (!result || result.accepted === false) {
     return {
       nextText: args.text,
@@ -88,7 +89,7 @@ test("disconnected submission uses text IPC and clears text when visible output 
       return { accepted: true, ok: true, assistantText: "Hello Sarah.", artifacts: [] };
     },
   });
-  assert.equal(sent, "hello jarvis");
+  assert.equal(sent, "  hello jarvis  ");
   assert.equal(outcome.nextText, "");
   assert.equal(outcome.hideInput, true);
   assert.equal(outcome.didSend, true);
@@ -141,7 +142,7 @@ test("connected successful submission still uses text IPC only", () => {
       return true;
     },
   });
-  assert.equal(sent, "do the thing");
+  assert.equal(sent, "  do the thing  ");
   assert.equal(sendCalls, 0);
   assert.equal(outcome.nextText, "");
   assert.equal(outcome.hideInput, true);

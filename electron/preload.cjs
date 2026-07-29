@@ -7,4 +7,7 @@ contextBridge.exposeInMainWorld("jarvis", {
   copyTextToClipboard: (text) => ipcRenderer.invoke("clipboard:write-text", text),
   runTextTurn: (request) => ipcRenderer.invoke("text:run", request),
   cancelTextTurn: (clientTurnId) => ipcRenderer.invoke("text:cancel", clientTurnId),
+  getContinuity: () => ipcRenderer.invoke("continuity:get"),
+  dismissPendingConfirmation: () => ipcRenderer.invoke("continuity:dismiss-pending"),
+  getBuildInfo: () => ipcRenderer.invoke("app:get-build-info"),
 });

@@ -44,10 +44,56 @@ export type JarvisTextHistoryItem = {
   text: string;
 };
 
+export type JarvisPendingConfirmationHint = {
+  toolName: string;
+  operation: string;
+  scope?: string | null;
+  previewToken: string;
+  expiresAt?: number;
+  redactedSummary?: string;
+  dailyUpdatedAt?: string;
+};
+
+export type JarvisPendingConfirmationPublic = {
+  toolName: string;
+  operation: string;
+  scope?: string | null;
+  expiresAt: number;
+  redactedSummary: string;
+  dailyUpdatedAt?: string;
+  createdAt: number;
+};
+
+export type JarvisBuildInfo = {
+  version: string;
+  gitSha?: string | null;
+  branch?: string | null;
+};
+
+export type JarvisContinuitySnapshot = {
+  recent: {
+    priorityId: string | null;
+    activeProjectId: string | null;
+    workingContext: {
+      commitments: string | null;
+      follow_ups: string | null;
+      unresolved_items: string | null;
+    };
+  };
+  pendingConfirmation: JarvisPendingConfirmationPublic | null;
+  buildInfo: JarvisBuildInfo;
+  restartPolicyNote: string;
+};
+
 export type JarvisTextTurnRequest = {
   clientTurnId: string;
   text: string;
   history?: JarvisTextHistoryItem[];
+  /**
+   * When true, main may inject the internal pending confirmation token for this turn.
+   * Fresh Send must leave this false/undefined. Preview tokens never come from the renderer.
+   */
+  resumePendingConfirmation?: boolean;
 };
 
 export type JarvisTextToolTraceItem = {
@@ -67,6 +113,9 @@ export type JarvisTextTurnError = {
   message: string;
   httpStatus?: number;
   retryable?: boolean;
+  retryAfterMs?: number;
+  cooldownMs?: number;
+  safeForAutoNetworkRetry?: boolean;
   apiErrorType?: string;
   apiErrorCode?: string;
   apiErrorParam?: string;
@@ -104,6 +153,9 @@ declare global {
       copyTextToClipboard: (text: string) => Promise<{ ok: boolean; error?: string }>;
       runTextTurn: (request: JarvisTextTurnRequest) => Promise<JarvisTextTurnResult>;
       cancelTextTurn: (clientTurnId: string) => Promise<JarvisTextCancelResult>;
+      getContinuity: () => Promise<JarvisContinuitySnapshot>;
+      dismissPendingConfirmation: () => Promise<{ ok: boolean }>;
+      getBuildInfo: () => Promise<JarvisBuildInfo>;
     };
   }
 }

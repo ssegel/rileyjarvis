@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BrainCircuit, Expand, History, Keyboard, Mic, MicOff, MonitorCog, PanelRight, Send, Square } from "lucide-react";
 import { ArtifactPanel } from "./components/ArtifactPanel";
 import { RickyFace } from "./components/RickyFace";
@@ -21,9 +21,14 @@ import {
 } from "./lib/responseLogArtifact";
 import { buildTextHistoryFromTranscript } from "./lib/textHistory";
 import { deliveryDiagMessage, readAssistantText } from "./lib/textDelivery";
-import { TextClient, type TextTurnState } from "./lib/textClient";
+import { TextClient, type TextClientErrorDetails, type TextTurnState } from "./lib/textClient";
 import { planTextPanelActivation } from "./lib/textPanelActivation";
-import type { RickyArtifact } from "./vite-env";
+import {
+  formatRetryAvailableAt,
+  isTextManualRetryAllowed,
+  showsTextRetryCountdown,
+} from "./lib/realtimeErrors";
+import type { JarvisBuildInfo, JarvisPendingConfirmationPublic, RickyArtifact } from "./vite-env";
 
 type RickyMode = "display" | "computer";
 
@@ -60,9 +65,16 @@ export default function App() {
   ]);
   const [status, setStatus] = useState("Idle");
   const [lastError, setLastError] = useState<ClassifiedRealtimeError | null>(null);
+  const [lastTextError, setLastTextError] = useState<TextClientErrorDetails | null>(null);
   const [textPrompt, setTextPrompt] = useState("");
   const [copyStatus, setCopyStatus] = useState("");
   const [textBusy, setTextBusy] = useState(false);
+  const [textCooldownUntilMs, setTextCooldownUntilMs] = useState<number | null>(null);
+  const [cooldownTick, setCooldownTick] = useState(0);
+  const [pendingConfirmation, setPendingConfirmation] = useState<JarvisPendingConfirmationPublic | null>(
+    null,
+  );
+  const [buildInfo, setBuildInfo] = useState<JarvisBuildInfo>({ version: "1.0.0" });
   const clientRef = useRef<RickyRealtimeClient | null>(null);
   const sessionOwnerRef = useRef(new SessionOwnerLock());
   const diagnosticsRef = useRef(new RealtimeDiagnosticsBuffer());
@@ -136,20 +148,92 @@ export default function App() {
           setArtifactVisible(true);
           if (nextArtifact.fullscreen) setArtifactFullscreen(true);
         },
-        onError: (message) => {
+        onError: (message, code, details) => {
           // Text errors must not overwrite Realtime lastError / voice recovery UI.
           setStatus(message);
           commitTranscriptEntry(newEntry("system", message));
+          const nextDetails: TextClientErrorDetails = details || {
+            code,
+            message,
+            retryable: isTextManualRetryAllowed(code),
+          };
+          setLastTextError(nextDetails);
+          if (
+            typeof nextDetails.cooldownMs === "number" &&
+            nextDetails.cooldownMs > 0 &&
+            showsTextRetryCountdown(nextDetails.code, nextDetails.retryable)
+          ) {
+            setTextCooldownUntilMs(Date.now() + nextDetails.cooldownMs);
+          } else {
+            setTextCooldownUntilMs(null);
+          }
         },
       },
       diagnosticsRef.current,
     );
   }
 
+  useEffect(() => {
+    let cancelled = false;
+    async function hydrateContinuity() {
+      try {
+        const [continuity, info] = await Promise.all([
+          window.jarvis.getContinuity(),
+          window.jarvis.getBuildInfo(),
+        ]);
+        if (cancelled) return;
+        setBuildInfo(info || continuity.buildInfo || { version: "1.0.0" });
+        textClientRef.current?.setBuildInfo(info || continuity.buildInfo);
+        setPendingConfirmation(continuity.pendingConfirmation || null);
+      } catch {
+        // Continuity IPC may be unavailable in non-Electron test shells.
+      }
+    }
+    void hydrateContinuity();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (textCooldownUntilMs == null) return;
+    if (Date.now() >= textCooldownUntilMs) {
+      setTextCooldownUntilMs(null);
+      return;
+    }
+    const id = window.setInterval(() => {
+      setCooldownTick((value) => value + 1);
+      if (Date.now() >= (textCooldownUntilMs || 0)) {
+        setTextCooldownUntilMs(null);
+      }
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [textCooldownUntilMs]);
+
   const isConnected = connectionState === "connected";
   const isBusy = connectionState === "connecting" || sessionUiState === "reconnecting";
-  const showErrorControls = sessionUiState === "error" || connectionState === "error";
+  const showVoiceErrorControls = sessionUiState === "error" || connectionState === "error";
   const textTurnActive = textBusy;
+  const textCooldownActive = textCooldownUntilMs != null && Date.now() < textCooldownUntilMs;
+  void cooldownTick;
+  const textRetryEnabled =
+    Boolean(lastTextError) &&
+    isTextManualRetryAllowed(lastTextError?.code, lastTextError?.retryable) &&
+    !textTurnActive &&
+    !textCooldownActive;
+  const showTextErrorControls = Boolean(lastTextError) && !showVoiceErrorControls;
+  const buildLabel = [buildInfo.version, buildInfo.gitSha ? buildInfo.gitSha.slice(0, 7) : null]
+    .filter(Boolean)
+    .join(" · ");
+
+  async function refreshPendingFromMain() {
+    try {
+      const continuity = await window.jarvis.getContinuity();
+      setPendingConfirmation(continuity.pendingConfirmation || null);
+    } catch {
+      // Ignore.
+    }
+  }
 
   function attachClient(): RickyRealtimeClient {
     // Prevent reconnect from retaining a prior client's audio path or peer connection.
@@ -233,9 +317,32 @@ export default function App() {
 
   async function copyDiagnostics() {
     const report =
+      (showTextErrorControls
+        ? textClientRef.current?.getDiagnosticReport(lastTextError?.code, {
+            connectionState,
+            cooldownUntilMs: textCooldownUntilMs,
+            pending: pendingConfirmation,
+            composerChars: textPrompt.length,
+          })
+        : null) ||
       clientRef.current?.getDiagnosticReport() ||
-      textClientRef.current?.getDiagnosticReport(lastError?.code) ||
-      ["Jarvis Realtime Diagnostics", JSON.stringify({ lastErrorCode: lastError?.code || null }, null, 2)].join("\n");
+      textClientRef.current?.getDiagnosticReport(lastError?.code || lastTextError?.code, {
+        connectionState,
+        cooldownUntilMs: textCooldownUntilMs,
+        pending: pendingConfirmation,
+        composerChars: textPrompt.length,
+      }) ||
+      [
+        "Jarvis Realtime Diagnostics",
+        JSON.stringify(
+          {
+            lastErrorCode: lastError?.code || lastTextError?.code || null,
+            build: buildInfo,
+          },
+          null,
+          2,
+        ),
+      ].join("\n");
     try {
       const result = await window.jarvis.copyTextToClipboard(report);
       setCopyStatus(result?.ok === true ? "Diagnostics copied." : "Could not copy diagnostics.");
@@ -263,9 +370,17 @@ export default function App() {
     commitTranscriptEntry(newEntry("system", `Mode switched to ${nextMode}.`));
   }
 
-  async function sendTextPrompt() {
-    const trimmed = textPrompt.trim();
-    if (!trimmed) return;
+  async function sendTextPrompt(options: { isManualRetry?: boolean } = {}) {
+    // Trim only to detect emptiness; submit the exact composer string unchanged.
+    const exactText = textPrompt;
+    if (!exactText.trim()) return;
+
+    if (textCooldownActive) {
+      const remaining = Math.max(1, Math.ceil(((textCooldownUntilMs || 0) - Date.now()) / 1000));
+      const message = `You can retry in ${remaining}s.`;
+      setStatus(message);
+      return;
+    }
 
     if (textTurnActive) {
       const message = "Jarvis is busy with another text turn.";
@@ -290,10 +405,18 @@ export default function App() {
     }
 
     // Build sanitized history BEFORE TextClient appends the current user turn to the log.
-    const history = buildTextHistoryFromTranscript(transcriptRef.current, trimmed);
+    // Manual Retry reuses exact composer text; do not clear or alter it here.
+    const history = buildTextHistoryFromTranscript(transcriptRef.current, exactText);
 
     try {
-      const result = await textClientRef.current?.submit(trimmed, history);
+      const resumePendingConfirmation =
+        options.isManualRetry === true &&
+        textClientRef.current?.canResumePendingConfirmation(exactText) === true;
+      const result = await textClientRef.current?.submit(exactText, history, {
+        // Exact failed composer + explicit Retry only; token stays on main.
+        resumePendingConfirmation,
+      });
+      await refreshPendingFromMain();
       const assistantText = readAssistantText(result);
 
       // Append successful assistant text BEFORE closing the field / releasing ownership.
@@ -363,6 +486,9 @@ export default function App() {
         setTextPrompt("");
         setShowTypeInput(false);
         setLastError(null);
+        setLastTextError(null);
+        setTextCooldownUntilMs(null);
+        textClientRef.current?.resetCooldownCounters();
         setStatus("Idle");
       }
     } catch (error) {
@@ -373,6 +499,25 @@ export default function App() {
       sessionOwnerRef.current.releaseText();
       setTextBusy(false);
     }
+  }
+
+  async function retryTextPrompt() {
+    if (!textRetryEnabled) return;
+    await sendTextPrompt({ isManualRetry: true });
+  }
+
+  async function dismissTextError() {
+    setLastTextError(null);
+    if (!textCooldownActive) setStatus("Idle");
+  }
+
+  async function dismissPendingBanner() {
+    try {
+      await window.jarvis.dismissPendingConfirmation();
+    } catch {
+      // Ignore.
+    }
+    setPendingConfirmation(null);
   }
 
   async function cancelTextPrompt() {
@@ -397,6 +542,17 @@ export default function App() {
     );
   }
 
+  const cooldownRemainingSec =
+    textCooldownActive && textCooldownUntilMs != null
+      ? Math.max(1, Math.ceil((textCooldownUntilMs - Date.now()) / 1000))
+      : null;
+  const retryAvailableAt =
+    textCooldownActive && textCooldownUntilMs != null ? formatRetryAvailableAt(textCooldownUntilMs) : null;
+  const pendingExpiryLabel =
+    pendingConfirmation && Number.isFinite(pendingConfirmation.expiresAt)
+      ? new Date(pendingConfirmation.expiresAt).toLocaleTimeString()
+      : null;
+
   const statusLine =
     status !== "Idle" ? status : lastError?.userMessage || SESSION_LABELS[sessionUiState];
 
@@ -411,7 +567,11 @@ export default function App() {
 
         <footer className="bottom-console">
           <section
-            className={showErrorControls ? "session-status session-status-error" : "session-status"}
+            className={
+              showVoiceErrorControls || showTextErrorControls
+                ? "session-status session-status-error"
+                : "session-status"
+            }
             role="status"
             aria-live="polite"
           >
@@ -419,12 +579,55 @@ export default function App() {
               <span className="session-state-label">{SESSION_LABELS[sessionUiState]}</span>
               <span className="session-status-message">{statusLine}</span>
             </div>
-            {showErrorControls ? (
+            <div className="session-meta-row">
+              <span className="session-meta-item">conn:{connectionState}</span>
+              <span className="session-meta-item">build:{buildLabel}</span>
+              {lastTextError?.code ? (
+                <span className="session-meta-item">err:{lastTextError.code}</span>
+              ) : lastError?.code ? (
+                <span className="session-meta-item">err:{lastError.code}</span>
+              ) : null}
+              {cooldownRemainingSec != null ? (
+                <span className="session-meta-item">
+                  retry in {cooldownRemainingSec}s
+                  {retryAvailableAt ? ` (${retryAvailableAt})` : ""}
+                </span>
+              ) : null}
+            </div>
+            {pendingConfirmation ? (
+              <div className="session-pending-banner">
+                <span>
+                  Pending: {pendingConfirmation.operation}
+                  {pendingConfirmation.scope ? ` (${pendingConfirmation.scope})` : ""} —{" "}
+                  {pendingConfirmation.redactedSummary}
+                  {pendingExpiryLabel ? ` · expires ${pendingExpiryLabel}` : ""}
+                </span>
+                <button type="button" onClick={() => void dismissPendingBanner()}>
+                  Dismiss
+                </button>
+              </div>
+            ) : null}
+            {showVoiceErrorControls ? (
               <div className="session-error-actions">
                 <button type="button" onClick={() => void retry()} disabled={isBusy}>
                   Retry
                 </button>
                 <button type="button" onClick={dismissError}>
+                  Dismiss
+                </button>
+                <button type="button" onClick={() => void copyDiagnostics()}>
+                  Copy diagnostics
+                </button>
+              </div>
+            ) : null}
+            {showTextErrorControls ? (
+              <div className="session-error-actions">
+                {textRetryEnabled ? (
+                  <button type="button" onClick={() => void retryTextPrompt()}>
+                    Retry
+                  </button>
+                ) : null}
+                <button type="button" onClick={() => void dismissTextError()}>
                   Dismiss
                 </button>
                 <button type="button" onClick={() => void copyDiagnostics()}>
@@ -460,6 +663,7 @@ export default function App() {
                   onClick={() => void sendTextPrompt()}
                   aria-label="Send typed prompt"
                   title="Send typed prompt"
+                  disabled={textCooldownActive}
                 >
                   <Send size={15} />
                 </button>
@@ -471,11 +675,15 @@ export default function App() {
             <button
               className={isConnected ? "simple-button active" : "simple-button"}
               onClick={
-                isConnected ? disconnect : showErrorControls ? () => void retry() : () => void connect()
+                isConnected ? disconnect : showVoiceErrorControls ? () => void retry() : () => void connect()
               }
               disabled={isBusy}
-              aria-label={isConnected ? "Disconnect voice" : showErrorControls ? "Retry voice" : "Connect voice"}
-              title={isConnected ? "Disconnect voice" : showErrorControls ? "Retry voice" : "Connect voice"}
+              aria-label={
+                isConnected ? "Disconnect voice" : showVoiceErrorControls ? "Retry voice" : "Connect voice"
+              }
+              title={
+                isConnected ? "Disconnect voice" : showVoiceErrorControls ? "Retry voice" : "Connect voice"
+              }
             >
               {isConnected ? <MicOff size={16} /> : <Mic size={16} />}
             </button>

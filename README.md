@@ -24,31 +24,38 @@ It is built with Electron, React, Vite, TypeScript, and the OpenAI Realtime API.
 
 Computer-use mode works on macOS and Windows 11. Voice, artifacts, notes, records, personal memory, image, and web-search features are available on both.
 
-## Quick Start
+## Quick Start (daily use)
 
-### macOS
+Prefer the built-renderer launcher for ordinary daily use (no Vite):
+
+### Windows
+
+```bat
+scripts\start-jarvis.bat
+```
+
+Or PowerShell:
+
+```powershell
+.\scripts\start-jarvis.ps1
+# Force rebuild:
+.\scripts\start-jarvis.ps1 -Rebuild
+```
+
+These scripts verify Node/npm/dependencies/`.env.local`/`OPENAI_API_KEY`, build when `dist/index.html` is missing (or when `-Rebuild` is passed), then start Electron with the built UI. A second launch focuses the existing Jarvis window.
+
+### First-time setup
 
 ```bash
 git clone https://github.com/rileybrown/rileyjarvis.git
 cd rileyjarvis
 npm install
 cp .env.example .env.local
-npm run dev
 ```
 
-### Windows PowerShell
+On Windows PowerShell use `Copy-Item .env.example .env.local`.
 
-```powershell
-git clone https://github.com/rileybrown/rileyjarvis.git
-Set-Location rileyjarvis
-npm install
-Copy-Item .env.example .env.local
-npm run dev
-```
-
-In Command Prompt, use `cd rileyjarvis` and `copy .env.example .env.local` instead.
-
-Edit `.env.local` before starting voice features:
+Edit `.env.local` before starting:
 
 ```bash
 OPENAI_API_KEY=your_openai_api_key_here
@@ -56,6 +63,24 @@ EXA_API_KEY=your_exa_api_key_here
 ```
 
 `OPENAI_API_KEY` is required. `EXA_API_KEY` is optional; web search will show a setup message when it is missing.
+
+## Development
+
+```bash
+npm run dev
+```
+
+This starts Vite on `127.0.0.1:5173` and launches Electron with hot reload. Use this path for implementers — not for everyday pilot use.
+
+Other useful commands:
+
+```bash
+npm run typecheck
+npm run build
+npm start
+```
+
+`npm start` loads the built renderer from `dist/` (same daily path Electron uses).
 
 ## macOS Permissions
 
@@ -66,22 +91,6 @@ RileyJarvis runs locally. Depending on the features you use, macOS may ask for:
 - Screen Recording permission for screenshots and screen inspection.
 
 Computer-control tools are blocked until the app is in computer-use mode.
-
-## Development
-
-```bash
-npm run dev
-```
-
-This starts Vite on `127.0.0.1:5173` and launches Electron.
-
-Other useful commands:
-
-```bash
-npm run typecheck
-npm run build
-npm start
-```
 
 ## Runtime Data
 
@@ -98,6 +107,7 @@ The app creates a local `data/` directory for notes, records, generated images, 
 | `entries.json` | Durable memory entries |
 | `archive/daily-YYYY-MM-DD.json` | Archived daily context after date rollover |
 | `backups/{timestamp}-*.json` | Timestamped snapshots before destructive changes (last 10 retained) |
+| `session-continuity.json` | Recent priority/project/working-context IDs only (no previews or pending confirmations) |
 
 **Durability boundaries**
 
