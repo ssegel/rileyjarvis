@@ -83,7 +83,6 @@ export default function App() {
   const artifactRef = useRef(artifact);
   const deliveredAssistantTurnRef = useRef<string | null>(null);
   const appendAssistantToLogRef = useRef<(text: string, clientTurnId: string) => boolean>(() => false);
-  const pendingInternalRef = useRef<JarvisPendingConfirmationPublic | null>(null);
 
   function commitTranscriptEntry(entry: TranscriptEntry): TranscriptEntry[] {
     const next = [entry, ...transcriptRef.current].slice(0, 80);
@@ -162,7 +161,7 @@ export default function App() {
           if (
             typeof nextDetails.cooldownMs === "number" &&
             nextDetails.cooldownMs > 0 &&
-            showsTextRetryCountdown(nextDetails.code)
+            showsTextRetryCountdown(nextDetails.code, nextDetails.retryable)
           ) {
             setTextCooldownUntilMs(Date.now() + nextDetails.cooldownMs);
           } else {
@@ -186,7 +185,6 @@ export default function App() {
         setBuildInfo(info || continuity.buildInfo || { version: "1.0.0" });
         textClientRef.current?.setBuildInfo(info || continuity.buildInfo);
         setPendingConfirmation(continuity.pendingConfirmation || null);
-        pendingInternalRef.current = continuity.pendingConfirmation || null;
       } catch {
         // Continuity IPC may be unavailable in non-Electron test shells.
       }
@@ -220,8 +218,7 @@ export default function App() {
   void cooldownTick;
   const textRetryEnabled =
     Boolean(lastTextError) &&
-    isTextManualRetryAllowed(lastTextError?.code) &&
-    lastTextError?.retryable !== false &&
+    isTextManualRetryAllowed(lastTextError?.code, lastTextError?.retryable) &&
     !textTurnActive &&
     !textCooldownActive;
   const showTextErrorControls = Boolean(lastTextError) && !showVoiceErrorControls;
@@ -233,21 +230,8 @@ export default function App() {
     try {
       const continuity = await window.jarvis.getContinuity();
       setPendingConfirmation(continuity.pendingConfirmation || null);
-      pendingInternalRef.current = continuity.pendingConfirmation || null;
     } catch {
       // Ignore.
-    }
-  }
-
-  async function fetchPendingHint() {
-    try {
-      const continuity = await window.jarvis.getContinuity();
-      setPendingConfirmation(continuity.pendingConfirmation || null);
-      // Token is only available via a dedicated internal path on main; attach through runTextTurn
-      // by asking main to inject from getPendingConfirmationInternal when present.
-      return continuity.pendingConfirmation;
-    } catch {
-      return null;
     }
   }
 
@@ -387,8 +371,9 @@ export default function App() {
   }
 
   async function sendTextPrompt(options: { isManualRetry?: boolean } = {}) {
-    const trimmed = textPrompt.trim();
-    if (!trimmed) return;
+    // Trim only to detect emptiness; submit the exact composer string unchanged.
+    const exactText = textPrompt;
+    if (!exactText.trim()) return;
 
     if (textCooldownActive) {
       const remaining = Math.max(1, Math.ceil(((textCooldownUntilMs || 0) - Date.now()) / 1000));
@@ -421,14 +406,16 @@ export default function App() {
 
     // Build sanitized history BEFORE TextClient appends the current user turn to the log.
     // Manual Retry reuses exact composer text; do not clear or alter it here.
-    const history = buildTextHistoryFromTranscript(transcriptRef.current, trimmed);
-    if (!options.isManualRetry) {
-      // Fresh submit starts a new cooldown chain only after outcome; counters reset on success.
-    }
+    const history = buildTextHistoryFromTranscript(transcriptRef.current, exactText);
 
     try {
-      await fetchPendingHint();
-      const result = await textClientRef.current?.submit(trimmed, history);
+      const resumePendingConfirmation =
+        options.isManualRetry === true &&
+        textClientRef.current?.canResumePendingConfirmation(exactText) === true;
+      const result = await textClientRef.current?.submit(exactText, history, {
+        // Exact failed composer + explicit Retry only; token stays on main.
+        resumePendingConfirmation,
+      });
       await refreshPendingFromMain();
       const assistantText = readAssistantText(result);
 
@@ -531,7 +518,6 @@ export default function App() {
       // Ignore.
     }
     setPendingConfirmation(null);
-    pendingInternalRef.current = null;
   }
 
   async function cancelTextPrompt() {

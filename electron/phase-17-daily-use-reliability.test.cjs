@@ -97,6 +97,73 @@ test("17.1 5xx retryable manual and honors Retry-After", () => {
   assert.equal(errors.isTextManualRetryAllowed(classified.code), true);
 });
 
+test("17.1 cooldown fallback resets when error category changes", () => {
+  let state = { chainCode: null, attemptIndex: 0, consecutiveRateLimited: 0 };
+
+  let step = errors.advanceTextCooldownChain(state, "network.offline");
+  assert.equal(step.attemptIndex, 0);
+  assert.equal(errors.computeTextCooldownMs(step.attemptIndex), 1000);
+  state = {
+    chainCode: step.chainCode,
+    attemptIndex: step.nextAttemptIndex,
+    consecutiveRateLimited: step.consecutiveRateLimited,
+  };
+
+  // network → 5xx starts 5xx fallback at first interval
+  step = errors.advanceTextCooldownChain(state, "server.unavailable");
+  assert.equal(step.attemptIndex, 0);
+  assert.equal(errors.computeTextCooldownMs(step.attemptIndex), 1000);
+  state = {
+    chainCode: step.chainCode,
+    attemptIndex: step.nextAttemptIndex,
+    consecutiveRateLimited: step.consecutiveRateLimited,
+  };
+
+  // 5xx → network also resets
+  step = errors.advanceTextCooldownChain(state, "network.offline");
+  assert.equal(step.attemptIndex, 0);
+  assert.equal(step.consecutiveRateLimited, 0);
+
+  // 429 → 429 → non-429 → 429
+  state = { chainCode: null, attemptIndex: 0, consecutiveRateLimited: 0 };
+  step = errors.advanceTextCooldownChain(state, "rate_limited");
+  assert.equal(step.consecutiveRateLimited, 1);
+  state = {
+    chainCode: step.chainCode,
+    attemptIndex: step.nextAttemptIndex,
+    consecutiveRateLimited: step.consecutiveRateLimited,
+  };
+  step = errors.advanceTextCooldownChain(state, "rate_limited");
+  assert.equal(step.consecutiveRateLimited, 2);
+  assert.equal(step.attemptIndex, 1);
+  state = {
+    chainCode: step.chainCode,
+    attemptIndex: step.nextAttemptIndex,
+    consecutiveRateLimited: step.consecutiveRateLimited,
+  };
+  step = errors.advanceTextCooldownChain(state, "network.offline");
+  assert.equal(step.consecutiveRateLimited, 0);
+  assert.equal(step.attemptIndex, 0);
+  state = {
+    chainCode: step.chainCode,
+    attemptIndex: step.nextAttemptIndex,
+    consecutiveRateLimited: step.consecutiveRateLimited,
+  };
+  step = errors.advanceTextCooldownChain(state, "rate_limited");
+  assert.equal(step.consecutiveRateLimited, 1);
+  assert.equal(step.attemptIndex, 0);
+});
+
+test("17.1 session.error retryable timeout vs non-retryable busy/cancel", () => {
+  assert.equal(errors.isTextManualRetryAllowed("session.error", true), true);
+  assert.equal(errors.isTextManualRetryAllowed("session.error", false), false);
+  assert.equal(errors.isTextManualRetryAllowed("session.error"), false);
+  assert.equal(errors.showsTextRetryCountdown("session.error", true), true);
+  assert.equal(errors.showsTextRetryCountdown("session.error", false), false);
+  assert.equal(errors.isTextManualRetryAllowed("quota.exhausted", true), false);
+  assert.equal(errors.isTextManualRetryAllowed("config.missing_api_key", true), false);
+});
+
 // --- §17.2 Auto network retry safety ---
 
 test("17.2 fetch throw before response sets safeForAutoNetworkRetry and allows one auto retry", async () => {
@@ -206,6 +273,10 @@ test("17.2 timeout after send never safe for auto retry", async () => {
   assert.equal(result.error.code, "session.error");
   assert.match(result.error.message, /timed out/i);
   assert.equal(result.error.safeForAutoNetworkRetry, false);
+  assert.equal(result.error.retryable, true);
+  assert.equal(errors.isTextManualRetryAllowed(result.error.code, result.error.retryable), true);
+  assert.equal(errors.isTextManualRetryAllowed("session.error", false), false);
+  assert.equal(errors.isTextManualRetryAllowed("session.error"), false);
 });
 
 // --- §17.3 Duplicate submission / composer (source + client guards) ---
@@ -221,9 +292,68 @@ test("17.3 cooldown and in-flight guards present in App/TextClient", () => {
   assert.match(app, /textRetryEnabled/);
   assert.match(app, /You can retry in/);
   assert.doesNotMatch(app, /Retrying in/);
+  assert.match(app, /canResumePendingConfirmation\(exactText\)/);
+  assert.match(app, /resumePendingConfirmation,/);
+  assert.doesNotMatch(app, /fetchPendingHint|pendingInternalRef/);
   assert.match(textClient, /isActive\(\)/);
   assert.match(textClient, /autoNetworkRetriesUsed/);
   assert.match(textClient, /TEXT_AUTO_NETWORK_RETRY_DELAY_MS/);
+  assert.match(textClient, /advanceTextCooldownChain/);
+  assert.match(textClient, /resumePendingConfirmation/);
+  assert.match(textClient, /autoNetworkRetryOptions\(options\)/);
+  assert.match(textClient, /item\.requiresConfirmation === true/);
+});
+
+test("17.3 exact composer text reaches runTextTurn on Send and Retry", () => {
+  const { resolveExactComposerText } = require("./text-run-request.cjs");
+  const composer = "  keep leading\nand trailing  \n";
+  const first = resolveExactComposerText(composer);
+  assert.equal(first.empty, false);
+  assert.equal(first.text, composer);
+  const retry = resolveExactComposerText(composer);
+  assert.equal(retry.text, composer);
+  assert.equal(resolveExactComposerText("   \n\t  ").empty, true);
+
+  const app = read("src/App.tsx");
+  const textClient = read("src/lib/textClient.ts");
+  assert.match(app, /const exactText = textPrompt/);
+  assert.match(app, /submit\(exactText,/);
+  assert.match(textClient, /text: exactText/);
+  assert.doesNotMatch(textClient, /text: trimmed/);
+});
+
+test("17.3 text-session preserves exact composer whitespace in request body", async () => {
+  const exact = "  line one\nline two  ";
+  let sentText = null;
+  const controller = createTextSessionController({
+    getApiKey: () => "sk-test",
+    getTextModel: () => "gpt-4.1",
+    buildInstructions: async () => "instructions",
+    getToolSpecs: () => [],
+    executeTool: async () => ({ ok: true }),
+    classifyHttpFailure: errors.classifyHttpFailure,
+    createTokenError,
+    timeoutMs: 5000,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      const input = body.input || [];
+      const last = input[input.length - 1];
+      sentText = last?.content?.[0]?.text;
+      return {
+        ok: true,
+        headers: { get: () => null },
+        async json() {
+          return {
+            output_text: "ok",
+            output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
+          };
+        },
+      };
+    },
+  });
+  const result = await controller.runTextTurn({ clientTurnId: "exact", text: exact });
+  assert.equal(result.ok, true);
+  assert.equal(sentText, exact);
 });
 
 test("17.3 second in-flight text turn rejected", async () => {
@@ -302,6 +432,181 @@ test("17.4 mint preview sets pending projection with expiry; remint suppressed; 
     assert.equal(store.getPendingConfirmation(), null);
     assert.equal(store._test.getPreviewStoreSize(), 0);
   });
+});
+
+test("17.4 dismiss hides banner but keeps internal token and remint suppression", async () => {
+  await withTempMemory(async (store) => {
+    await store.memoryPriorities({
+      operation: "add",
+      items: [{ text: "Dismiss keep remint" }],
+    });
+    const preview = await store.memoryPriorities({
+      operation: "remove",
+      reference: { by: "text", value: "Dismiss keep remint" },
+    });
+    assert.ok(preview.previewToken);
+    assert.ok(store.getPendingConfirmation());
+    store.dismissPendingConfirmation();
+    assert.equal(store.getPendingConfirmation(), null);
+    const internal = store.getPendingConfirmationInternal();
+    assert.ok(internal);
+    assert.equal(internal.previewToken, preview.previewToken);
+
+    const remint = await store.memoryPriorities({
+      operation: "remove",
+      reference: { by: "text", value: "Dismiss keep remint" },
+    });
+    assert.equal(remint.previewToken, preview.previewToken);
+  });
+});
+
+test("17.4 fresh Send does not attach pending; explicit resume does", () => {
+  const { prepareTextRunPayload } = require("./text-run-request.cjs");
+  const internal = {
+    toolName: "memory_priorities",
+    operation: "remove",
+    scope: null,
+    previewToken: "tok-secret-xyz",
+    expiresAt: Date.now() + 60_000,
+    redactedSummary: "remove item",
+  };
+
+  const fresh = prepareTextRunPayload(
+    { clientTurnId: "a", text: "unrelated hello", pendingConfirmation: { previewToken: "evil" } },
+    () => internal,
+  );
+  assert.equal(Object.prototype.hasOwnProperty.call(fresh, "pendingConfirmation"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(fresh, "resumePendingConfirmation"), false);
+  assert.doesNotMatch(JSON.stringify(fresh), /tok-secret|evil|previewToken/);
+
+  const resume = prepareTextRunPayload(
+    { clientTurnId: "b", text: "confirm that", resumePendingConfirmation: true },
+    () => internal,
+  );
+  assert.equal(resume.pendingConfirmation.previewToken, "tok-secret-xyz");
+  assert.equal(resume.pendingConfirmation.operation, "remove");
+  assert.equal(Object.prototype.hasOwnProperty.call(resume, "resumePendingConfirmation"), false);
+
+  const noInternal = prepareTextRunPayload(
+    { clientTurnId: "c", text: "confirm", resumePendingConfirmation: true },
+    () => null,
+  );
+  assert.equal(Object.prototype.hasOwnProperty.call(noInternal, "pendingConfirmation"), false);
+});
+
+test("17.4 pending resume eligibility is exact-text and failed-turn bound", async () => {
+  const { PendingResumeEligibility, autoNetworkRetryOptions } =
+    await import("../src/lib/pendingResume.ts");
+  const { prepareTextRunPayload } = require("./text-run-request.cjs");
+  const state = new PendingResumeEligibility();
+  const original = "  confirm this\nexact operation  ";
+  const internal = {
+    toolName: "memory_priorities",
+    operation: "remove",
+    scope: null,
+    previewToken: "same-token",
+    expiresAt: Date.now() + 60_000,
+  };
+
+  // Failed turn associated with pending makes only the exact composer eligible.
+  state.recordFailure(original, true);
+  assert.equal(state.canResume(original), true);
+  const unedited = prepareTextRunPayload(
+    {
+      clientTurnId: "retry",
+      text: original,
+      resumePendingConfirmation: state.canResume(original),
+    },
+    () => internal,
+  );
+  assert.equal(unedited.pendingConfirmation.previewToken, "same-token");
+
+  // Any edit is a normal turn and cannot attach the token.
+  const edited = `${original}!`;
+  assert.equal(state.canResume(edited), false);
+  const editedPayload = prepareTextRunPayload(
+    {
+      clientTurnId: "edited",
+      text: edited,
+      resumePendingConfirmation: state.canResume(edited),
+    },
+    () => internal,
+  );
+  assert.equal(Object.prototype.hasOwnProperty.call(editedPayload, "pendingConfirmation"), false);
+
+  // Restoring the byte-exact string restores eligibility while the same failed state is current.
+  assert.equal(state.canResume(original), true);
+
+  // Starting an unrelated fresh turn invalidates the failed-turn association.
+  state.beginTurn(edited, { resumePendingConfirmation: false });
+  assert.equal(state.canResume(original), false);
+  const fresh = prepareTextRunPayload(
+    { clientTurnId: "fresh", text: "unrelated", resumePendingConfirmation: false },
+    () => internal,
+  );
+  assert.equal(Object.prototype.hasOwnProperty.call(fresh, "pendingConfirmation"), false);
+
+  // Success clears eligibility.
+  state.recordFailure(original, true);
+  state.clear();
+  assert.equal(state.canResume(original), false);
+
+  // Automatic retry preserves an explicit decision and never invents one.
+  assert.deepEqual(autoNetworkRetryOptions({ resumePendingConfirmation: true }), {
+    resumePendingConfirmation: true,
+    isAutoNetworkRetry: true,
+  });
+  assert.deepEqual(autoNetworkRetryOptions({}), {
+    resumePendingConfirmation: false,
+    isAutoNetworkRetry: true,
+  });
+});
+
+test("17.4 text-session pending hint only when request carries pendingConfirmation", async () => {
+  let capturedBodies = [];
+  const controller = createTextSessionController({
+    getApiKey: () => "sk-test",
+    getTextModel: () => "gpt-4.1",
+    buildInstructions: async () => "instructions",
+    getToolSpecs: () => [],
+    executeTool: async () => ({ ok: true }),
+    classifyHttpFailure: errors.classifyHttpFailure,
+    createTokenError,
+    timeoutMs: 5000,
+    fetchImpl: async (_url, init) => {
+      capturedBodies.push(JSON.parse(init.body));
+      return {
+        ok: true,
+        headers: { get: () => null },
+        async json() {
+          return {
+            output_text: "ok",
+            output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
+          };
+        },
+      };
+    },
+  });
+
+  await controller.runTextTurn({ clientTurnId: "fresh", text: "hello while pending" });
+  const freshInput = JSON.stringify(capturedBodies[0].input || []);
+  assert.doesNotMatch(freshInput, /PENDING CONFIRMATION|previewToken|confirmed=true/);
+
+  capturedBodies = [];
+  await controller.runTextTurn({
+    clientTurnId: "resume",
+    text: "yes confirm",
+    pendingConfirmation: {
+      toolName: "memory_priorities",
+      operation: "remove",
+      previewToken: "tok-abc",
+      scope: null,
+    },
+  });
+  const resumeInput = JSON.stringify(capturedBodies[0].input || []);
+  assert.match(resumeInput, /PENDING CONFIRMATION/);
+  assert.match(resumeInput, /previewToken=tok-abc/);
+  assert.match(resumeInput, /confirmed=true/);
 });
 
 test("17.4 TTL expiry clears pending and confirm returns STALE_PREVIEW", async () => {
@@ -997,10 +1302,16 @@ test("17.8 diagnostics copy excludes tokens/keys/plans; includes code + cooldown
 
 test("Phase 17 wiring: text session pending hint and error enrichment", () => {
   const textSession = read("electron/text-session.cjs");
+  const main = read("electron/main.cjs");
+  const app = read("src/App.tsx");
   assert.match(textSession, /safeForAutoNetworkRetry/);
   assert.match(textSession, /pendingConfirmation/);
   assert.match(textSession, /onHttpResponseReceived/);
   assert.match(textSession, /retryAfterMs/);
+  assert.match(main, /prepareTextRunPayload/);
+  assert.match(app, /canResumePendingConfirmation\(exactText\)/);
+  assert.match(app, /resumePendingConfirmation,/);
+  assert.doesNotMatch(app, /pendingInternalRef|fetchPendingHint/);
 });
 
 test("Realtime connect policy remains 30s capped", () => {

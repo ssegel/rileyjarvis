@@ -260,6 +260,8 @@ function createMemoryStore(options = {}) {
    *   bindingKey: string,
    * }} */
   let pendingConfirmation = null;
+  /** Banner dismiss hides public projection only; remint/resume continuity stays until clear. */
+  let pendingBannerDismissed = false;
   let sessionContinuityHydrated = false;
   /** @type {Set<string>} */
   const notFoundFingerprints = new Set();
@@ -272,6 +274,7 @@ function createMemoryStore(options = {}) {
 
   function clearPendingConfirmation() {
     pendingConfirmation = null;
+    pendingBannerDismissed = false;
   }
 
   function setPendingConfirmation({
@@ -295,6 +298,8 @@ function createMemoryStore(options = {}) {
       createdAt: Date.now(),
       bindingKey: String(bindingKey || ""),
     };
+    // A newly created or superseding preview becomes visible again.
+    pendingBannerDismissed = false;
   }
 
   function refreshPendingFromStore() {
@@ -307,7 +312,7 @@ function createMemoryStore(options = {}) {
 
   function getPendingConfirmationPublic() {
     refreshPendingFromStore();
-    if (!pendingConfirmation) return null;
+    if (!pendingConfirmation || pendingBannerDismissed) return null;
     return {
       toolName: pendingConfirmation.toolName,
       operation: pendingConfirmation.operation,
@@ -325,7 +330,10 @@ function createMemoryStore(options = {}) {
   }
 
   function dismissPendingConfirmation() {
-    clearPendingConfirmation();
+    // Hide public banner only — keep previewStore + internal pending for remint/resume.
+    if (pendingConfirmation) {
+      pendingBannerDismissed = true;
+    }
   }
 
   function buildBindingKey(toolName, operation, scope, requestObj) {

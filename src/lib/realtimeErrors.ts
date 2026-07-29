@@ -74,8 +74,14 @@ export function isRetryableCode(code: RealtimeErrorCode): boolean {
   return !NON_RETRYABLE.has(code);
 }
 
-/** Manual Retry allowed after cooldown for these text failure codes. */
-export function isTextManualRetryAllowed(code: string | undefined | null): boolean {
+/**
+ * Manual Retry allowed after cooldown.
+ * Uses explicit error.retryable when provided (e.g. session.error timeout vs busy/cancel).
+ */
+export function isTextManualRetryAllowed(
+  code: string | undefined | null,
+  retryable?: boolean | null,
+): boolean {
   if (!code) return false;
   if (
     code === "quota.exhausted" ||
@@ -84,13 +90,49 @@ export function isTextManualRetryAllowed(code: string | undefined | null): boole
   ) {
     return false;
   }
+  if (typeof retryable === "boolean") {
+    return retryable;
+  }
+  // Without an explicit flag, session.error is not assumed retryable (busy/cancel/reject).
+  if (code === "session.error") return false;
   if (isRealtimeErrorCode(code)) return isRetryableCode(code);
-  return code !== "session.error";
+  return true;
 }
 
 /** Countdown UI is never shown for quota or other non-manual-retry codes. */
-export function showsTextRetryCountdown(code: string | undefined | null): boolean {
-  return isTextManualRetryAllowed(code);
+export function showsTextRetryCountdown(
+  code: string | undefined | null,
+  retryable?: boolean | null,
+): boolean {
+  return isTextManualRetryAllowed(code, retryable);
+}
+
+export type TextCooldownChainState = {
+  chainCode: string | null;
+  attemptIndex: number;
+  consecutiveRateLimited: number;
+};
+
+/**
+ * Advance per-error-chain cooldown fallback state (Phase 17 §3).
+ * Switching error code/category resets the fallback index; consecutive 429s keep their counter.
+ */
+export function advanceTextCooldownChain(
+  prev: Partial<TextCooldownChainState> | null | undefined,
+  errorCode: string | undefined | null,
+): TextCooldownChainState & { nextAttemptIndex: number } {
+  const code = errorCode || "unknown";
+  const previous = prev || {};
+  const sameChain = previous.chainCode === code;
+  const attemptIndex = sameChain ? Math.max(0, Number(previous.attemptIndex) || 0) : 0;
+  const consecutiveRateLimited =
+    code === "rate_limited" ? Math.max(0, Number(previous.consecutiveRateLimited) || 0) + 1 : 0;
+  return {
+    chainCode: code,
+    attemptIndex,
+    nextAttemptIndex: attemptIndex + 1,
+    consecutiveRateLimited,
+  };
 }
 
 /**

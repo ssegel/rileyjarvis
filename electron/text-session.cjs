@@ -51,14 +51,15 @@ function createTextSessionController(deps) {
 
   async function runTextTurn(request) {
     const clientTurnId = String(request?.clientTurnId || "");
-    const text = String(request?.text || "").trim();
+    const exactText = request?.text == null ? "" : String(request.text);
+    const text = exactText;
     const history = Array.isArray(request?.history) ? request.history : [];
     const startedAt = now();
 
     if (!clientTurnId) {
       return failResult("unknown", "Missing text turn id.", startedAt, now);
     }
-    if (!text) {
+    if (!exactText.trim()) {
       return failResult("unknown", "Typed message was empty.", startedAt, now);
     }
     if (activeTurns.size > 0) {
@@ -447,8 +448,10 @@ function abortedOutcome(options) {
 }
 
 function buildInitialInput(text, history) {
-  const current = String(text || "").trim();
-  const normalized = normalizeTextHistory(history, current);
+  // Preserve the exact current composer string; trim only for history dedup / emptiness.
+  const exact = text == null ? "" : String(text);
+  const currentForDedup = exact.trim();
+  const normalized = normalizeTextHistory(history, currentForDedup);
   const items = [];
   for (const entry of normalized) {
     const role = entry.role === "assistant" || entry.role === "ricky" ? "assistant" : "user";
@@ -471,7 +474,7 @@ function buildInitialInput(text, history) {
   items.push({
     type: "message",
     role: "user",
-    content: [{ type: "input_text", text: current }],
+    content: [{ type: "input_text", text: exact }],
   });
   return items;
 }

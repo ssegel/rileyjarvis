@@ -1,6 +1,6 @@
 # Phase 17 Implementation Report — Daily-Use Reliability
 
-**Status:** Implementation complete; live validation (§18 L1–L8 + sanitized diagnostics) passed. Temporary DevTools hook removed.
+**Status:** Implementation complete; live validation (§18 L1–L8 + sanitized diagnostics) passed. Pre-merge correction pass applied (pending resume flag, dismiss vs remint, retryable session errors, exact composer text, per-chain cooldown). No live validation during this correction pass.
 **Branch:** `phase-17-daily-use-reliability`  
 **Baseline:** `4d36e5c` — *Add Phase 17 daily-use reliability design*  
 **Audit contract:** `docs/phase-17-daily-use-reliability-audit.md`
@@ -609,3 +609,106 @@ Get-CimInstance Win32_Process | Where-Object {
 ```
 
 **Result:** no remaining `electron.exe` / `node.exe` processes for this repository. Jarvis fully closed.
+
+---
+
+## Pre-merge correction pass (draft PR #1)
+
+**No live validation was run during this correction pass.** No Jarvis launch and no OpenAI requests. Live `data/memory` was not modified.
+
+### Defect 1 — Pending confirmation injected into every text turn
+
+| | |
+|---|---|
+| **Root cause** | `electron/main.cjs` `text:run` always copied `getPendingConfirmationInternal()` into the payload whenever a preview existed. |
+| **Correction** | Added `resumePendingConfirmation` on the client request. `prepareTextRunPayload` (`electron/text-run-request.cjs`) injects the internal token **only** when that flag is `true`. Fresh Send leaves the flag false. App sets the flag only on manual Retry. Renderer-supplied `pendingConfirmation` is always stripped. |
+| **Tests** | Behavioral: fresh payload has no token; resume attaches token; text-session hint appears only when pending is on the prepared request. |
+
+### Defect 2 — Dismiss destroys remint suppression
+
+| | |
+|---|---|
+| **Root cause** | `dismissPendingConfirmation()` called `clearPendingConfirmation()`, wiping internal continuity while leaving `previewStore` entries. |
+| **Correction** | Banner visibility is separate (`pendingBannerDismissed`). Dismiss hides `getPendingConfirmation()` only. Internal pending + remint reuse remain until success, TTL, stale binding, restart, or `invalidatePreviews()`. New/superseding previews clear the dismiss flag and show again. |
+| **Tests** | Dismiss hides public projection; internal token remains; equivalent remint reuses the same token. |
+
+### Defect 3 — Retryable session errors blocked in the renderer
+
+| | |
+|---|---|
+| **Root cause** | Manual retry treated `session.error` as non-retryable by code alone (or inconsistently), ignoring backend `retryable: true` (timeout). |
+| **Correction** | `isTextManualRetryAllowed(code, retryable?)` uses the explicit `retryable` flag when present. Timeout (`retryable: true`) allows Retry; busy/cancel/reject (`retryable: false`) do not. Quota/config stay non-retryable even if a flag is wrongly true. |
+| **Tests** | Timeout retryable vs busy/cancel non-retryable unit cases. |
+
+### Defect 4 — Exact composer text trimmed before submission
+
+| | |
+|---|---|
+| **Root cause** | App/TextClient/`buildInitialInput` trimmed the composer before `runTextTurn` / Responses input. |
+| **Correction** | Trim only for emptiness / history dedup. Submit and API current-message use the exact composer string. Auto network retry resubmits the same string without duplicating `onUserText`. |
+| **Tests** | Exact whitespace preserved in text-session request body; planner/source contracts for `exactText`. |
+
+### Defect 5 — Shared cooldown fallback across unrelated errors
+
+| | |
+|---|---|
+| **Root cause** | Single `cooldownAttemptIndex` advanced across all failure codes. |
+| **Correction** | `advanceTextCooldownChain` resets fallback index when the error code/category changes; consecutive 429 counter resets on non-429; success resets all chain state. |
+| **Tests** | network→5xx, 5xx→network, 429→429→non-429→429 behavioral chain tests. |
+
+### Defect 6 — Dead / misleading pending wiring
+
+| | |
+|---|---|
+| **Root cause** | `pendingInternalRef`, `fetchPendingHint()`, and comments implied renderer access to internal tokens. |
+| **Correction** | Removed dead refs/helpers. Flow is App (`resumePendingConfirmation`) → TextClient → `vite-env` request → main `prepareTextRunPayload` → text-session hint. |
+
+### Command results (correction pass)
+
+```
+node --test electron/phase-17-daily-use-reliability.test.cjs
+→ 43/43 pass
+
+node --test electron/text-mode.test.cjs electron/text-prompt-submit.test.cjs electron/text-history.test.cjs electron/text-delivery.test.cjs electron/text-panel-activation.test.cjs electron/realtime-diagnostics-recovery.test.cjs electron/clipboard-diagnostics.test.cjs
+→ 78/78 pass
+
+node --test electron/priority-lifecycle.test.cjs electron/working-context-lifecycle.test.cjs electron/active-projects-lifecycle.test.cjs electron/day-briefing.test.cjs electron/memory.test.cjs
+→ 126/126 pass
+
+npm run build
+→ tsc --noEmit OK; vite build OK
+
+git diff --check
+→ EXIT 0
+```
+
+### Follow-up correction — bind resume to the exact failed composer
+
+| | |
+|---|---|
+| **Root cause** | App treated any Manual Retry as eligible for `resumePendingConfirmation`, so editing the composer could attach an older destructive preview token to materially different text. |
+| **Correction** | `PendingResumeEligibility` stores only the exact composer string from the latest failed turn associated with pending confirmation (never the token). App requests resume only when Manual Retry is explicit and the current composer is byte-for-byte identical. TextClient independently enforces the same check. A fresh unrelated turn, cancellation, or success clears eligibility. Editing without submitting disables resume; restoring the exact string restores eligibility only while the same failed-turn state remains current. Main still performs the authoritative valid-internal-pending check before token injection. |
+| **Automatic retry** | `autoNetworkRetryOptions()` preserves the original request's explicit resume boolean across the one permitted automatic transport retry and never infers or activates it. |
+| **Tests** | Unedited retry attaches the same token; any edit prevents attachment; edit-then-restore behavior; unrelated fresh Send; success clear; auto retry preserve/never-invent. Exact whitespace/newline equality is covered. |
+
+### Follow-up command results
+
+```
+node --test electron/phase-17-daily-use-reliability.test.cjs
+→ 44/44 pass
+
+node --test electron/text-mode.test.cjs electron/text-prompt-submit.test.cjs electron/text-history.test.cjs electron/text-delivery.test.cjs electron/text-panel-activation.test.cjs electron/realtime-diagnostics-recovery.test.cjs electron/clipboard-diagnostics.test.cjs
+→ 78/78 pass
+
+npm run build
+→ tsc --noEmit OK; vite build OK
+
+git diff --check
+→ EXIT 0
+```
+
+### Remaining uncertainty / risk
+
+- No substantive pending-confirmation resume risk remains from the reviewed path: renderer eligibility is exact-failed-text-bound and main independently requires a valid internal pending token.
+- The focused Node test emits Node's non-failing `MODULE_TYPELESS_PACKAGE_JSON` warning when dynamically importing the TypeScript eligibility helper; production Vite/TypeScript build is unaffected.
+- **No live validation was run during this follow-up correction pass.** Jarvis was not launched and no OpenAI request was made.

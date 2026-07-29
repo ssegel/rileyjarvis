@@ -44,8 +44,13 @@ function isRetryableCode(code) {
   return !NON_RETRYABLE.has(code);
 }
 
-/** Manual Retry allowed after cooldown for these text failure codes. */
-function isTextManualRetryAllowed(code) {
+/**
+ * Manual Retry allowed after cooldown.
+ * Uses explicit error.retryable when provided (e.g. session.error timeout vs busy/cancel).
+ * @param {string|null|undefined} code
+ * @param {boolean|null|undefined} [retryable]
+ */
+function isTextManualRetryAllowed(code, retryable) {
   if (!code) return false;
   if (
     code === "quota.exhausted" ||
@@ -54,12 +59,40 @@ function isTextManualRetryAllowed(code) {
   ) {
     return false;
   }
+  if (typeof retryable === "boolean") {
+    return retryable;
+  }
+  // Without an explicit flag, session.error is not assumed retryable (busy/cancel/reject).
+  if (code === "session.error") return false;
   return isRetryableCode(code);
 }
 
 /** Countdown UI is never shown for quota or other non-manual-retry codes. */
-function showsTextRetryCountdown(code) {
-  return isTextManualRetryAllowed(code);
+function showsTextRetryCountdown(code, retryable) {
+  return isTextManualRetryAllowed(code, retryable);
+}
+
+/**
+ * Advance per-error-chain cooldown fallback state (Phase 17 §3).
+ * Switching error code/category resets the fallback index; consecutive 429s keep their counter.
+ * @param {{ chainCode?: string|null, attemptIndex?: number, consecutiveRateLimited?: number }} prev
+ * @param {string|null|undefined} errorCode
+ */
+function advanceTextCooldownChain(prev, errorCode) {
+  const code = errorCode || "unknown";
+  const previous = prev && typeof prev === "object" ? prev : {};
+  const sameChain = previous.chainCode === code;
+  const attemptIndex = sameChain ? Math.max(0, Number(previous.attemptIndex) || 0) : 0;
+  const consecutiveRateLimited =
+    code === "rate_limited" ? Math.max(0, Number(previous.consecutiveRateLimited) || 0) + 1 : 0;
+  return {
+    chainCode: code,
+    /** Index to feed computeTextCooldownMs for this failure. */
+    attemptIndex,
+    /** Index after this failure (for the next same-code failure). */
+    nextAttemptIndex: attemptIndex + 1,
+    consecutiveRateLimited,
+  };
 }
 
 /**
@@ -258,6 +291,7 @@ module.exports = {
   isRetryableCode,
   isTextManualRetryAllowed,
   showsTextRetryCountdown,
+  advanceTextCooldownChain,
   computeTextCooldownMs,
   textCooldownUserMessage,
   formatRetryAvailableAt,

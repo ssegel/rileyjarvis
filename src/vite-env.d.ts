@@ -89,7 +89,11 @@ export type JarvisTextTurnRequest = {
   clientTurnId: string;
   text: string;
   history?: JarvisTextHistoryItem[];
-  pendingConfirmation?: JarvisPendingConfirmationHint;
+  /**
+   * When true, main may inject the internal pending confirmation token for this turn.
+   * Fresh Send must leave this false/undefined. Preview tokens never come from the renderer.
+   */
+  resumePendingConfirmation?: boolean;
 };
 
 export type JarvisTextToolTraceItem = {

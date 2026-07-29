@@ -14,6 +14,7 @@ const {
   evaluateJarvisUiReadiness,
 } = require("./window-launch.cjs");
 const { sanitizeDiagnosticText } = require("./realtime-errors.cjs");
+const { prepareTextRunPayload } = require("./text-run-request.cjs");
 
 dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 
@@ -1113,22 +1114,11 @@ const textSession = createTextSessionController({
 });
 
 ipcMain.handle("text:run", async (_event, request) => {
-  const payload = request && typeof request === "object" ? { ...request } : {};
-  const internalPending =
+  const payload = prepareTextRunPayload(request, () =>
     typeof memoryStore.getPendingConfirmationInternal === "function"
       ? memoryStore.getPendingConfirmationInternal()
-      : null;
-  if (internalPending && internalPending.previewToken) {
-    payload.pendingConfirmation = {
-      toolName: internalPending.toolName,
-      operation: internalPending.operation,
-      scope: internalPending.scope ?? null,
-      previewToken: internalPending.previewToken,
-      expiresAt: internalPending.expiresAt,
-      redactedSummary: internalPending.redactedSummary,
-      dailyUpdatedAt: internalPending.dailyUpdatedAt,
-    };
-  }
+      : null,
+  );
   return textSession.runTextTurn(payload);
 });
 ipcMain.handle("text:cancel", async (_event, clientTurnId) => textSession.cancelTextTurn(clientTurnId));

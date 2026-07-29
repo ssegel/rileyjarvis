@@ -7,13 +7,19 @@ import {
 import { buildTurnArtifactDelivery, selectTurnArtifacts } from "./artifactSelection";
 import { guardArtifactPanelNarration } from "./textPanelActivation";
 import {
+  autoNetworkRetryOptions,
+  PendingResumeEligibility,
+  type PendingResumeSubmitOptions,
+} from "./pendingResume";
+import {
   TEXT_AUTO_NETWORK_RETRY_DELAY_MS,
+  advanceTextCooldownChain,
   computeTextCooldownMs,
   isTextManualRetryAllowed,
   textCooldownUserMessage,
+  type TextCooldownChainState,
 } from "./realtimeErrors";
 import type {
-  JarvisPendingConfirmationHint,
   JarvisTextHistoryItem,
   JarvisTextTurnError,
   JarvisTextTurnResult,
@@ -56,8 +62,12 @@ export class TextClient {
   private callbacks: TextClientCallbacks;
   private diagnostics: RealtimeDiagnosticsBuffer;
   private autoNetworkRetriesUsed = 0;
-  private consecutiveRateLimited = 0;
-  private cooldownAttemptIndex = 0;
+  private cooldownChain: TextCooldownChainState = {
+    chainCode: null,
+    attemptIndex: 0,
+    consecutiveRateLimited: 0,
+  };
+  private pendingResumeEligibility = new PendingResumeEligibility();
   private buildInfo: { version?: string; gitSha?: string; branch?: string } = { version: "1.0.0" };
 
   constructor(callbacks: TextClientCallbacks, diagnostics?: RealtimeDiagnosticsBuffer) {
@@ -92,10 +102,17 @@ export class TextClient {
     );
   }
 
+  canResumePendingConfirmation(composerText: string): boolean {
+    return this.pendingResumeEligibility.canResume(composerText);
+  }
+
   resetCooldownCounters(): void {
     this.autoNetworkRetriesUsed = 0;
-    this.consecutiveRateLimited = 0;
-    this.cooldownAttemptIndex = 0;
+    this.cooldownChain = {
+      chainCode: null,
+      attemptIndex: 0,
+      consecutiveRateLimited: 0,
+    };
   }
 
   getDiagnosticReport(
@@ -143,13 +160,11 @@ export class TextClient {
   async submit(
     text: string,
     history: JarvisTextHistoryItem[] = [],
-    options: {
-      pendingConfirmation?: JarvisPendingConfirmationHint | null;
-      isAutoNetworkRetry?: boolean;
-    } = {},
+    options: PendingResumeSubmitOptions = {},
   ): Promise<JarvisTextTurnResult | null> {
-    const trimmed = text.trim();
-    if (!trimmed) return null;
+    // Trim only for emptiness; submit the exact composer string unchanged.
+    const exactText = text == null ? "" : String(text);
+    if (!exactText.trim()) return null;
     if (this.isActive()) {
       this.callbacks.onError("Jarvis is busy with another text turn.", "session.error", {
         code: "session.error",
@@ -175,16 +190,25 @@ export class TextClient {
       };
     }
 
+    options = {
+      ...options,
+      // Defense in depth: explicit resume is accepted only for the exact current
+      // failed composer tracked by this client.
+      resumePendingConfirmation:
+        options.resumePendingConfirmation === true &&
+        this.pendingResumeEligibility.canResume(exactText),
+    };
     if (!options.isAutoNetworkRetry) {
       this.autoNetworkRetriesUsed = 0;
     }
+    this.pendingResumeEligibility.beginTurn(exactText, options);
 
     const clientTurnId = crypto.randomUUID();
     const generation = ++this.generation;
     this.activeTurnId = clientTurnId;
     this.setState("sending");
     if (!options.isAutoNetworkRetry) {
-      this.callbacks.onUserText(trimmed);
+      this.callbacks.onUserText(exactText);
     }
     this.diag("info", "text.turn.start", "Text turn started", clientTurnId);
 
@@ -192,9 +216,10 @@ export class TextClient {
       this.setState("waiting");
       const result = await window.jarvis.runTextTurn({
         clientTurnId,
-        text: trimmed,
+        text: exactText,
         history,
-        pendingConfirmation: options.pendingConfirmation || undefined,
+        // Token stays main-process-only; flag requests resume injection when set.
+        resumePendingConfirmation: options.resumePendingConfirmation === true,
       });
 
       const mainText = readAssistantText(result);
@@ -213,6 +238,7 @@ export class TextClient {
 
       // Drop late results after cancel/timeout supersession (generation only).
       if (plan.action === "reject" && plan.reason === "stale") {
+        this.pendingResumeEligibility.clear();
         this.setState("cancelled");
         this.diag("warn", "text.turn.late_result_dropped", "Late text result ignored after cancel", clientTurnId);
         return {
@@ -234,6 +260,7 @@ export class TextClient {
       }
 
       if (plan.action === "reject" && plan.reason === "cancelled") {
+        this.pendingResumeEligibility.clear();
         this.setState("cancelled");
         this.callbacks.onStatus("Text request cancelled.");
         this.diag("warn", "text.turn.cancelled", "Text turn cancelled", clientTurnId, result);
@@ -241,7 +268,7 @@ export class TextClient {
       }
 
       if (plan.action === "reject" && (plan.reason === "error" || plan.reason === "missing")) {
-        return await this.handleTurnFailure(result, clientTurnId, trimmed, history, options);
+        return await this.handleTurnFailure(result, clientTurnId, exactText, history, options);
       }
 
       if (plan.action === "empty_error") {
@@ -258,10 +285,14 @@ export class TextClient {
             safeForAutoNetworkRetry: false,
           },
         };
-        return await this.handleTurnFailure(emptyResult, clientTurnId, trimmed, history, options);
+        return await this.handleTurnFailure(emptyResult, clientTurnId, exactText, history, options);
       }
 
       if (plan.action !== "deliver") {
+        this.pendingResumeEligibility.recordFailure(
+          exactText,
+          options.resumePendingConfirmation === true,
+        );
         this.setState("error");
         this.emitFailure({
           code: "unknown",
@@ -307,6 +338,7 @@ export class TextClient {
       );
 
       this.setState("completed");
+      this.pendingResumeEligibility.clear();
       this.resetCooldownCounters();
       this.diag("info", "text.turn.completed", "Text turn completed", clientTurnId, result);
       // Preserve nonempty assistantText on the returned result for App verification.
@@ -326,6 +358,10 @@ export class TextClient {
     } catch (error) {
       const message = error instanceof Error ? error.message : "The text request failed. Try again.";
       this.setState("error");
+      this.pendingResumeEligibility.recordFailure(
+        exactText,
+        options.resumePendingConfirmation === true,
+      );
       this.emitFailure({
         code: "unknown",
         message,
@@ -349,6 +385,7 @@ export class TextClient {
     try {
       await window.jarvis.cancelTextTurn(turnId);
     } finally {
+      this.pendingResumeEligibility.clear();
       // Ensure renderer lock can clear even if cancel IPC throws.
       if (this.activeTurnId === turnId) {
         this.activeTurnId = null;
@@ -360,12 +397,9 @@ export class TextClient {
   private async handleTurnFailure(
     result: JarvisTextTurnResult | null | undefined,
     clientTurnId: string,
-    trimmed: string,
+    exactText: string,
     history: JarvisTextHistoryItem[],
-    options: {
-      pendingConfirmation?: JarvisPendingConfirmationHint | null;
-      isAutoNetworkRetry?: boolean;
-    },
+    options: PendingResumeSubmitOptions,
   ): Promise<JarvisTextTurnResult | null> {
     const raw = result?.error;
     const canAuto =
@@ -379,19 +413,20 @@ export class TextClient {
       this.diag("warn", "text.turn.auto_network_retry", "One safe network auto-retry", clientTurnId, result);
       this.activeTurnId = null;
       await sleep(TEXT_AUTO_NETWORK_RETRY_DELAY_MS);
-      return this.submit(trimmed, history, {
-        pendingConfirmation: options.pendingConfirmation,
-        isAutoNetworkRetry: true,
-      });
+      return this.submit(exactText, history, autoNetworkRetryOptions(options));
     }
 
-    if (raw?.code === "rate_limited") {
-      this.consecutiveRateLimited += 1;
-    } else {
-      this.consecutiveRateLimited = 0;
-    }
-    const error = enrichTextError(raw, this.cooldownAttemptIndex, this.consecutiveRateLimited);
-    this.cooldownAttemptIndex += 1;
+    const advanced = advanceTextCooldownChain(this.cooldownChain, raw?.code);
+    this.cooldownChain = {
+      chainCode: advanced.chainCode,
+      attemptIndex: advanced.nextAttemptIndex,
+      consecutiveRateLimited: advanced.consecutiveRateLimited,
+    };
+    const error = enrichTextError(raw, advanced.attemptIndex, advanced.consecutiveRateLimited);
+    const associatedWithPendingConfirmation =
+      options.resumePendingConfirmation === true ||
+      Boolean(result?.toolTrace?.some((item) => item.requiresConfirmation === true));
+    this.pendingResumeEligibility.recordFailure(exactText, associatedWithPendingConfirmation);
 
     this.setState("error");
     this.emitFailure(error);
@@ -408,22 +443,23 @@ export class TextClient {
   }
 
   private emitFailure(error: JarvisTextTurnError & TextClientErrorDetails): void {
+    const manualRetry = isTextManualRetryAllowed(error.code, error.retryable);
     const cooldownMs =
       typeof error.cooldownMs === "number"
         ? error.cooldownMs
-        : isTextManualRetryAllowed(error.code)
+        : manualRetry
           ? computeTextCooldownMs(
-              Math.max(0, this.cooldownAttemptIndex - 1),
+              Math.max(0, this.cooldownChain.attemptIndex - 1),
               error.retryAfterMs,
-              error.code === "rate_limited" ? this.consecutiveRateLimited : 0,
+              error.code === "rate_limited" ? this.cooldownChain.consecutiveRateLimited : 0,
             )
           : undefined;
     const message =
-      cooldownMs != null && isTextManualRetryAllowed(error.code)
+      cooldownMs != null && manualRetry
         ? textCooldownUserMessage(
             error.code || "unknown",
             cooldownMs,
-            error.code === "rate_limited" ? this.consecutiveRateLimited : 0,
+            error.code === "rate_limited" ? this.cooldownChain.consecutiveRateLimited : 0,
           )
         : error.message || "The text request failed. Try again.";
     this.callbacks.onError(message, error.code, {
@@ -431,7 +467,7 @@ export class TextClient {
       message,
       cooldownMs,
       consecutiveRateLimited:
-        error.code === "rate_limited" ? this.consecutiveRateLimited : undefined,
+        error.code === "rate_limited" ? this.cooldownChain.consecutiveRateLimited : undefined,
     });
   }
 
@@ -492,7 +528,7 @@ export function enrichTextError(
   const retryAfterMs = error?.retryAfterMs;
   const retryable =
     typeof error?.retryable === "boolean" ? error.retryable : isTextManualRetryAllowed(code);
-  const cooldownMs = isTextManualRetryAllowed(code)
+  const cooldownMs = isTextManualRetryAllowed(code, retryable)
     ? computeTextCooldownMs(attemptIndex, retryAfterMs, consecutiveRateLimited)
     : undefined;
   return {
