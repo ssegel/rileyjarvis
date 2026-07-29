@@ -21,7 +21,20 @@ dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 const dataDir = path.join(process.cwd(), "data");
 const dbPath = path.join(dataDir, "ricky-db.json");
 const desktopControl = createDesktopControl({ dataDir, screen, shell, desktopCapturer });
-const memoryStore = createMemoryStore({ rootDir: path.join(dataDir, "memory") });
+let textSessionRef = null;
+const memoryStore = createMemoryStore({
+  rootDir: path.join(dataDir, "memory"),
+  isExternallyBusy: () => {
+    try {
+      if (textSessionRef && typeof textSessionRef.getActiveTurnCount === "function") {
+        if (textSessionRef.getActiveTurnCount() > 0) return true;
+      }
+    } catch {
+      // ignore
+    }
+    return false;
+  },
+});
 let currentMode = "display";
 let mainWindow = null;
 let normalWindowBounds = null;
@@ -69,7 +82,15 @@ function getBuildInfo() {
   } catch {
     branch = null;
   }
-  return { version, gitSha, branch };
+  let staleBuild = false;
+  try {
+    const { evaluateRendererBuildFreshness } = require("../scripts/launch-helpers.cjs");
+    const freshness = evaluateRendererBuildFreshness(process.cwd());
+    staleBuild = freshness.stale === true;
+  } catch {
+    staleBuild = false;
+  }
+  return { version, gitSha, branch, staleBuild };
 }
 
 const RESTART_POLICY_NOTE = "Pending confirmations do not survive restart.";
@@ -1112,8 +1133,36 @@ const textSession = createTextSessionController({
   createTokenError: realtimeErrors.createTokenError,
   sanitizeDiagnosticText: realtimeErrors.sanitizeDiagnosticText,
 });
+textSessionRef = textSession;
 
 ipcMain.handle("text:run", async (_event, request) => {
+  if (
+    (typeof memoryStore.isConfirmInFlight === "function" && memoryStore.isConfirmInFlight()) ||
+    (typeof memoryStore.getSharedOwner === "function" &&
+      memoryStore.getSharedOwner() &&
+      memoryStore.getSharedOwner().kind === "confirm")
+  ) {
+    return {
+      ok: false,
+      clientTurnId: request && request.clientTurnId ? String(request.clientTurnId) : "",
+      assistantText: "",
+      artifacts: [],
+      toolNames: [],
+      artifactCount: 0,
+      selectedArtifact: null,
+      hasSubstantiveArtifact: false,
+      toolTrace: [],
+      usage: { inputTokens: 0, outputTokens: 0, model: "" },
+      durationMs: 0,
+      outcome: "error",
+      cancelled: false,
+      error: {
+        code: "session.busy",
+        message: "Jarvis is busy. Wait for the current action to finish.",
+        retryable: false,
+      },
+    };
+  }
   const payload = prepareTextRunPayload(request, () =>
     typeof memoryStore.getPendingConfirmationInternal === "function"
       ? memoryStore.getPendingConfirmationInternal()
@@ -1143,6 +1192,8 @@ ipcMain.handle("continuity:get", () => {
     pendingConfirmation: pending,
     buildInfo: getBuildInfo(),
     restartPolicyNote: RESTART_POLICY_NOTE,
+    confirmInFlight: typeof memoryStore.isConfirmInFlight === "function" ? memoryStore.isConfirmInFlight() : false,
+    memoryBusy: typeof memoryStore.isMemoryQueueBusy === "function" ? memoryStore.isMemoryQueueBusy() : false,
   };
 });
 
@@ -1151,6 +1202,67 @@ ipcMain.handle("continuity:dismiss-pending", () => {
     memoryStore.dismissPendingConfirmation();
   }
   return { ok: true };
+});
+
+ipcMain.handle("continuity:confirm-pending", async (_event, _payload) => {
+  // Ignore renderer payload entirely — no token/operation accepted.
+  if (typeof memoryStore.confirmPendingConfirmation !== "function") {
+    return { ok: false, code: "STALE_PREVIEW", message: "Nothing to confirm." };
+  }
+  return memoryStore.confirmPendingConfirmation({});
+});
+
+ipcMain.handle("backups:list", async () => {
+  if (typeof memoryStore.listBackupMetadata !== "function") {
+    return { ok: false, ordinary: [], baselines: [] };
+  }
+  return memoryStore.listBackupMetadata();
+});
+
+ipcMain.handle("backups:create-baseline", async (_event, payload) => {
+  const name = payload && typeof payload.name === "string" ? payload.name : "";
+  const note = payload && typeof payload.note === "string" ? payload.note : undefined;
+  return memoryStore.createProtectedBaseline({ name, note });
+});
+
+ipcMain.handle("backups:reregister-baseline", async (_event, payload) => {
+  return memoryStore.reregisterBaseline({
+    fileName: payload && payload.fileName,
+    name: payload && payload.name,
+    note: payload && payload.note,
+  });
+});
+
+ipcMain.handle("backups:delete-baseline", async (_event, payload) => {
+  return memoryStore.deleteBaseline({
+    id: payload && payload.id,
+    fileName: payload && payload.fileName,
+  });
+});
+
+ipcMain.handle("pilot:record-issue", async (_event, payload) => {
+  const note = payload && typeof payload.note === "string" ? payload.note : "";
+  const build = getBuildInfo();
+  const pending =
+    typeof memoryStore.getPendingConfirmation === "function" ? memoryStore.getPendingConfirmation() : null;
+  return memoryStore.recordPilotIssue({
+    note,
+    build,
+    errorCode: payload && payload.errorCode != null ? String(payload.errorCode) : null,
+    httpStatus: payload && typeof payload.httpStatus === "number" ? payload.httpStatus : null,
+    cooldownUntilMs:
+      payload && typeof payload.cooldownUntilMs === "number" ? payload.cooldownUntilMs : null,
+    connectionState: payload && payload.connectionState != null ? String(payload.connectionState) : null,
+    pending: pending
+      ? {
+          toolName: pending.toolName,
+          operation: pending.operation,
+          scope: pending.scope,
+          expiresAt: pending.expiresAt,
+        }
+      : null,
+    staleBuild: build.staleBuild === true,
+  });
 });
 
 app.on("before-quit", () => {
@@ -1258,6 +1370,18 @@ ipcMain.handle("realtime:create-token", async () => {
 ipcMain.handle("tools:execute", async (_event, toolCall) => executeTrustedTool(toolCall));
 
 async function executeTrustedTool(toolCall) {
+  if (
+    (typeof memoryStore.isConfirmInFlight === "function" && memoryStore.isConfirmInFlight()) ||
+    (typeof memoryStore.getSharedOwner === "function" &&
+      memoryStore.getSharedOwner() &&
+      memoryStore.getSharedOwner().kind === "confirm")
+  ) {
+    return {
+      ok: false,
+      code: "session.busy",
+      error: "Jarvis is busy. Wait for the current action to finish.",
+    };
+  }
   const name = String(toolCall?.name || "");
   const args = asObject(toolCall?.arguments);
 

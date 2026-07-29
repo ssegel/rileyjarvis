@@ -44,6 +44,22 @@ Or PowerShell:
 
 These scripts verify Node/npm/dependencies/`.env.local`/`OPENAI_API_KEY`, build when `dist/index.html` is missing (or when `-Rebuild` is passed), then start Electron with the built UI. A second launch focuses the existing Jarvis window.
 
+If source files are newer than `dist`, the launcher warns that the built UI may be stale. Rebuild is explicit only via `-Rebuild` (not automatic every launch).
+
+### Desktop shortcut (Windows)
+
+```powershell
+.\scripts\create-desktop-shortcut.ps1
+```
+
+Creates or updates `Jarvis.lnk` on the desktop targeting `scripts\start-jarvis.bat` (paths with spaces are preserved). If an unrelated `Jarvis.lnk` already exists, pass `-Replace` to overwrite it.
+
+### Pilot safety notes
+
+- **Protected baselines** — save named snapshots under `data/memory/backups/baselines/`; ordinary rolling prune never deletes them. Create/list/re-register/delete from the session pilot controls.
+- **Deterministic Confirm** — pending destructive previews can be applied with the banner **Confirm** button (no second LLM turn; preview tokens stay in the main process).
+- **Record issue** — manually log a sanitized pilot note for later review (does not affect memory operations).
+
 ### First-time setup
 
 ```bash
